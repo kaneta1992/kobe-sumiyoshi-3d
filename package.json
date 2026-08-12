@@ -1,0 +1,23 @@
+{
+  "name": "kobe-sumiyoshi-3d",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "神戸市東灘区 住吉山手周辺 2.4km四方の実在地形・建物・道路を3D表示するWebアプリ",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mapbox/vector-tile": "^3.0.0",
+    "pbf": "^5.1.2",
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "@types/three": "^0.185.4",
+    "typescript": "^5.9.0",
+    "vite": "^8.2.1"
+  }
+}
