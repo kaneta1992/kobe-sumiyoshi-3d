@@ -41,7 +41,8 @@ description: 神戸・住吉山手3D街歩きアプリ（kobe-sumiyoshi-3d）の
 ## 検証・運用
 
 - L1ゲート: `npx tsc --noEmit` / `npm run build` / `grep -RIn "Math.random" src/ | grep -v "// allow"; test $? -eq 1`
-- 動作確認URL: `?stats`（計測HUD）, `?walk`は廃止で既定が三人称, `?fly`（自由カメラ・物理なし）, `?quality=mobile`, `?webgl`, `?hour=17.5`, `?room=xxx`, `?solo`
+- 動作確認URL: `?stats`（計測HUD）, `?walk`は廃止で既定が三人称, `?fly`（自由カメラ・物理なし）, `?quality=mobile`, `?webgl`, `?hour=17.5`, `?room=xxx`, `?solo`, `?spawn=x,z`（最寄り道路上に開始）, `?superman`（+Gキーで飛行デバッグ）
+- 渦森橋: ワールド座標 (x 82, z 132)。`?spawn=82,132` で直行
 - 2タブマルチ検証: 各タブを一度前面にしてロード完了させること（裏タブは描画停止でワールド構築が進まない）
 - コミットは日本語・機密スキャン後。契約ベース開発（.claude/contracts/、番号連番）
 
@@ -50,7 +51,8 @@ description: 神戸・住吉山手3D街歩きアプリ（kobe-sumiyoshi-3d）の
 - rapier3d-compat 0.12 の QueryFilterFlags は TS定義とWASMのビット配置がずれており、レイに指定すると全部外れる → 衝突グループで絞る
 - rapier の currentVehicleSpeed() は符号がステップ毎に反転することがある → 剛体速度の正面射影で自前算出
 - pbf v5 は `PbfReader` named export（v3の default `Pbf` と非互換）
-- 道路は地形から+0.32mドレープしている — 物理側も同じ定数を共有しないと足が路面に埋まる（roads.tsから共有）
+- 道路ドレープは**+0.03m**（契約08で0.32mから縮小）。前処理で道路コリドーの地形を縦断プロファイルへカービングしてハイトマップに焼いてある — 道路の高さを変えたいときは**必ず前処理側**（tools/lib/road-carve.mjs + src/shared/road-profile.js）を触る。クライアント側で縦断ソルバーを再適用してはいけない（pinned・二度掛けで路面が浮く）
+- 橋は RdCL vt_code 下1桁3（2703/2713）。カービング除外・桁/高欄/橋脚は src/world/bridges.ts。橋上には電柱・下草を置かない
 - 兵庫県DEMの集約は「最大値」でDSMと揃える（平均にすると崖・擁壁で偽の樹高が出る）
 - 建物高さは[高さ, 測定時地面標高]の2値 — 急斜面で屋根の絶対高を固定するため。片方だけ使うと浮き/埋まりが出る
 - L字建物はOBB屋根が破綻する → 充填率<0.74 or 短辺<1.4mは陸屋根に落とす
