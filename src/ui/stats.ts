@@ -17,6 +17,8 @@ export const worldStats = {
     treeNear: 0,
     treeMid: 0,
     treeFar: 0,
+    /** 直近フレームの物理計算時間[ms]（契約04） */
+    physicsMs: 0,
 };
 
 export interface StatsOverlay {
@@ -109,7 +111,8 @@ export function createStatsOverlay(
                         `chunk ${worldStats.chunksDrawn}/${worldStats.chunksTotal}   ` +
                         `HLOD ${worldStats.hlod0}/${worldStats.hlod1}/${worldStats.hlod2}\n` +
                         `tree ${worldStats.treeNear}/${worldStats.treeMid}/${worldStats.treeFar}\n` +
-                        `scale ${renderScale.toFixed(2)}   vram~${formatMB(gpuBytes)}\n` +
+                        `scale ${renderScale.toFixed(2)}   vram~${formatMB(gpuBytes)}   ` +
+                        `phys ${worldStats.physicsMs.toFixed(1)}ms\n` +
                         label();
                 }
             }

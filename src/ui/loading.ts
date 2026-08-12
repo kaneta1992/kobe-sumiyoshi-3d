@@ -10,6 +10,7 @@ const overlay = el<HTMLDivElement>('loading');
 const bar = el<HTMLDivElement>('loading-bar');
 const label = el<HTMLDivElement>('loading-label');
 const status = el<HTMLDivElement>('status');
+const help = el<HTMLDivElement>('help');
 
 export function setLoadingProgress(loaded: number, total: number, phase: string): void {
     const ratio = total > 0 ? Math.min(1, loaded / total) : 0;
@@ -23,6 +24,11 @@ export function hideLoading(): void {
 
 export function setStatus(text: string): void {
     status.textContent = text;
+}
+
+/** 画面左下の操作説明。徒歩／運転／自由カメラで内容が変わる */
+export function setHelp(text: string): void {
+    help.textContent = text;
 }
 
 export function showFatal(message: string): void {

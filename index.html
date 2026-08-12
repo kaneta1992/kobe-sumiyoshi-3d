@@ -98,13 +98,87 @@
                 font-size: 12px;
                 color: #a8b4c2;
             }
+            /* タッチUI（src/ui/touch.ts が中身を作る）。タッチ端末でだけ表示される */
+            #touch-ui {
+                position: fixed;
+                inset: 0;
+                z-index: 15;
+                pointer-events: none;
+                user-select: none;
+                -webkit-user-select: none;
+            }
+            #touch-ui.hidden {
+                display: none;
+            }
+            #touch-ui .touch-stick,
+            #touch-ui .touch-button {
+                position: absolute;
+                pointer-events: auto;
+                touch-action: none;
+                border-radius: 50%;
+                border: 1px solid rgba(255, 255, 255, 0.3);
+                background: rgba(12, 16, 22, 0.34);
+                backdrop-filter: blur(2px);
+            }
+            /* 出典表記（常時表示が利用条件）と重ならないよう、操作系は下端から持ち上げる */
+            #touch-ui .touch-stick,
+            #touch-ui .touch-buttons {
+                bottom: calc(env(safe-area-inset-bottom, 0px) + 118px);
+            }
+            #touch-ui .touch-stick {
+                left: max(16px, env(safe-area-inset-left));
+                width: 120px;
+                height: 120px;
+            }
+            #touch-ui .touch-knob {
+                position: absolute;
+                left: 50%;
+                top: 50%;
+                width: 50px;
+                height: 50px;
+                margin: -25px 0 0 -25px;
+                border-radius: 50%;
+                background: rgba(233, 240, 248, 0.5);
+            }
+            #touch-ui .touch-buttons {
+                position: absolute;
+                right: max(16px, env(safe-area-inset-right));
+                display: flex;
+                align-items: flex-end;
+                gap: 10px;
+            }
+            #touch-ui .touch-button {
+                position: relative;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                width: 68px;
+                height: 68px;
+                font-size: 12px;
+                letter-spacing: 0.04em;
+                color: #e8edf2;
+                text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+            }
+            #touch-ui .touch-button.active {
+                background: rgba(111, 168, 255, 0.5);
+            }
+            #touch-ui .touch-button.disabled {
+                opacity: 0.35;
+            }
+            #touch-ui .touch-button.hidden {
+                display: none;
+            }
+            #touch-ui .touch-interact {
+                width: 78px;
+                height: 78px;
+            }
         </style>
     </head>
     <body>
         <div id="app"></div>
 
         <div id="status" class="panel">起動中…</div>
-        <div id="help" class="panel">ドラッグ: 視点回転　WASD: 移動　Space/C: 上下　Shift: 加速　ホイール: 速度</div>
+        <div id="help" class="panel">WASD: 移動　Shift: 走る　ドラッグ/マウス: 視点　F: 乗車　R: 位置リセット</div>
         <div id="credit" class="panel">
             出典:
             <a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank" rel="noreferrer">

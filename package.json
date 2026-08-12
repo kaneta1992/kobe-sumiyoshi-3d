@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@dimforge/rapier3d-compat": "^0.12.0",
     "@mapbox/vector-tile": "^3.0.0",
     "pbf": "^5.1.2",
     "three": "^0.185.1"

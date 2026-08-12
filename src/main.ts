@@ -3,11 +3,13 @@
  * レンダラーは WebGPURenderer を使う。WebGPU 非対応環境では three が
  * WebGL2 バックエンドへ自動フォールバックする（E5-b）。
  *
+ * 既定は三人称の徒歩（契約04）。物理・入力・カメラは src/game が持つ。
+ *
  * URL パラメータ:
  *   ?webgl              WebGL2 バックエンドを強制（フォールバック確認用）
  *   ?quality=mobile|desktop / ?tier=0..2   品質プリセットの強制
- *   ?stats              画面内 stats（fps / draw / tri / chunk / HLOD / scale）
- *   ?walk               地上 1.6m の徒歩視点で開始（近景の確認用）
+ *   ?stats              画面内 stats（fps / draw / tri / chunk / HLOD / scale / phys）
+ *   ?fly                自由カメラ（デバッグ用。物理を読み込まない）
  *   ?hour=15.5          太陽の時刻
  *
  * 性能規律（契約03 追記2）:
@@ -17,10 +19,11 @@
  */
 import { ACESFilmicToneMapping, PCFSoftShadowMap, PerspectiveCamera, Scene, Vector3, WebGPURenderer } from 'three/webgpu';
 import { createFlyCamera } from './camera';
+import type { Game } from './game';
 import { createQuality, initialQuality, maxTier, sunHour, tierIsPinned, type QualitySettings } from './quality';
 import { createPostProcessing, type PostChain } from './render/post';
 import { createStatsOverlay } from './ui/stats';
-import { hideLoading, setLoadingProgress, setStatus, showFatal } from './ui/loading';
+import { hideLoading, setHelp, setLoadingProgress, setStatus, showFatal } from './ui/loading';
 import { createEnvironment } from './world/environment';
 import { fogRangeNode, setSunHour } from './world/sun';
 import { buildWorld, worldEvents, type World, type WorldProgress } from './world';
@@ -64,8 +67,19 @@ async function start(): Promise<void> {
     const scene = new Scene();
     const camera = new PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.35, quality.cameraFar);
     camera.position.set(0, 700, 900);
-    const controls = createFlyCamera(camera, renderer.domElement);
-    controls.setView(new Vector3(0, 700, 900), new Vector3(0, 250, -300));
+
+    // 既定は三人称の操作系。?fly のときだけ従来の自由カメラを使う（契約04 追記2）
+    const freeCamera = params.has('fly');
+    const controls = freeCamera ? createFlyCamera(camera, renderer.domElement) : null;
+    controls?.setView(new Vector3(0, 700, 900), new Vector3(0, 250, -300));
+    // WASM のロードはタイル取得と並行して先に始めておく
+    const gameModule = freeCamera
+        ? null
+        : import('./game').then(async (module) => {
+              await module.initPhysics();
+              return module;
+          });
+    let game: Game | null = null;
 
     const environment = createEnvironment(scene, quality);
     fogRangeNode.value.set(quality.fogNear, quality.fogFar);
@@ -89,25 +103,36 @@ async function start(): Promise<void> {
     });
 
     let world: World | null = null;
-    worldEvents.addEventListener('ready', (e) => {
-        world = (e as CustomEvent<World>).detail;
-        const spawn = world.spawn;
-        const groundY = world.getElevationAt(spawn.x, spawn.z);
-        if (params.has('walk')) {
-            // 徒歩視点（地上 1.6m・道路上）。近景品質の確認はこの高さで行う
-            const ahead = 40;
-            const targetX = spawn.x + spawn.dirX * ahead;
-            const targetZ = spawn.z + spawn.dirZ * ahead;
-            controls.setView(
-                new Vector3(spawn.x, groundY + 1.6, spawn.z),
-                new Vector3(targetX, world.getElevationAt(targetX, targetZ) + 2.6, targetZ),
-            );
-        } else {
-            controls.setView(
-                new Vector3(spawn.x, groundY + 70, spawn.z + 190),
-                new Vector3(spawn.x, groundY + 10, spawn.z - 160),
-            );
+    /** ワールドが揃ってから物理・操作系を作る（E2: ロード完了前にスポーンしない） */
+    const onWorldReady = async (ready: World): Promise<void> => {
+        const spawn = ready.spawn;
+        const groundY = ready.getElevationAt(spawn.x, spawn.z);
+        controls?.setView(
+            new Vector3(spawn.x, groundY + 70, spawn.z + 190),
+            new Vector3(spawn.x, groundY + 10, spawn.z - 160),
+        );
+        if (freeCamera) setHelp('ドラッグ: 視点回転　WASD: 移動　Space/C: 上下　Shift: 加速　ホイール: 速度');
+
+        if (gameModule) {
+            setLoadingProgress(1, 1, '物理コライダーを生成中');
+            try {
+                const { createGame } = await gameModule;
+                game = createGame({
+                    scene,
+                    camera,
+                    element: renderer.domElement,
+                    world: ready,
+                    quality,
+                });
+                game.update(0); // カメラをプレイヤーの後方へ置いてから可視判定する
+            } catch (err) {
+                // 物理を用意できなくても真っ白にはしない（E25）
+                console.error('[game] 物理の初期化に失敗しました', err);
+                setHelp('物理の初期化に失敗したため自由カメラで表示しています');
+            }
         }
+
+        world = ready;
         world.update(camera, quality, true);
         stats.measure(scene);
         const s = world.stats;
@@ -120,7 +145,11 @@ async function start(): Promise<void> {
         // 全パイプラインを先にコンパイルしてから表示する（初回視界移動のカクつき防止）。
         // 数十のパイプラインを作るので時間がかかる。何をしているかは表示しておく
         setLoadingProgress(1, 1, 'シェーダーを準備中');
-        void world.prewarm(renderer, scene, camera).then(() => hideLoading());
+        await world.prewarm(renderer, scene, camera);
+        hideLoading();
+    };
+    worldEvents.addEventListener('ready', (e) => {
+        void onWorldReady((e as CustomEvent<World>).detail);
     });
 
     /** 品質段階を1段落とす。ジオメトリは作り直さず、距離・影・ポストだけ効かせる */
@@ -143,7 +172,8 @@ async function start(): Promise<void> {
         const dt = Math.min(0.1, (now - last) / 1000);
         last = now;
         renderer.info.reset();
-        controls.update(dt);
+        if (game) game.update(dt);
+        else controls?.update(dt);
         environment.update(camera);
         world?.update(camera, quality);
 

@@ -17,15 +17,19 @@ import type { Point2, RoadLine } from '../data/vector';
 
 /** 地形起伏に追従させるための再サンプリング間隔[m] */
 const SEGMENT_LENGTH = 6;
+/**
+ * 路面の寸法。物理コライダー（src/game/physics.ts）も同じ値で帯を作るので、
+ * ここを変えると路面と足元がずれる。二重定義を作らないこと。
+ */
 /** 地表からの浮かせ量[m] */
-const DRAPE_OFFSET = 0.32;
+export const DRAPE_OFFSET = 0.32;
 /** 縁石の高さ[m] と 見付け幅[m] */
-const CURB_HEIGHT = 0.15;
-const CURB_WIDTH = 0.22;
+export const CURB_HEIGHT = 0.15;
+export const CURB_WIDTH = 0.22;
 /** 歩道の幅[m] */
-const SIDEWALK_WIDTH = 1.6;
+export const SIDEWALK_WIDTH = 1.6;
 /** 歩道を付ける最小幅員[m] */
-const SIDEWALK_MIN_WIDTH = 5.5;
+export const SIDEWALK_MIN_WIDTH = 5.5;
 
 /** 路面の種別（aRoad.w） */
 const SURFACE_ASPHALT = 0;
@@ -35,8 +39,8 @@ const SURFACE_SIDEWALK = 2;
 const ASPHALT: readonly [number, number, number] = [0.052, 0.052, 0.055];
 const CONCRETE: readonly [number, number, number] = [0.29, 0.285, 0.27];
 
-/** 長い区間を分割し、地形に追従する頂点列にする */
-function resample(points: readonly Point2[]): Point2[] {
+/** 長い区間を分割し、地形に追従する頂点列にする（物理コライダー生成でも使う） */
+export function resampleCenterline(points: readonly Point2[]): Point2[] {
     const out: Point2[] = [points[0]];
     for (let i = 1; i < points.length; i++) {
         const a = points[i - 1];
@@ -125,7 +129,7 @@ export function createRoads(
     }
     const pieces: Piece[] = [];
     for (const line of lines) {
-        const pts = resample(line.points);
+        const pts = resampleCenterline(line.points);
         if (pts.length < 2) continue;
         const width = Math.max(1.2, Math.min(line.width, 30));
         // 60m 程度ずつに切って、セルをまたぐ長い帯を作らない

@@ -13,8 +13,9 @@ import { countPhotoTiles, loadAerialImage } from '../data/photo';
 import { loadBuildingHeights, loadHeightmap, loadTrees } from '../data/terrain-assets';
 import { countVectorTiles, loadVectorFeatures } from '../data/vector';
 import type { QualitySettings } from '../quality';
+import type { RoadLine } from '../data/vector';
 import { worldStats } from '../ui/stats';
-import { createBuildings } from './buildings';
+import { createBuildings, type BuildingCollision } from './buildings';
 import { buildOccupancy } from './occupancy';
 import { createProps } from './props';
 import { createRoads } from './roads';
@@ -34,6 +35,14 @@ export interface World {
     terrain: Terrain;
     vegetation: Vegetation | null;
     spawn: Spawn;
+    /**
+     * 物理コライダーの素材（契約04）。描画に使ったのと同じ形状を渡すので、
+     * 当たり判定と見た目がずれない
+     */
+    collision: {
+        buildings: readonly BuildingCollision[];
+        roads: readonly RoadLine[];
+    };
     /** 地表標高[m]。エリア外は端の値にクランプされる */
     getElevationAt(x: number, z: number): number;
     /** 毎フレーム呼ぶ。HLOD 選択・距離/フラスタムカリング・樹木の詰め直し */
@@ -201,6 +210,7 @@ export async function buildWorld(
         terrain,
         vegetation,
         spawn,
+        collision: { buildings: buildings.collision, roads: features.roads },
         getElevationAt: terrain.getElevationAt,
         update(camera, q, force = false) {
             camera.updateMatrixWorld();

@@ -596,11 +596,25 @@ function createFacadeMaterial(): MeshStandardNodeMaterial {
     return material;
 }
 
+/**
+ * 物理コライダー用の建物形状（契約04）。描画と同じ高さ・同じフットプリントから作るので、
+ * 壁に当たる位置と見た目の壁がずれない。穴（中庭）は入れない — 中には入れないため
+ */
+export interface BuildingCollision {
+    outer: readonly Point2[];
+    /** 壁の下端（地面に埋まる） */
+    base: number;
+    /** 壁の上端（棟 or 陸屋根の天端） */
+    top: number;
+    center: Point2;
+}
+
 export interface BuildingsResult {
     hlod: Hlod;
     /** 実測高さを適用できた建物数 */
     measured: number;
     total: number;
+    collision: BuildingCollision[];
 }
 
 export function createBuildings(
@@ -717,5 +731,12 @@ export function createBuildings(
     );
     hlod.group.name = 'buildings';
 
-    return { hlod, measured, total: plans.length };
+    const collision = plans.map((p) => ({
+        outer: p.shape.rings[0],
+        base: p.base,
+        top: p.top,
+        center: p.center,
+    }));
+
+    return { hlod, measured, total: plans.length, collision };
 }
