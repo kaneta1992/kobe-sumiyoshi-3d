@@ -14,7 +14,8 @@
  */
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { ORIGIN_LAT, ORIGIN_LON, xToLon, zToLat } from '../src/shared/geo.js';
+import { ORIGIN_LAT, ORIGIN_LON, latToZ, lonToX, xToLon, zToLat } from '../src/shared/geo.js';
+import { buildRoadProfiles } from '../src/shared/road-profile.js';
 import {
     HEIGHTMAP_SIZE,
     buildBuildingHeights,
@@ -24,14 +25,19 @@ import {
     buildTrees,
     gridX,
     gridZ,
+    sampleGrid,
 } from './lib/assets.mjs';
-import { loadBuildingShapes } from './lib/bvmap.mjs';
+import { loadVectorFeatures } from './lib/bvmap.mjs';
 import { downloadSheets, zipPath } from './lib/download.mjs';
 import { loadGsiElevation } from './lib/gsi-dem.mjs';
 import { encodePngRgb } from './lib/png.mjs';
 import { GRID_DIR, OUT_DIR, ensureDirs } from './lib/paths.mjs';
+import { carveGround, measureBuildingImpact, verifyClientSurface } from './lib/road-carve.mjs';
 import { resolveSheets } from './lib/sheets.mjs';
 import { GN, GRID_MARGIN, NO_DATA, createGrids, rasterizeSheet } from './lib/xyz-raster.mjs';
+
+/** 渦森橋の実測座標（docs/data-spec.md §4）。橋が架かったことの検証に使う */
+const UZUMORI_BRIDGE = { lon: 135.25301, lat: 34.739446 };
 
 /** グリッドの作り方を変えたら上げる。上げると .cache/grid が捨てられ作り直しになる */
 const GRID_VERSION = 2;
@@ -125,6 +131,65 @@ function verifyGeoreference(ground, gsi) {
     return { median: med, p90: abs[Math.floor(abs.length * 0.9)] ?? NaN, samples: diffs.length };
 }
 
+/**
+ * 橋の検証出力（契約08 合格基準）。橋セグメント数・連結後の橋の本数・
+ * 渦森橋が実データ座標に架かったかを出す。
+ */
+function reportBridges(profiled, ground) {
+    const bridges = profiled.paths.filter((p) => p.bridge);
+    if (bridges.length === 0) {
+        throw new Error('E46: 橋（vt_code 2703/2713）のセグメントが1本も見つかりませんでした');
+    }
+    // タイル境界で割れた橋を端点の一致で束ねる（E46）
+    const key = (p) => `${Math.round(p.x * 2)},${Math.round(p.z * 2)}`;
+    const parent = bridges.map((_, i) => i);
+    const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+    const ends = new Map();
+    bridges.forEach((b, i) => {
+        for (const p of [b.points[0], b.points[b.points.length - 1]]) {
+            const k = key(p);
+            const other = ends.get(k);
+            if (other === undefined) ends.set(k, i);
+            else parent[find(i)] = find(other);
+        }
+    });
+    const groups = new Set(bridges.map((_, i) => find(i)));
+    const totalLength = bridges.reduce((a, b) => a + b.length, 0);
+    console.log(
+        `[検証 橋] セグメント ${bridges.length}本（連結後 ${groups.size}橋）/ 総延長 ${totalLength.toFixed(0)}m`,
+    );
+
+    const tx = lonToX(UZUMORI_BRIDGE.lon);
+    const tz = latToZ(UZUMORI_BRIDGE.lat);
+    let best = null;
+    for (const b of bridges) {
+        for (let i = 0; i < b.points.length; i++) {
+            const d = Math.hypot(b.points[i].x - tx, b.points[i].z - tz);
+            if (!best || d < best.d) best = { d, b, i };
+        }
+    }
+    if (!best || best.d > 60) {
+        throw new Error(
+            `渦森橋 (${UZUMORI_BRIDGE.lon}, ${UZUMORI_BRIDGE.lat}) の近傍に橋セグメントが見つかりません` +
+                `（最寄り ${best ? best.d.toFixed(0) : '∞'}m）`,
+        );
+    }
+    // 桁下の谷の深さ = 縦断標高 − 地形標高（カービング後）
+    let clearance = 0;
+    for (let i = 0; i < best.b.points.length; i++) {
+        const p = best.b.points[i];
+        const c = best.b.heights[i] - sampleGrid(ground, p.x, p.z);
+        if (c > clearance) clearance = c;
+    }
+    const mid = best.b.points[best.b.points.length >> 1];
+    console.log(
+        `[検証 渦森橋] 検出: 中心 (x ${mid.x.toFixed(0)}, z ${mid.z.toFixed(0)}) / ` +
+            `実データ座標との距離 ${best.d.toFixed(1)}m / 幅員 ${best.b.width.toFixed(1)}m / ` +
+            `橋長 ${best.b.length.toFixed(0)}m / 桁下の谷 最大 ${clearance.toFixed(1)}m / ` +
+            `路面標高 ${best.b.heights[best.i].toFixed(1)}m`,
+    );
+}
+
 async function stageAssets() {
     const state = loadState();
     const grids = loadGrids(state);
@@ -140,6 +205,34 @@ async function stageAssets() {
         `[assets] 地面セル: 50cm由来 ${native.toLocaleString('en-US')} / ` +
             `近傍補間 ${filledNeighbour.toLocaleString('en-US')} / DEM5A補完 ${filledGsi.toLocaleString('en-US')}`,
     );
+    // --- 道路の縦断プロファイルと地形カービング（契約08） -------------------
+    // 建物高さ・nDSM・樹木より **先** に地面を確定させる。測定の基準地面が
+    // カービング後になるので、道路脇の建物が浮いたり沈んだりしない（E43）
+    const { shapes, roads, tilesFailed } = await loadVectorFeatures();
+    if (tilesFailed > 0) console.warn(`[assets] bvmap タイル ${tilesFailed} 枚が取得できませんでした`);
+
+    const profiled = buildRoadProfiles(roads, (x, z) => sampleGrid(ground, x, z));
+    const groundBefore = Float32Array.from(ground);
+    const carve = carveGround(ground, profiled.paths);
+    const impact = measureBuildingImpact(groundBefore, ground, shapes);
+    console.log(
+        `[検証 E45] 縦断プロファイル: 道路 ${profiled.stats.paths}本 / 頂点 ${profiled.stats.vertices.toLocaleString('en-US')} / ` +
+            `交差点 ${profiled.stats.junctions.toLocaleString('en-US')}、` +
+            `地形との差 平均 ${profiled.stats.meanDeviation.toFixed(2)}m / p90 ${profiled.stats.p90Deviation.toFixed(2)}m / ` +
+            `p99 ${profiled.stats.p99Deviation.toFixed(2)}m / 最大 ${profiled.stats.maxDeviation.toFixed(2)}m`,
+    );
+    console.log(
+        `[検証 E45] カービング: 延長 ${(carve.carvedLength / 1000).toFixed(2)}km / ` +
+            `${carve.cells.toLocaleString('en-US')}セル（最大 掘り ${carve.maxDrop.toFixed(2)}m / ` +
+            `盛り ${carve.maxRaise.toFixed(2)}m、法面保護でスキップ ${carve.skippedBySlope.toLocaleString('en-US')}セル）`,
+    );
+    console.log(
+        `[検証 E43] 建物直下の地面移動: ${impact.moved}/${impact.buildings}件が2cm超 ` +
+            `(30cm超 ${impact.over30cm}件 / 1m超 ${impact.over100cm}件 / 最大 ${impact.max.toFixed(2)}m) ` +
+            '— 高さ測定はカービング後の地面で行うため基準は整合',
+    );
+    reportBridges(profiled, ground);
+
     const { ndsm, valid } = buildNdsm(grids.dsmMax, ground);
     console.log(`[assets] nDSM 有効セル ${valid.toLocaleString('en-US')}`);
 
@@ -155,6 +248,19 @@ async function stageAssets() {
 
     // --- ハイトマップ ---
     const { rgb, meta } = buildHeightmap(ground);
+    const check = verifyClientSurface({ rgb, meta }, roads, (x, z) => sampleGrid(groundBefore, x, z));
+    console.log(
+        `[検証 E47] 路面と地表の段差（クライアントと同じ 1025グリッド + 量子化後・` +
+            `${check.gap.count.toLocaleString('en-US')}点）: 中央値 ${(check.gap.p50 * 100).toFixed(1)}cm / ` +
+            `p99 ${(check.gap.p99 * 100).toFixed(1)}cm / 最大 ${(check.gap.max * 100).toFixed(1)}cm ` +
+            `@ (x ${check.gap.worst.x.toFixed(0)}, z ${check.gap.worst.z.toFixed(0)})`,
+    );
+    console.log(
+        `[検証 乗り心地] 路面の勾配変化（station 間）: カービング前 中央値 ${check.gradeBefore.p50.toFixed(1)}% / ` +
+            `p90 ${check.gradeBefore.p90.toFixed(1)}% / p99 ${check.gradeBefore.p99.toFixed(1)}%  →  ` +
+            `後 中央値 ${check.gradeAfter.p50.toFixed(1)}% / p90 ${check.gradeAfter.p90.toFixed(1)}% / ` +
+            `p99 ${check.gradeAfter.p99.toFixed(1)}%`,
+    );
     const png = encodePngRgb(rgb, HEIGHTMAP_SIZE, HEIGHTMAP_SIZE);
     writeFileSync(join(OUT_DIR, 'heightmap.png'), png);
     writeFileSync(join(OUT_DIR, 'heightmap.json'), JSON.stringify(meta));
@@ -164,8 +270,6 @@ async function stageAssets() {
     );
 
     // --- 建物の実高さ ---
-    const { shapes, tilesFailed } = await loadBuildingShapes();
-    if (tilesFailed > 0) console.warn(`[assets] bvmap タイル ${tilesFailed} 枚が取得できませんでした`);
     const { heights, buildingMask, stats } = buildBuildingHeights(shapes, ndsm, ground);
     const matchRate = stats.shapes ? (stats.keys / stats.shapes) * 100 : 0;
     writeFileSync(

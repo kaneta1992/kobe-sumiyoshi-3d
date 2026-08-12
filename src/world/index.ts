@@ -13,8 +13,9 @@ import { countPhotoTiles, loadAerialImage } from '../data/photo';
 import { loadBuildingHeights, loadHeightmap, loadTrees } from '../data/terrain-assets';
 import { countVectorTiles, loadVectorFeatures } from '../data/vector';
 import type { QualitySettings } from '../quality';
-import type { RoadLine } from '../data/vector';
+import { buildRoadProfiles, type RoadPath } from '../shared/road-profile.js';
 import { worldStats } from '../ui/stats';
+import { buildBridgeSpans, createBridges, type BridgeSpan } from './bridges';
 import { createBuildings, type BuildingCollision } from './buildings';
 import { buildOccupancy } from './occupancy';
 import { createProps } from './props';
@@ -41,7 +42,9 @@ export interface World {
      */
     collision: {
         buildings: readonly BuildingCollision[];
-        roads: readonly RoadLine[];
+        /** 縦断プロファイル付きの道路（描画リボンと同じ高さでコライダーを作る） */
+        roads: readonly RoadPath[];
+        bridges: readonly BridgeSpan[];
     };
     /** 地表標高[m]。エリア外は端の値にクランプされる */
     getElevationAt(x: number, z: number): number;
@@ -130,6 +133,15 @@ export async function buildWorld(
     await nextFrame();
     const terrain = createTerrain(sampler, aerial, heightmap, quality);
 
+    phase = '道路の縦断を解いています';
+    emit();
+    await nextFrame();
+    // 路面標高は前処理と同じソルバーで解く（src/shared/road-profile.js）。
+    // 地形は前処理でこの縦断へカービング済みなので、通常部は地形標高そのまま
+    // （pinned）= 路面と地面に段差が出ない。橋だけが両端の取付点を結ぶ直線になる（契約08）
+    const profiled = buildRoadProfiles(features.roads, terrain.getElevationAt, { pinned: true });
+    const bridgeSpans = buildBridgeSpans(profiled.paths);
+
     phase = '道路・建物の占有図を作成中';
     emit();
     await nextFrame();
@@ -148,7 +160,14 @@ export async function buildWorld(
     phase = '道路・歩道を生成中';
     emit();
     await nextFrame();
-    const roads = createRoads(features.roads, terrain.getElevationAt, quality);
+    const roads = createRoads(profiled.paths, quality);
+    const bridges = createBridges(bridgeSpans, terrain.getElevationAt, quality);
+    if (bridgeSpans.length > 0) {
+        console.info(
+            `[world] 橋 ${bridges.count}本（RdCL セグメント ${profiled.stats.bridgePaths}本）/ 橋脚 ${bridges.piers}基 ` +
+                `(三角形 ${bridges.triangles.toLocaleString()})`,
+        );
+    }
 
     phase = '電柱・ガードレールを配置中';
     emit();
@@ -174,7 +193,7 @@ export async function buildWorld(
 
     const group = new Group();
     group.name = 'world';
-    group.add(terrain.group, roads.hlod.group, buildings.hlod.group);
+    group.add(terrain.group, roads.hlod.group, bridges.group, buildings.hlod.group);
     if (props) group.add(props.group);
     if (vegetation) group.add(vegetation.group);
     scene.add(group);
@@ -189,14 +208,24 @@ export async function buildWorld(
     const chunkTotal =
         terrain.chunkCount + buildings.hlod.cellCount + roads.hlod.cellCount + (props?.cellCount ?? 0);
 
-    // 徒歩視点は道路上に立たせる（原点は斜面や建物の中に落ちることがある）
-    let spawn: Spawn = { x: 0, z: 0, dirX: 0, dirZ: -1 };
+    // 徒歩視点は道路上に立たせる（原点は斜面や建物の中に落ちることがある）。
+    // ?spawn=x,z を付けるとその座標にいちばん近い道路上へ降りる（橋などの目視検証用）
+    const wanted = { x: 0, z: 0 };
+    const spawnParam = new URLSearchParams(location.search).get('spawn');
+    if (spawnParam) {
+        const [px, pz] = spawnParam.split(',').map(Number);
+        if (Number.isFinite(px) && Number.isFinite(pz)) {
+            wanted.x = px;
+            wanted.z = pz;
+        }
+    }
+    let spawn: Spawn = { x: wanted.x, z: wanted.z, dirX: 0, dirZ: -1 };
     let bestDistance = Infinity;
     for (const road of features.roads) {
-        if (road.width < 4) continue;
+        if (road.width < 4 || road.bridge) continue;
         for (let i = 0; i + 1 < road.points.length; i++) {
             const p = road.points[i];
-            const d = p.x * p.x + p.z * p.z;
+            const d = (p.x - wanted.x) ** 2 + (p.z - wanted.z) ** 2;
             if (d >= bestDistance) continue;
             const q = road.points[i + 1];
             const len = Math.hypot(q.x - p.x, q.z - p.z) || 1;
@@ -210,7 +239,7 @@ export async function buildWorld(
         terrain,
         vegetation,
         spawn,
-        collision: { buildings: buildings.collision, roads: features.roads },
+        collision: { buildings: buildings.collision, roads: profiled.paths, bridges: bridgeSpans },
         getElevationAt: terrain.getElevationAt,
         update(camera, q, force = false) {
             camera.updateMatrixWorld();

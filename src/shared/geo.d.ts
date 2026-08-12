@@ -5,6 +5,7 @@ export declare const ORIGIN_LAT: number;
 export declare const AREA_HALF: number;
 export declare const CULL_MARGIN: number;
 export declare const VECTOR_Z: number;
+export declare const TERRAIN_VERTS: number;
 
 export declare function lonToX(lon: number): number;
 export declare function latToZ(lat: number): number;

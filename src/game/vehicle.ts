@@ -77,8 +77,8 @@ const WHEELS: readonly [number, number, number][] = [
     [-WHEEL_X, WHEEL_Y, -WHEEL_Z],
 ];
 
-/** 静止時にサスペンションが縮む量[m]（剛性40 の実測。上のコメント参照） */
-const STATIC_SAG = 0.06;
+/** 静止時にサスペンションが縮む量[m]（剛性30 の実測。上のコメント参照） */
+const STATIC_SAG = 0.08;
 /**
  * 静止時の車輪の描画位置（車体ローカル）。遠隔プレイヤーの車はサスペンションの
  * 伸縮を同期しないので、この固定値で描く（契約05）。
@@ -130,12 +130,14 @@ export function createVehicle(physics: Physics, x: number, y: number, z: number,
         );
     }
     // サスペンション定数は bullet 由来の無次元値（内部で車体質量が掛かる。実測: 剛性 k で
-    // 静的な沈み込みは g/(4k) になる）。k=40 で約 6cm 沈む乗用車らしい足まわりにする
+    // 静的な沈み込みは g/(4k) になる）。k=30 で約 8cm 沈む、やや柔らかい足まわり。
+    // 市街地の細かい凹凸で突き上げないよう、契約08 で 40 → 30・ストローク 0.18 → 0.26 へ
+    // 緩めてある（減衰は 2√k 比を保ったまま、収まりを早くするため戻り側を厚めに）
     for (let i = 0; i < WHEELS.length; i++) {
-        controller.setWheelSuspensionStiffness(i, 40);
-        controller.setWheelSuspensionCompression(i, 4.4);
-        controller.setWheelSuspensionRelaxation(i, 2.8);
-        controller.setWheelMaxSuspensionTravel(i, 0.18);
+        controller.setWheelSuspensionStiffness(i, 30);
+        controller.setWheelSuspensionCompression(i, 3.8);
+        controller.setWheelSuspensionRelaxation(i, 2.6);
+        controller.setWheelMaxSuspensionTravel(i, 0.26);
         controller.setWheelMaxSuspensionForce(i, 60000);
         controller.setWheelFrictionSlip(i, 2.4);
         controller.setWheelSideFrictionStiffness(i, 0.9);

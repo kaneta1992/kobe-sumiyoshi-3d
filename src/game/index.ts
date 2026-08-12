@@ -103,6 +103,7 @@ export function createGame(options: GameOptions): Game {
         getElevationAt: world.getElevationAt,
         buildings: world.collision.buildings,
         roads: world.collision.roads,
+        bridges: world.collision.bridges,
         minElevation: world.stats.minElevation,
         maxElevation: world.stats.maxElevation,
     });

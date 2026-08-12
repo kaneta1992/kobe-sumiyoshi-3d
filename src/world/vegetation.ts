@@ -683,6 +683,7 @@ function collectGroundCover(
     out: VegItem[],
 ): void {
     for (const road of roads) {
+        if (road.bridge) continue; // 橋の上に下草は生えない
         const half = Math.max(1.2, Math.min(road.width, 30)) / 2;
         for (let i = 1; i < road.points.length; i++) {
             const a = road.points[i - 1];

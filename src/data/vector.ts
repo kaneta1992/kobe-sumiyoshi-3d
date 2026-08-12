@@ -3,15 +3,15 @@
  * BldA（建物ポリゴン）と RdCL（道路中心線）をローカル座標のジオメトリに変換する。
  * pbf v5 は PbfReader を named export する（data-spec.md §4 の実測注意書き）。
  *
- * BldA のデコードは前処理スクリプトと共有する（src/shared/bvmap-buildings.js）。
+ * BldA / RdCL のデコードはどちらも前処理スクリプトと共有する
+ * （src/shared/bvmap-buildings.js / src/shared/bvmap-roads.js）。
  */
-import { VectorTile } from '@mapbox/vector-tile';
-import { PbfReader } from 'pbf';
-import { AREA_HALF, CULL_MARGIN, VECTOR_URL, VECTOR_Z, tileUrl } from '../config';
-import { tileCoords, tileRange, tileXToLon, tileYToLat } from '../geo';
-import { latToZ, lonToX } from '../geo';
+import { CULL_MARGIN, VECTOR_URL, VECTOR_Z, tileUrl } from '../config';
+import { tileCoords, tileRange } from '../geo';
 import { readBuildingShapes } from '../shared/bvmap-buildings.js';
 import type { SharedBuildingShape, SharedPoint2 } from '../shared/bvmap-buildings.js';
+import { readRoadLines } from '../shared/bvmap-roads.js';
+import type { SharedRoadLine } from '../shared/bvmap-roads.js';
 import { fetchTileBuffer, mapPool } from '../net/tiles';
 
 export type Point2 = SharedPoint2;
@@ -19,10 +19,8 @@ export type Point2 = SharedPoint2;
 /** 建物: rings[0] が外周、rings[1..] が穴 */
 export type BuildingShape = SharedBuildingShape;
 
-export interface RoadLine {
-    points: Point2[];
-    width: number;
-}
+/** 道路中心線。bridge = true は橋・高架部（vt_code 2703/2713） */
+export type RoadLine = SharedRoadLine;
 
 export interface VectorFeatures {
     buildings: BuildingShape[];
@@ -33,30 +31,6 @@ export interface VectorFeatures {
 export function countVectorTiles(): number {
     const r = tileRange(VECTOR_Z, CULL_MARGIN);
     return r.nx * r.ny;
-}
-
-const LIMIT = AREA_HALF + CULL_MARGIN;
-
-function inArea(p: Point2): boolean {
-    return Math.abs(p.x) <= LIMIT && Math.abs(p.z) <= LIMIT;
-}
-
-/**
- * 幅員属性 → メートル。"3m-5.5m未満" のようなレンジ文字列を数値化する。
- * 値が読めない場合は道路種別から控えめな既定値を使う。
- */
-function parseWidth(props: Record<string, string | number | boolean>): number {
-    const raw = props['vt_rnkwidth'] ?? props['vt_width'];
-    if (typeof raw === 'number' && raw > 0) return Math.min(raw, 40);
-    if (typeof raw === 'string') {
-        const nums = raw.match(/\d+(?:\.\d+)?/g);
-        if (nums && nums.length >= 2) return (Number(nums[0]) + Number(nums[1])) / 2;
-        if (nums && nums.length === 1) {
-            const n = Number(nums[0]);
-            return raw.includes('未満') ? n * 0.75 : n;
-        }
-    }
-    return props['vt_motorway'] ? 12 : 4;
 }
 
 export async function loadVectorFeatures(
@@ -95,29 +69,7 @@ function readTile(
     buildings: BuildingShape[],
     roads: RoadLine[],
 ): void {
-    const tile = new VectorTile(new PbfReader(buf));
-
-    const toWorld = (px: number, py: number, extent: number): Point2 => {
-        const lon = tileXToLon(tx + px / extent, VECTOR_Z);
-        const lat = tileYToLat(ty + py / extent, VECTOR_Z);
-        return { x: lonToX(lon), z: latToZ(lat) };
-    };
-
-    // 穴つきポリゴンへの分解（E7）とエリア外カリングは共有モジュール側で行う
+    // 穴つきポリゴンへの分解（E7）・幅員/橋の判定・エリア外カリングは共有モジュール側で行う
     for (const shape of readBuildingShapes(buf, tx, ty)) buildings.push(shape);
-
-    const rd = tile.layers['RdCL'];
-    if (rd) {
-        for (let i = 0; i < rd.length; i++) {
-            const f = rd.feature(i);
-            const width = parseWidth(f.properties);
-            const extent = f.extent;
-            for (const line of f.loadGeometry()) {
-                if (line.length < 2) continue;
-                const points = line.map((p) => toWorld(p.x, p.y, extent));
-                if (!points.some(inArea)) continue;
-                roads.push({ points, width });
-            }
-        }
-    }
+    for (const line of readRoadLines(buf, tx, ty)) roads.push(line);
 }

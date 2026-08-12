@@ -284,6 +284,9 @@ export function createProps(
 
     for (let ri = 0; ri < roads.length; ri++) {
         const road = roads[ri];
+        // 橋の上には電柱もガードレールも立てない（高欄は bridges.ts が持つ。
+        // 地形標高で置くと谷底に沈む）
+        if (road.bridge) continue;
         const half = Math.max(1.2, Math.min(road.width, 30)) / 2;
         // 道ごとにどちら側へ電柱を立てるかを決める
         const side = hash01(road.points[0].x, road.points[0].z, 0x2c1) < 0.5 ? -1 : 1;

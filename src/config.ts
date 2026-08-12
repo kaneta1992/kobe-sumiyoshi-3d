@@ -10,11 +10,9 @@ export {
     CULL_MARGIN,
     ORIGIN_LAT,
     ORIGIN_LON,
+    TERRAIN_VERTS,
     VECTOR_Z,
 } from './shared/geo.js';
-
-/** 地形メッシュの1辺頂点数。高精細ハイトマップ（1025点）に合わせて上げてある */
-export const TERRAIN_VERTS = 1025;
 
 /** タイルのズームレベル（data-spec.md §2〜§4） */
 export const DEM_Z = 15;

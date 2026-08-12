@@ -9,22 +9,23 @@
  *
  * コライダーは描画と同じ素材から作る:
  *   地形 = 描画地形と同じ 1024 分割ハイトフィールド（乖離ゼロ）
- *   道路 = 描画リボンと同じ drape 高さの三角形メッシュ（路面に足が埋まらない）
+ *   道路 = 描画リボンと同じ縦断プロファイル + drape 高さの三角形メッシュ
+ *   橋   = デッキ上面 + 高欄の内側の壁（桁下は素通し・契約08）
  *   建物 = フットプリント外周の押し出し壁を 300m セルごとに1つの trimesh へまとめる
  *   小物（電柱・樹木・ガードレール）は省略（契約04: すり抜け許容）
  */
 import * as RAPIER from '@dimforge/rapier3d-compat';
 import { AREA_HALF } from '../config';
-import type { RoadLine } from '../data/vector';
 import type { BuildingCollision } from '../world/buildings';
+import { PARAPET_HEIGHT, PARAPET_WIDTH, type BridgeSpan } from '../world/bridges';
 import {
     CURB_HEIGHT,
     CURB_WIDTH,
     DRAPE_OFFSET,
     SIDEWALK_MIN_WIDTH,
     SIDEWALK_WIDTH,
-    resampleCenterline,
 } from '../world/roads';
+import type { RoadPath } from '../shared/road-profile.js';
 
 /** 物理の固定タイムステップ[s] */
 export const FIXED_DT = 1 / 60;
@@ -58,7 +59,8 @@ const STATIC_QUERY = (0xffff << 16) | GROUP_STATIC;
 export interface PhysicsInput {
     getElevationAt(x: number, z: number): number;
     buildings: readonly BuildingCollision[];
-    roads: readonly RoadLine[];
+    roads: readonly RoadPath[];
+    bridges: readonly BridgeSpan[];
     minElevation: number;
     maxElevation: number;
 }
@@ -139,14 +141,10 @@ function addBuildingWalls(map: Map<number, MeshBuffer>, building: BuildingCollis
 }
 
 /** 道路: 描画リボンと同じ位置に水平な帯を敷く（車道 + 幅員の広い道は歩道も） */
-function addRoadRibbons(
-    map: Map<number, MeshBuffer>,
-    road: RoadLine,
-    getElevationAt: (x: number, z: number) => number,
-): void {
-    const pts = resampleCenterline(road.points);
+function addRoadRibbons(map: Map<number, MeshBuffer>, road: RoadPath): void {
+    const pts = road.points;
     if (pts.length < 2) return;
-    const half = Math.max(1.2, Math.min(road.width, 30)) / 2;
+    const half = road.width / 2;
     const walkway = half >= SIDEWALK_MIN_WIDTH / 2;
     // 帯の左右の縁（描画側 addRibbon と同じ「前後の点から法線を作る」手順）
     const a: Edge = [0, 0, 0];
@@ -160,24 +158,58 @@ function addRoadRibbons(
             const inner = side === 0 ? -half : side * (half + CURB_WIDTH);
             const outer = side === 0 ? half : side * (half + CURB_WIDTH + SIDEWALK_WIDTH);
             const lift = side === 0 ? DRAPE_OFFSET : DRAPE_OFFSET + CURB_HEIGHT;
-            edgePoint(pts, i, inner, lift, getElevationAt, a);
-            edgePoint(pts, i, outer, lift, getElevationAt, b);
-            edgePoint(pts, i + 1, outer, lift, getElevationAt, c);
-            edgePoint(pts, i + 1, inner, lift, getElevationAt, d);
+            edgePoint(pts, road.heights, i, inner, lift, a);
+            edgePoint(pts, road.heights, i, outer, lift, b);
+            edgePoint(pts, road.heights, i + 1, outer, lift, c);
+            edgePoint(pts, road.heights, i + 1, inner, lift, d);
             pushQuad(buf, a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2], d[0], d[1], d[2]);
+        }
+    }
+}
+
+/**
+ * 橋: デッキ上面（走行・歩行面）と高欄の内側の壁。桁下には何も置かないので
+ * 橋の下は通り抜けられる（契約08）。
+ */
+function addBridgeDeck(map: Map<number, MeshBuffer>, span: BridgeSpan): void {
+    const pts = span.points;
+    if (pts.length < 2) return;
+    const half = span.deckHalf - PARAPET_WIDTH;
+    const a: Edge = [0, 0, 0];
+    const b: Edge = [0, 0, 0];
+    const c: Edge = [0, 0, 0];
+    const d: Edge = [0, 0, 0];
+    for (let i = 0; i + 1 < pts.length; i++) {
+        const buf = cellOf(map, pts[i].x, pts[i].z);
+        edgePoint(pts, span.heights, i, -half, DRAPE_OFFSET, a);
+        edgePoint(pts, span.heights, i, half, DRAPE_OFFSET, b);
+        edgePoint(pts, span.heights, i + 1, half, DRAPE_OFFSET, c);
+        edgePoint(pts, span.heights, i + 1, -half, DRAPE_OFFSET, d);
+        pushQuad(buf, a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2], d[0], d[1], d[2]);
+        // 高欄（谷へ落ちないように内側の面だけ立てる）
+        for (const side of [-1, 1]) {
+            edgePoint(pts, span.heights, i, side * half, DRAPE_OFFSET, a);
+            edgePoint(pts, span.heights, i + 1, side * half, DRAPE_OFFSET, b);
+            pushQuad(
+                buf,
+                a[0], a[1], a[2],
+                b[0], b[1], b[2],
+                b[0], b[1] + PARAPET_HEIGHT, b[2],
+                a[0], a[1] + PARAPET_HEIGHT, a[2],
+            );
         }
     }
 }
 
 type Edge = [number, number, number];
 
-/** 中心線 pts[i] から法線方向へ offset だけ寄せ、地表 + lift の高さに置いた点 */
+/** 中心線 pts[i] から法線方向へ offset だけ寄せ、路面標高 + lift の高さに置いた点 */
 function edgePoint(
     pts: readonly { x: number; z: number }[],
+    heights: readonly number[] | Float64Array,
     i: number,
     offset: number,
     lift: number,
-    getElevationAt: (x: number, z: number) => number,
     out: Edge,
 ): void {
     const prev = pts[Math.max(0, i - 1)];
@@ -194,7 +226,7 @@ function edgePoint(
     }
     out[0] = pts[i].x - dz * offset;
     out[2] = pts[i].z + dx * offset;
-    out[1] = getElevationAt(out[0], out[2]) + lift;
+    out[1] = heights[i] + lift;
 }
 
 export function createPhysics(input: PhysicsInput): Physics {
@@ -232,7 +264,10 @@ export function createPhysics(input: PhysicsInput): Physics {
 
     // --- 道路・建物 ---------------------------------------------------------
     const roadCells = new Map<number, MeshBuffer>();
-    for (const road of input.roads) addRoadRibbons(roadCells, road, input.getElevationAt);
+    for (const road of input.roads) {
+        if (!road.bridge) addRoadRibbons(roadCells, road);
+    }
+    for (const span of input.bridges) addBridgeDeck(roadCells, span);
     const buildingCells = new Map<number, MeshBuffer>();
     for (const building of input.buildings) addBuildingWalls(buildingCells, building);
 

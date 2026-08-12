@@ -26,6 +26,13 @@ export const CULL_MARGIN = 120;
 /** 最適化ベクトルタイル（bvmap）のズーム */
 export const VECTOR_Z = 16;
 
+/**
+ * 地形メッシュの1辺頂点数（高精細ハイトマップに合わせて 1025 = 1024分割）。
+ * 物理ハイトフィールドも同じ刻みで作る。前処理側の検証（クライアントが実際に
+ * 見る地表を再現して段差を測る）でも使うので共有定義に置く。
+ */
+export const TERRAIN_VERTS = 1025;
+
 const DEG = Math.PI / 180;
 const M_PER_DEG_LAT = 111132;
 const M_PER_DEG_LON = 111320 * Math.cos(ORIGIN_LAT * DEG);

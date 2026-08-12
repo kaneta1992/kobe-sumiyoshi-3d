@@ -11,6 +11,7 @@
  *   ?stats              画面内 stats（fps / draw / tri / chunk / HLOD / scale / phys）
  *   ?fly                自由カメラ（デバッグ用。物理を読み込まない）
  *   ?hour=15.5          太陽の時刻
+ *   ?spawn=x,z          指定座標にいちばん近い道路上から開始（橋などの目視検証用）
  *   ?room=名前          マルチプレイのルーム（既定 kobe-sumiyoshi-3d-v1）
  *   ?solo               マルチプレイを使わない
  *

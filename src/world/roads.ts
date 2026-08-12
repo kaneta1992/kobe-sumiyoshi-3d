@@ -1,9 +1,15 @@
 /**
- * 道路。RdCL（道路中心線）を幅員に応じたリボンにし、地形に沿わせて少し浮かせる。
+ * 道路。RdCL（道路中心線）を幅員に応じたリボンにする。
+ *
+ * 高さは縦断プロファイル（src/shared/road-profile.js）が決める。前処理はこの同じ
+ * プロファイルへ地形を吸着させてある（カービング）ので、路面は地形とほぼ同一面に載る。
+ * したがってドレープは z-fighting を避ける最小限（3cm）でよい（契約08）。
  *
  * 近景（1.6m 視点）で効くのは路面そのものより「白線・縁石・歩道」の存在なので、
  * 車道リボンに加えて幅員 5.5m 以上の道には縁石と歩道を生成する。
  * 白線とアスファルトのムラは頂点属性（横断位置・幅員・進行距離）からシェーダーで描く。
+ *
+ * 橋・高架部（bridge）はここでは扱わない。桁・高欄・橋脚を持つ別ジオメトリ（bridges.ts）。
  *
  * HLOD セルに割ってフラスタム/距離カリングする（追記2-1）。遠景セルは白線を持たない
  * 簡略メッシュにしてモアレとドローコールを減らす。
@@ -13,16 +19,15 @@ import { abs, attribute, float, mix, mx_noise_float, positionView, positionWorld
 import { createBuf, pushVertex, toGeometry, type MeshBuf } from './geom';
 import { buildHlod, type Hlod } from './hlod';
 import type { QualitySettings } from '../quality';
-import type { Point2, RoadLine } from '../data/vector';
+import type { Point2 } from '../data/vector';
+import type { RoadPath } from '../shared/road-profile.js';
 
-/** 地形起伏に追従させるための再サンプリング間隔[m] */
-const SEGMENT_LENGTH = 6;
 /**
  * 路面の寸法。物理コライダー（src/game/physics.ts）も同じ値で帯を作るので、
  * ここを変えると路面と足元がずれる。二重定義を作らないこと。
  */
-/** 地表からの浮かせ量[m] */
-export const DRAPE_OFFSET = 0.32;
+/** 路面標高からの浮かせ量[m]。地形はこの標高へカービング済みなので z-fighting 回避ぶんだけ */
+export const DRAPE_OFFSET = 0.03;
 /** 縁石の高さ[m] と 見付け幅[m] */
 export const CURB_HEIGHT = 0.15;
 export const CURB_WIDTH = 0.22;
@@ -38,22 +43,6 @@ const SURFACE_SIDEWALK = 2;
 
 const ASPHALT: readonly [number, number, number] = [0.052, 0.052, 0.055];
 const CONCRETE: readonly [number, number, number] = [0.29, 0.285, 0.27];
-
-/** 長い区間を分割し、地形に追従する頂点列にする（物理コライダー生成でも使う） */
-export function resampleCenterline(points: readonly Point2[]): Point2[] {
-    const out: Point2[] = [points[0]];
-    for (let i = 1; i < points.length; i++) {
-        const a = points[i - 1];
-        const b = points[i];
-        const len = Math.hypot(b.x - a.x, b.z - a.z);
-        const steps = Math.max(1, Math.ceil(len / SEGMENT_LENGTH));
-        for (let s = 1; s <= steps; s++) {
-            const t = s / steps;
-            out.push({ x: a.x + (b.x - a.x) * t, z: a.z + (b.z - a.z) * t });
-        }
-    }
-    return out;
-}
 
 /**
  * 路面マテリアル。
@@ -114,37 +103,37 @@ export interface RoadsResult {
     hlod: Hlod;
 }
 
-export function createRoads(
-    lines: readonly RoadLine[],
-    getElevationAt: (x: number, z: number) => number,
-    quality: QualitySettings,
-): RoadsResult {
+export function createRoads(paths: readonly RoadPath[], quality: QualitySettings): RoadsResult {
     // HLOD セルへ配るための代表点（線分ごとに分割して細かく配る）
     interface Piece {
         points: Point2[];
+        /** points と同じ長さの路面標高[m] */
+        heights: number[];
         width: number;
         /** 線の先頭からの距離（白線の破線を連続させるため） */
         startDistance: number;
         center: Point2;
+        /** 橋の上（車道だけ敷く。縁石・歩道は高欄と干渉するので付けない） */
+        bridge: boolean;
     }
     const pieces: Piece[] = [];
-    for (const line of lines) {
-        const pts = resampleCenterline(line.points);
+    for (const path of paths) {
+        const pts = path.points;
         if (pts.length < 2) continue;
-        const width = Math.max(1.2, Math.min(line.width, 30));
         // 60m 程度ずつに切って、セルをまたぐ長い帯を作らない
         const chunk = 10;
-        let travelled = 0;
         for (let i = 0; i < pts.length - 1; i += chunk) {
-            const slice = pts.slice(i, Math.min(pts.length, i + chunk + 1));
-            if (slice.length < 2) break;
-            let length = 0;
-            for (let k = 1; k < slice.length; k++) {
-                length += Math.hypot(slice[k].x - slice[k - 1].x, slice[k].z - slice[k - 1].z);
-            }
-            const mid = slice[Math.floor(slice.length / 2)];
-            pieces.push({ points: slice, width, startDistance: travelled, center: { x: mid.x, z: mid.z } });
-            travelled += length;
+            const end = Math.min(pts.length, i + chunk + 1);
+            if (end - i < 2) break;
+            const mid = pts[Math.floor((i + end) / 2)];
+            pieces.push({
+                points: pts.slice(i, end),
+                heights: Array.from(path.heights.slice(i, end)),
+                width: path.width,
+                startDistance: path.dists[i],
+                center: { x: mid.x, z: mid.z },
+                bridge: path.bridge,
+            });
         }
     }
 
@@ -192,8 +181,10 @@ export function createRoads(
             const az = pts[i].z + pz * innerOffset;
             const bx = pts[i].x + px * outerOffset;
             const bz = pts[i].z + pz * outerOffset;
-            left.push(ax, getElevationAt(ax, az) + yOffset, az);
-            right.push(bx, getElevationAt(bx, bz) + outerYOffset, bz);
+            // 断面は水平（路面は縦断プロファイルの高さ）。地形はそこへカービング済み
+            const y = piece.heights[i];
+            left.push(ax, y + yOffset, az);
+            right.push(bx, y + outerYOffset, bz);
             lateralL.push(innerOffset / half);
             lateralR.push(outerOffset / half);
         }
@@ -258,7 +249,7 @@ export function createRoads(
                 const half = piece.width / 2;
                 addRibbon(buf, piece, -half, half, DRAPE_OFFSET, DRAPE_OFFSET, ASPHALT, SURFACE_ASPHALT, 1);
                 // 縁石と歩道は近距離セルだけ（遠景では見えないうえドローコールの無駄）
-                if (level > 0 || piece.width < SIDEWALK_MIN_WIDTH) continue;
+                if (level > 0 || piece.bridge || piece.width < SIDEWALK_MIN_WIDTH) continue;
                 for (const side of [-1, 1]) {
                     const inner = side * half;
                     const curbOuter = side * (half + CURB_WIDTH);
