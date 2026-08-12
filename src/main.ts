@@ -2,26 +2,58 @@
  * エントリポイント。レンダラー初期化 → 環境構築 → ワールド読み込み → 描画ループ。
  * レンダラーは WebGPURenderer を使う。WebGPU 非対応環境では three が
  * WebGL2 バックエンドへ自動フォールバックする（E5-b）。
+ *
+ * URL パラメータ:
+ *   ?webgl              WebGL2 バックエンドを強制（フォールバック確認用）
+ *   ?quality=mobile|desktop / ?tier=0..2   品質プリセットの強制
+ *   ?stats              画面内 stats（fps / draw / tri / chunk / HLOD / scale）
+ *   ?walk               地上 1.6m の徒歩視点で開始（近景の確認用）
+ *   ?hour=15.5          太陽の時刻
+ *
+ * 性能規律（契約03 追記2）:
+ *   - フレームループ内で new を作らない
+ *   - フレームタイムの EMA を見てレンダースケールを段階降格 / 復帰
+ *   - それでも足りなければ品質段階（tier）を1段ずつ落とす（戻さない）
  */
 import { ACESFilmicToneMapping, PCFSoftShadowMap, PerspectiveCamera, Scene, Vector3, WebGPURenderer } from 'three/webgpu';
 import { createFlyCamera } from './camera';
+import { createQuality, initialQuality, maxTier, sunHour, tierIsPinned, type QualitySettings } from './quality';
+import { createPostProcessing, type PostChain } from './render/post';
+import { createStatsOverlay } from './ui/stats';
 import { hideLoading, setLoadingProgress, setStatus, showFatal } from './ui/loading';
 import { createEnvironment } from './world/environment';
+import { fogRangeNode, setSunHour } from './world/sun';
 import { buildWorld, worldEvents, type World, type WorldProgress } from './world';
+
+/** 動的解像度スケーリングの段階 */
+const RENDER_SCALES = [1, 0.85, 0.72, 0.6, 0.5];
+/** レンダースケールを見直す間隔[s]（頻繁に変えるとバッファ再確保でかえって重い） */
+const SCALE_INTERVAL = 1.4;
+/** 品質段階を落とすまでに我慢する時間[s] */
+const TIER_PATIENCE = 6;
 
 async function start(): Promise<void> {
     const container = document.getElementById('app');
     if (!container) throw new Error('#app が見つかりません');
 
+    let quality: QualitySettings = initialQuality();
+    setSunHour(sunHour());
+
     // ?webgl を付けると WebGL2 バックエンドを強制する（E5-b のフォールバック確認用）
-    const forceWebGL = new URLSearchParams(location.search).has('webgl');
-    const renderer = new WebGPURenderer({ antialias: true, forceWebGL });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    const params = new URLSearchParams(location.search);
+    const forceWebGL = params.has('webgl');
+    const renderer = new WebGPURenderer({ antialias: false, forceWebGL });
+    const basePixelRatio = Math.min(window.devicePixelRatio, quality.maxPixelRatio);
+    let scaleIndex = 0;
+    renderer.setPixelRatio(basePixelRatio);
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.toneMapping = ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 0.95;
-    renderer.shadowMap.enabled = true;
+    renderer.toneMappingExposure = 1.05;
+    renderer.shadowMap.enabled = quality.shadows;
     renderer.shadowMap.type = PCFSoftShadowMap;
+    // ポストプロセスは1フレームに複数回 render するので、自動リセットを止めて
+    // フレーム全体の draw call / triangle を積算する（stats の実測値のため）
+    renderer.info.autoReset = false;
     await renderer.init();
     container.appendChild(renderer.domElement);
 
@@ -30,12 +62,19 @@ async function start(): Promise<void> {
         : 'WebGL2';
 
     const scene = new Scene();
-    const camera = new PerspectiveCamera(60, window.innerWidth / window.innerHeight, 1, 30000);
+    const camera = new PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.35, quality.cameraFar);
     camera.position.set(0, 700, 900);
     const controls = createFlyCamera(camera, renderer.domElement);
     controls.setView(new Vector3(0, 700, 900), new Vector3(0, 250, -300));
 
-    createEnvironment(scene);
+    const environment = createEnvironment(scene, quality);
+    fogRangeNode.value.set(quality.fogNear, quality.fogFar);
+
+    let post: PostChain | null = createPostProcessing(renderer, scene, camera, quality);
+    const stats = createStatsOverlay(
+        renderer,
+        () => `${backend} / ${quality.preset} t${quality.tier}`,
+    );
 
     const onResize = (): void => {
         camera.aspect = window.innerWidth / window.innerHeight;
@@ -48,33 +87,100 @@ async function start(): Promise<void> {
         const p = (e as CustomEvent<WorldProgress>).detail;
         setLoadingProgress(p.loaded, p.total, p.phase);
     });
+
+    let world: World | null = null;
     worldEvents.addEventListener('ready', (e) => {
-        const world = (e as CustomEvent<World>).detail;
-        const groundY = world.getElevationAt(0, 0);
-        controls.setView(
-            new Vector3(0, groundY + 330, 780),
-            new Vector3(0, groundY + 60, -260),
-        );
-        hideLoading();
+        world = (e as CustomEvent<World>).detail;
+        const spawn = world.spawn;
+        const groundY = world.getElevationAt(spawn.x, spawn.z);
+        if (params.has('walk')) {
+            // 徒歩視点（地上 1.6m・道路上）。近景品質の確認はこの高さで行う
+            const ahead = 40;
+            const targetX = spawn.x + spawn.dirX * ahead;
+            const targetZ = spawn.z + spawn.dirZ * ahead;
+            controls.setView(
+                new Vector3(spawn.x, groundY + 1.6, spawn.z),
+                new Vector3(targetX, world.getElevationAt(targetX, targetZ) + 2.6, targetZ),
+            );
+        } else {
+            controls.setView(
+                new Vector3(spawn.x, groundY + 70, spawn.z + 190),
+                new Vector3(spawn.x, groundY + 10, spawn.z - 160),
+            );
+        }
+        world.update(camera, quality, true);
+        stats.measure(scene);
         const s = world.stats;
         setStatus(
-            `${backend}　建物 ${s.buildings}（実測高さ ${s.buildingsMeasured}）　道路 ${s.roads}　` +
-                `樹木 ${s.trees}　標高 ${s.minElevation.toFixed(0)}〜${s.maxElevation.toFixed(0)}m` +
+            `${backend}　${quality.preset}　建物 ${s.buildings}（実測高さ ${s.buildingsMeasured}）　道路 ${s.roads}　` +
+                `樹木 ${s.trees}　植生 ${s.vegetationItems}　標高 ${s.minElevation.toFixed(0)}〜${s.maxElevation.toFixed(0)}m` +
                 `　地形 ${s.hiresTerrain ? '50cm' : 'DEM5A'}` +
                 (s.vectorTilesFailed > 0 ? `　欠損タイル ${s.vectorTilesFailed}` : ''),
         );
+        // 全パイプラインを先にコンパイルしてから表示する（初回視界移動のカクつき防止）。
+        // 数十のパイプラインを作るので時間がかかる。何をしているかは表示しておく
+        setLoadingProgress(1, 1, 'シェーダーを準備中');
+        void world.prewarm(renderer, scene, camera).then(() => hideLoading());
     });
 
+    /** 品質段階を1段落とす。ジオメトリは作り直さず、距離・影・ポストだけ効かせる */
+    const downgrade = (): void => {
+        if (tierIsPinned() || quality.tier >= maxTier(quality.preset)) return;
+        quality = createQuality(quality.preset, quality.tier + 1);
+        renderer.shadowMap.enabled = quality.shadows;
+        environment.sun.castShadow = quality.shadows;
+        fogRangeNode.value.set(quality.fogNear, quality.fogFar);
+        post?.dispose();
+        post = createPostProcessing(renderer, scene, camera, quality);
+        world?.update(camera, quality, true);
+        console.info(`[quality] 段階を ${quality.tier} に落としました`);
+    };
+
     let last = performance.now();
+    let scaleTimer = 0;
+    let slowTimer = 0;
     renderer.setAnimationLoop((now: number) => {
         const dt = Math.min(0.1, (now - last) / 1000);
         last = now;
+        renderer.info.reset();
         controls.update(dt);
-        renderer.render(scene, camera);
+        environment.update(camera);
+        world?.update(camera, quality);
+
+        if (post) post.render();
+        else renderer.render(scene, camera);
+
+        const frameMs = stats.sample(dt, RENDER_SCALES[scaleIndex]);
+        // ロード中・プリウォーム中の重さで品質を落とさない
+        if (!world) return;
+        const targetMs = 1000 / quality.targetFps;
+
+        // --- 動的解像度スケーリング（追記2-2） ---
+        // vsync では frameMs が target を下回らないので、復帰判定は target 直上に置く
+        scaleTimer += dt;
+        if (scaleTimer >= SCALE_INTERVAL) {
+            scaleTimer = 0;
+            const minIndex = RENDER_SCALES.findIndex((s) => s <= quality.minRenderScale);
+            const lastIndex = minIndex < 0 ? RENDER_SCALES.length - 1 : minIndex;
+            if (frameMs > targetMs * 1.25 && scaleIndex < lastIndex) {
+                scaleIndex++;
+                renderer.setPixelRatio(basePixelRatio * RENDER_SCALES[scaleIndex]);
+            } else if (frameMs < targetMs * 1.06 && scaleIndex > 0) {
+                scaleIndex--;
+                renderer.setPixelRatio(basePixelRatio * RENDER_SCALES[scaleIndex]);
+            }
+        }
+
+        // --- それでも足りなければ品質段階を落とす（一方通行・振動しない） ---
+        slowTimer = frameMs > targetMs * 1.4 ? slowTimer + dt : 0;
+        if (slowTimer > TIER_PATIENCE) {
+            slowTimer = 0;
+            downgrade();
+        }
     });
 
     try {
-        await buildWorld(scene);
+        await buildWorld(scene, quality);
     } catch (err) {
         console.error(err);
         showFatal(`ワールドの読み込みに失敗しました: ${String(err)}`);
