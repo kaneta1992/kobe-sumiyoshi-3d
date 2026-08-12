@@ -76,3 +76,9 @@ DECISION: 採用済みスタック（地理院DEM+bvmap）を維持し、建物�
 - タイル疎通: dem5a_png 15/28694/13008 → 200 / seamlessphoto 17/114779/52032.jpg → 200（.pngは404） / optimal_bvmap-v1 16/57389/26016.pbf → 200, BldA 517件（3101:435, 3102:27, 3111:55）, RdCL 237件（幅員属性あり）
 - CORS: cyberjapandata.gsi.go.jp は Access-Control-Allow-Origin: * → GitHub Pages からの直接fetch可
 - GitHub: gh CLI 認証済み（kaneta1992）。plan情報はAPIからnull（Pages private可否はデプロイ時に判明 → E: Freeなら公開リポ必要、その際ユーザー確認）
+
+## 契約03の中断と再委譲（2026-08-12）
+
+- ユーザー中断により契約03エージェントが停止（書きかけ5ファイル）→ スクラッチパッドへ退避後 `git checkout`+削除でチェックポイントへ復元、tsc clean 確認 [確認済み]
+- DECISION: 中断分は破棄して仕切り直し — 中途状態の整合性が検証不能なため（blocked ≠ failed、リトライには数えない）
+- DECISION: ユーザー要件追加「Pixel 7a 30fps・計測・カリング」を契約03/04に追記してから再委譲 — 後付け最適化より構造への織り込みを優先
