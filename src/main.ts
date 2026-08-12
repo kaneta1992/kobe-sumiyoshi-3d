@@ -10,7 +10,8 @@
  *   ?quality=mobile|desktop / ?tier=0..2   品質プリセットの強制
  *   ?stats              画面内 stats（fps / draw / tri / chunk / HLOD / scale / phys）
  *   ?fly                自由カメラ（デバッグ用。物理を読み込まない）
- *   ?hour=15.5          太陽の時刻
+ *   ?hour=15.5          太陽の時刻（0〜24。夜は月光になる）
+ *   ?shot=1..6          画作りレビュー用の定点カメラ（契約07）
  *   ?spawn=x,z          指定座標にいちばん近い道路上から開始（橋などの目視検証用）
  *   ?room=名前          マルチプレイのルーム（既定 kobe-sumiyoshi-3d-v1）
  *   ?solo               マルチプレイを使わない
@@ -21,7 +22,7 @@
  *   - それでも足りなければ品質段階（tier）を1段ずつ落とす（戻さない）
  */
 import { ACESFilmicToneMapping, PCFSoftShadowMap, PerspectiveCamera, Scene, Vector3, WebGPURenderer } from 'three/webgpu';
-import { createFlyCamera } from './camera';
+import { createFlyCamera, shotHour, shotIndex, shotView, type ShotView } from './camera';
 import type { Game } from './game';
 import type { Multiplayer } from './net/multiplayer';
 import { createQuality, initialQuality, maxTier, sunHour, tierIsPinned, type QualitySettings } from './quality';
@@ -45,10 +46,13 @@ async function start(): Promise<void> {
     if (!container) throw new Error('#app が見つかりません');
 
     let quality: QualitySettings = initialQuality();
-    setSunHour(sunHour());
-
     // ?webgl を付けると WebGL2 バックエンドを強制する（E5-b のフォールバック確認用）
     const params = new URLSearchParams(location.search);
+    // 定点カメラ（?shot）は画に固有の時刻を持つ。?hour が明示されていればそちらを優先。
+    // 太陽光の色・強さは環境の構築時に読むので、ここで確定させておく
+    const shot = shotIndex();
+    const forcedHour = params.has('hour') ? null : shotHour(shot);
+    setSunHour(forcedHour ?? sunHour());
     const forceWebGL = params.has('webgl');
     const renderer = new WebGPURenderer({ antialias: false, forceWebGL });
     const basePixelRatio = Math.min(window.devicePixelRatio, quality.maxPixelRatio);
@@ -125,6 +129,12 @@ async function start(): Promise<void> {
     });
 
     let world: World | null = null;
+    /**
+     * 定点カメラの視点（?shot）。操作系・物理はそのまま動かしたまま、
+     * 毎フレームこの姿勢でカメラを上書きする（E59）
+     */
+    let shotPose: ShotView | null = null;
+
     /** ワールドが揃ってから物理・操作系を作る（E2: ロード完了前にスポーンしない） */
     const onWorldReady = async (ready: World): Promise<void> => {
         const spawn = ready.spawn;
@@ -165,6 +175,20 @@ async function start(): Promise<void> {
                 // 物理を用意できなくても真っ白にはしない（E25）
                 console.error('[game] 物理の初期化に失敗しました', err);
                 setHelp('物理の初期化に失敗したため自由カメラで表示しています');
+            }
+        }
+
+        if (shot > 0) {
+            shotPose = shotView(shot, {
+                spawn,
+                getElevationAt: ready.getElevationAt,
+                minElevation: ready.stats.minElevation,
+                maxElevation: ready.stats.maxElevation,
+            });
+            if (shotPose) {
+                camera.position.copy(shotPose.eye);
+                camera.lookAt(shotPose.target);
+                setHelp(`定点カメラ ?shot=${shot}　${shotPose.label}`);
             }
         }
 
@@ -210,6 +234,11 @@ async function start(): Promise<void> {
         renderer.info.reset();
         if (game) game.update(dt);
         else controls?.update(dt);
+        // 定点カメラは操作系のあとに上書きする（物理・アバターはそのまま動く）
+        if (shotPose) {
+            camera.position.copy(shotPose.eye);
+            camera.lookAt(shotPose.target);
+        }
         multiplayer?.update(dt);
         map?.update(dt); // 中で10Hzに間引く（マーカー層だけ描き直す）
         environment.update(camera);

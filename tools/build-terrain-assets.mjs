@@ -29,6 +29,7 @@ import {
 } from './lib/assets.mjs';
 import { loadVectorFeatures } from './lib/bvmap.mjs';
 import { downloadSheets, zipPath } from './lib/download.mjs';
+import { GI_SIZE, bakeGi } from './lib/gi.mjs';
 import { loadGsiElevation } from './lib/gsi-dem.mjs';
 import { encodePngRgb } from './lib/png.mjs';
 import { GRID_DIR, OUT_DIR, ensureDirs } from './lib/paths.mjs';
@@ -290,6 +291,20 @@ async function stageAssets() {
         console.warn('[検証 E12] 一致率が 80% 未満です。要調査');
     }
 
+    // --- ベイクGI（契約07 追記1） ---
+    // 地形はカービング後、遮蔽は「地形+建物=硬い」「樹冠=参加媒質」。建物マスクが
+    // 要るのでここで焼く（太陽の直接光は焼かない = 時刻を変えても破綻しない）
+    const giT0 = Date.now();
+    const gi = bakeGi(ground, grids.dsmMax, buildingMask);
+    const giPng = encodePngRgb(gi.rgb, GI_SIZE, GI_SIZE);
+    writeFileSync(join(OUT_DIR, 'gi.png'), giPng);
+    writeFileSync(join(OUT_DIR, 'gi.json'), JSON.stringify(gi.meta));
+    console.log(
+        `[assets] gi.png ${GI_SIZE}x${GI_SIZE} ${(giPng.length / 1048576).toFixed(2)}MB ` +
+            `空可視率 平均 ${gi.stats.meanSky.toFixed(3)} / 最小 ${gi.stats.minSky.toFixed(3)}、` +
+            `1バウンス 最大 ${gi.stats.maxBounce.toFixed(3)} (${((Date.now() - giT0) / 1000).toFixed(1)}s)`,
+    );
+
     // --- 樹木 ---
     const { trees, stats: treeStats } = buildTrees(ndsm, buildingMask);
     writeFileSync(
@@ -304,7 +319,14 @@ async function stageAssets() {
             `間隔係数 ${treeStats.radiusScale.toFixed(2)})`,
     );
 
-    const total = ['heightmap.png', 'heightmap.json', 'building-heights.json', 'trees.json'].reduce(
+    const total = [
+        'heightmap.png',
+        'heightmap.json',
+        'gi.png',
+        'gi.json',
+        'building-heights.json',
+        'trees.json',
+    ].reduce(
         (a, f) => a + statSync(join(OUT_DIR, f)).size,
         0,
     );

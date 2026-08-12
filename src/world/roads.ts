@@ -18,7 +18,9 @@ import { Mesh, MeshStandardNodeMaterial, Object3D } from 'three/webgpu';
 import { abs, attribute, float, mix, mx_noise_float, positionView, positionWorld, saturate, smoothstep, vec3 } from 'three/tsl';
 import { createBuf, pushVertex, toGeometry, type MeshBuf } from './geom';
 import { buildHlod, type Hlod } from './hlod';
+import { GI_AO_STRENGTH, GI_BOUNCE_SCALE, bounceColorNode } from './sun';
 import type { QualitySettings } from '../quality';
+import type { GiMap } from '../data/terrain-assets';
 import type { Point2 } from '../data/vector';
 import type { RoadPath } from '../shared/road-profile.js';
 
@@ -94,7 +96,12 @@ function createRoadMaterial(quality: QualitySettings): MeshStandardNodeMaterial 
     const isWalk = smoothstep(1.5, 1.9, kind);
     const walk = withPaint.mul(mix(float(1), float(0.74), joint.mul(near).mul(isWalk)));
 
-    material.colorNode = quality.preset === 'desktop' ? walk : mix(base, base.mul(mix(float(0.85), float(1.2), blotch)), isAsphalt);
+    const color = quality.preset === 'desktop' ? walk : mix(base, base.mul(mix(float(0.85), float(1.2), blotch)), isAsphalt);
+    material.colorNode = color;
+    // ベイクGI（追記1）: 路地・軒下・並木の下で路面が落ちる。x=空可視率 / y=1バウンス
+    const gi = attribute<'vec2'>('aGi', 'vec2');
+    material.aoNode = mix(float(1), gi.x, GI_AO_STRENGTH);
+    material.emissiveNode = color.mul(bounceColorNode).mul(gi.y.mul(GI_BOUNCE_SCALE));
     material.roughnessNode = mix(float(0.94), float(0.55), paint);
     return material;
 }
@@ -103,7 +110,11 @@ export interface RoadsResult {
     hlod: Hlod;
 }
 
-export function createRoads(paths: readonly RoadPath[], quality: QualitySettings): RoadsResult {
+export function createRoads(
+    paths: readonly RoadPath[],
+    gi: GiMap | null,
+    quality: QualitySettings,
+): RoadsResult {
     // HLOD セルへ配るための代表点（線分ごとに分割して細かく配る）
     interface Piece {
         points: Point2[];
@@ -154,6 +165,7 @@ export function createRoads(paths: readonly RoadPath[], quality: QualitySettings
         const pts = piece.points;
         const half = piece.width / 2;
         const roadAttr = b.extra['aRoad'];
+        const giAttr = b.extra['aGi'];
         let distance = piece.startDistance;
         const left: number[] = [];
         const right: number[] = [];
@@ -235,6 +247,10 @@ export function createRoads(paths: readonly RoadPath[], quality: QualitySettings
                         color[2] * shade,
                     );
                     roadAttr.push(v[1], half, v[2], kind);
+                    giAttr.push(
+                        gi ? gi.skyAt(v[0][0], v[0][2], 0.2) : 1,
+                        gi ? gi.bounceAt(v[0][0], v[0][2]) : 0,
+                    );
                 }
             }
         }
@@ -243,7 +259,7 @@ export function createRoads(paths: readonly RoadPath[], quality: QualitySettings
     const hlod = buildHlod(
         pieces.map((p) => p.center),
         (level, indices): Object3D | null => {
-            const buf = createBuf(['aRoad']);
+            const buf = createBuf(['aRoad', 'aGi']);
             for (const index of indices) {
                 const piece = pieces[index];
                 const half = piece.width / 2;
@@ -271,7 +287,7 @@ export function createRoads(paths: readonly RoadPath[], quality: QualitySettings
                 }
             }
             if (buf.pos.length === 0) return null;
-            const mesh = new Mesh(toGeometry(buf, { aRoad: 4 }), material);
+            const mesh = new Mesh(toGeometry(buf, { aRoad: 4, aGi: 2 }), material);
             mesh.name = `roads-L${level}`;
             mesh.receiveShadow = true;
             mesh.matrixAutoUpdate = false;

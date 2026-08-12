@@ -33,7 +33,8 @@ import { latToTileY, lonToTileX, xToLon, zToLat } from '../geo';
 import type { QualitySettings } from '../quality';
 import type { ElevationSampler } from '../data/dem';
 import type { AerialImage } from '../data/photo';
-import type { Heightmap } from '../data/terrain-assets';
+import type { GiMap, Heightmap } from '../data/terrain-assets';
+import { GI_AO_STRENGTH, GI_BOUNCE_SCALE, bounceColorNode } from './sun';
 
 export interface Terrain {
     group: Group;
@@ -140,7 +141,8 @@ function toTexture(canvas: HTMLCanvasElement, maxSize: number): Texture {
 
 function createMaterial(map: Texture, quality: QualitySettings): MeshStandardNodeMaterial {
     const material = new MeshStandardNodeMaterial({ roughness: 0.96, metalness: 0 });
-    const baked = attribute<'vec3'>('aGround', 'vec3'); // x=AO, y=傾斜, z=標高
+    // x = ベイクGIの空可視率 / y = 傾斜 / z = ベイクGIの1バウンス受光量
+    const baked = attribute<'vec3'>('aGround', 'vec3');
     const albedo = textureNode(map, uv()).rgb;
     // 傾斜が急なところは土肌寄りに寄せて、写真ののっぺり感を崩す。
     // ほぼ垂直な面は擁壁・法面ブロックなので、コンクリート寄りの色にする
@@ -150,15 +152,20 @@ function createMaterial(map: Texture, quality: QualitySettings): MeshStandardNod
     const slope = saturate(baked.y.sub(0.42).mul(1.9));
     const cliff = saturate(baked.y.sub(0.74).mul(3.4));
     const soiled = mix(albedo, albedo.mul(0.55).add(soil.mul(0.45)), slope);
-    const tinted = mix(soiled, albedo.mul(0.3).add(wall.mul(0.7)), cliff).mul(baked.x);
+    const tinted = mix(soiled, albedo.mul(0.3).add(wall.mul(0.7)), cliff);
     // 近景だけ高周波のムラを足す（航空写真が甘くなる 1.6m 視点対策）
     const closeness = smoothstep(20, 150, positionView.length()).oneMinus();
     const grain = mx_noise_float(positionWorld.mul(0.85)).mul(0.5).add(0.5);
     const coarse = mx_noise_float(positionWorld.mul(0.13)).mul(0.5).add(0.5);
-    material.colorNode =
+    const base =
         quality.preset === 'desktop'
             ? tinted.mul(mix(float(1), mix(float(0.72), float(1.3), grain.mul(0.6).add(coarse.mul(0.4))), closeness))
             : tinted;
+    material.colorNode = base;
+    // ベイクGI（追記1）: 空可視率は環境光だけを削り、直射日光は削らない。
+    // 塞がれたぶんは1バウンスで拾い直すので谷筋・林床が黒く潰れない
+    material.aoNode = mix(float(1), baked.x, GI_AO_STRENGTH);
+    material.emissiveNode = base.mul(bounceColorNode).mul(baked.z.mul(GI_BOUNCE_SCALE));
     material.roughnessNode = mix(float(0.99), float(0.86), baked.y);
     return material;
 }
@@ -167,6 +174,7 @@ export function createTerrain(
     sample: ElevationSampler,
     aerial: AerialImage,
     heightmap: Heightmap | null,
+    gi: GiMap | null,
     quality: QualitySettings,
 ): Terrain {
     const heights = new Float32Array(N * N);
@@ -202,9 +210,12 @@ export function createTerrain(
         return h00 * (1 - tx) * (1 - tz) + h10 * tx * (1 - tz) + h01 * (1 - tx) * tz + h11 * tx * tz;
     };
 
-    const ao = bakeAmbientOcclusion(heights);
+    // 前処理のベイクGI（追記1）が使えればそれを使う。無ければ起動時に
+    // 地形だけの粗い遮蔽を焼く（従来動作へのフォールバック・E58）
+    const ao = gi ? null : bakeAmbientOcclusion(heights);
     const aoStep = (AREA_HALF * 2) / (AO_GRID - 1);
-    const sampleAO = (x: number, z: number): number => {
+    const sampleFallbackAO = (x: number, z: number): number => {
+        if (!ao) return 1;
         const fx = Math.min(Math.max((x + AREA_HALF) / aoStep, 0), AO_GRID - 1);
         const fz = Math.min(Math.max((z + AREA_HALF) / aoStep, 0), AO_GRID - 1);
         const c = Math.min(Math.floor(fx), AO_GRID - 2);
@@ -264,9 +275,9 @@ export function createTerrain(
                 uvs[target * 2] = (lonToTileX(lon, range.z) - range.x0) / range.nx;
                 // テクスチャは flipY されるので v を反転する
                 uvs[target * 2 + 1] = 1 - (latToTileY(zToLat(z), range.z) - range.y0) / range.ny;
-                ground[target * 3] = sampleAO(x, z);
+                ground[target * 3] = gi ? gi.skyAt(x, z, 0) : sampleFallbackAO(x, z);
                 ground[target * 3 + 1] = 1 - scratchNormal.y;
-                ground[target * 3 + 2] = h;
+                ground[target * 3 + 2] = gi ? gi.bounceAt(x, z) : 0;
                 if (h < cMin) cMin = h;
                 if (h > cMax) cMax = h;
             };

@@ -39,6 +39,8 @@ export const BLD_NO_WALL = 3111;
 /** 前処理で生成した高精細アセット（存在しなければ従来のタイル由来にフォールバックする） */
 export const HEIGHTMAP_URL = 'data/heightmap.png';
 export const HEIGHTMAP_META_URL = 'data/heightmap.json';
+export const GI_URL = 'data/gi.png';
+export const GI_META_URL = 'data/gi.json';
 export const BUILDING_HEIGHTS_URL = 'data/building-heights.json';
 export const TREES_URL = 'data/trees.json';
 

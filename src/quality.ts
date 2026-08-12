@@ -186,8 +186,10 @@ export function initialQuality(): QualitySettings {
     return createQuality(preset, Number.isFinite(pinned) ? pinned : 0);
 }
 
-/** 太陽の時刻（デフォルトは昼下がり15時） */
+/** 太陽の時刻（デフォルトは昼下がり15時）。夜間も含む 0〜24 の全域が使える（E39） */
 export function sunHour(): number {
-    const raw = Number(new URLSearchParams(location.search).get('hour'));
-    return Number.isFinite(raw) && raw > 0 ? Math.max(5, Math.min(19, raw)) : 15;
+    const value = new URLSearchParams(location.search).get('hour');
+    if (value === null) return 15;
+    const raw = Number(value);
+    return Number.isFinite(raw) ? Math.max(0, Math.min(24, raw)) : 15;
 }

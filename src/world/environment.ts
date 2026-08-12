@@ -25,13 +25,16 @@ import { CSMShadowNode } from 'three/addons/csm/CSMShadowNode.js';
 import { exp, float, mix, positionLocal, positionView, positionWorld, cameraPosition, fog, saturate, smoothstep } from 'three/tsl';
 import type { QualitySettings } from '../quality';
 import {
+    ambientColor,
     fogColorNode,
     fogHeightNode,
     fogRangeNode,
     groundHazeNode,
     hazeSunNode,
+    lighting,
     skyHorizonNode,
     skyZenithNode,
+    sunColor,
     sunColorNode,
     sunDirNode,
     sunDirection,
@@ -91,11 +94,16 @@ export function createEnvironment(scene: Scene, quality: QualitySettings): Envir
     const sky = createSkyDome();
     group.add(sky);
 
-    const hemi = new HemisphereLight(0xbcd6ff, 0x6a6350, quality.ao ? 0.85 : 1.05);
+    // 環境光の色・強さは時刻で決まる（sun.ts）。ベイクGIの空可視率はこの光を
+    // 遮る形で効く（materials 側の aoNode）ので、ここは「開けた空の下の明るさ」
+    const hemi = new HemisphereLight(0x000000, 0x000000, lighting.ambient * (quality.ao ? 0.82 : 1));
+    hemi.color.copy(ambientColor);
+    hemi.groundColor.copy(ambientColor).multiplyScalar(0.42).offsetHSL(-0.06, -0.1, 0.02);
     hemi.position.set(0, 1000, 0);
     group.add(hemi);
 
-    const sun = new DirectionalLight(0xfff2e2, 3.2);
+    const sun = new DirectionalLight(0xffffff, lighting.sun);
+    sun.color.copy(sunColor);
     sun.position.copy(sunDirection).multiplyScalar(2500);
     sun.castShadow = quality.shadows;
     sun.shadow.mapSize.set(quality.shadowMapSize, quality.shadowMapSize);

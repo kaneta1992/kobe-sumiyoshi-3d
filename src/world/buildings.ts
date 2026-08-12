@@ -39,9 +39,9 @@ import { footprintKey } from '../geo';
 import { hash01 } from './hash';
 import { createBuf, pushQuadFacing, pushTriangleFacing, pushVertex, toGeometry, type MeshBuf } from './geom';
 import { buildHlod, type Hlod } from './hlod';
-import { skyHorizonNode } from './sun';
+import { GI_AO_STRENGTH, GI_BOUNCE_SCALE, bounceColorNode, skyHorizonNode } from './sun';
 import type { QualitySettings } from '../quality';
-import type { BuildingHeightMap } from '../data/terrain-assets';
+import type { BuildingHeightMap, GiMap } from '../data/terrain-assets';
 import type { BuildingShape, Point2 } from '../data/vector';
 
 /** 傾斜地で屋根を持ち上げる補正量の上限[m] */
@@ -56,6 +56,12 @@ const ROOF_PITCH_MIN = 0.34;
 const ROOF_PITCH_MAX = 0.48;
 /** 勾配屋根にする下限のフットプリント充填率（L字型などはOBBとズレるので陸屋根に落とす・E20） */
 const FILL_RATIO_FOR_PITCHED = 0.74;
+/**
+ * ベイクGIを引く位置を法線方向へずらす量[m]。
+ * ベイクは建物自身も遮蔽体として焼いてあるので、壁面の真上で引くと自分の屋根に
+ * 潰される。外へ出して「その壁が面している空間の開け具合」を拾う
+ */
+const GI_PROBE_OFFSET = 1.6;
 
 type RoofKind = 'flat' | 'hip' | 'gable';
 
@@ -230,10 +236,11 @@ function addWalls(b: MeshBuf, plan: BuildingPlan, options: WallOptions): void {
         if (options.facade) facade.push(base, wallTop, seed);
         else if (facade) facade.push(0, 0, 0);
     };
-    // 接地部を暗く（ベイクAO）。1.2m 付近までで戻すので壁全体が濁らない
+    // 接地部を暗く。ベイクGI（aGi）が広域の遮蔽を持つので、ここは接地の
+    // ごく近くだけを締める役に絞る（二重に暗くしない）
     const shadeAt = (y: number): number => {
         const t = Math.min(1, (y - base) / Math.max(1.4, (wallTop - base) * 0.18));
-        return 0.5 + 0.5 * t;
+        return 0.72 + 0.28 * t;
     };
     const levels: number[] = [];
     for (let i = 0; i <= options.segments; i++) {
@@ -590,7 +597,13 @@ function createFacadeMaterial(): MeshStandardNodeMaterial {
     const vcol = attribute<'vec3'>('color', 'vec3');
     const shaded = mix(vcol, vcol.mul(0.7), balcony.add(floorLine).mul(detail));
     const glazed = mix(shaded, glass, windows.mul(detail));
-    material.colorNode = mix(glazed, doorColor, door.mul(detail));
+    const color = mix(glazed, doorColor, door.mul(detail));
+    material.colorNode = color;
+    // ベイクGI（追記1）: aGi = (空可視率, 1バウンス受光量)。
+    // 空可視率は環境光だけを削り、直射日光は削らない
+    const gi = attribute<'vec2'>('aGi', 'vec2');
+    material.aoNode = mix(float(1), gi.x, GI_AO_STRENGTH);
+    material.emissiveNode = color.mul(bounceColorNode).mul(gi.y.mul(GI_BOUNCE_SCALE));
     material.roughnessNode = mix(float(0.86), float(0.16), windows.mul(detail));
     material.metalnessNode = windows.mul(detail).mul(0.35);
     return material;
@@ -621,6 +634,7 @@ export function createBuildings(
     shapes: readonly BuildingShape[],
     getElevationAt: (x: number, z: number) => number,
     measuredHeights: BuildingHeightMap | null,
+    gi: GiMap | null,
     quality: QualitySettings,
 ): BuildingsResult {
     const plans: BuildingPlan[] = [];
@@ -702,12 +716,40 @@ export function createBuildings(
     const detailMaterial = createFacadeMaterial();
     const midMaterial = new MeshStandardNodeMaterial({ vertexColors: true, roughness: 0.88, metalness: 0 });
     const proxyMaterial = new MeshStandardNodeMaterial({ vertexColors: true, roughness: 0.92, metalness: 0 });
+    // 簡略段・プロキシ段にも同じベイクGIを入れる（段が切り替わっても明るさが飛ばない）
+    for (const material of [midMaterial, proxyMaterial]) {
+        const giAttr = attribute<'vec2'>('aGi', 'vec2');
+        const albedo = attribute<'vec3'>('color', 'vec3');
+        material.aoNode = mix(float(1), giAttr.x, GI_AO_STRENGTH);
+        material.emissiveNode = albedo.mul(bounceColorNode).mul(giAttr.y.mul(GI_BOUNCE_SCALE));
+    }
+
+    /**
+     * 出来上がった頂点列へベイクGIを流し込む。押し出し側の全箇所に手を入れずに済み、
+     * 壁は法線方向へ逃がしてから引ける（自分の屋根で潰れないように）
+     */
+    const fillGi = (buf: MeshBuf): void => {
+        const out = buf.extra['aGi'];
+        for (let i = 0; i < buf.pos.length; i += 3) {
+            if (!gi) {
+                out.push(1, 0);
+                continue;
+            }
+            const nx = buf.nrm[i];
+            const nz = buf.nrm[i + 2];
+            const nl = Math.hypot(nx, nz);
+            const px = buf.pos[i] + (nl > 0.2 ? (nx / nl) * GI_PROBE_OFFSET : 0);
+            const pz = buf.pos[i + 2] + (nl > 0.2 ? (nz / nl) * GI_PROBE_OFFSET : 0);
+            const h = Math.max(0, buf.pos[i + 1] - getElevationAt(px, pz));
+            out.push(gi.skyAt(px, pz, h), gi.bounceAt(px, pz));
+        }
+    };
 
     const hlod = buildHlod(
         plans.map((p) => p.center),
         (level, indices): Object3D | null => {
             const detailed = level === 0;
-            const buf = createBuf(detailed ? ['aFacade'] : []);
+            const buf = createBuf(detailed ? ['aFacade', 'aGi'] : ['aGi']);
             for (const index of indices) {
                 const plan = plans[index];
                 if (level === 2) {
@@ -719,7 +761,8 @@ export function createBuildings(
                 else addPitchedRoof(buf, plan, detailed);
             }
             if (buf.pos.length === 0) return null;
-            const geometry = toGeometry(buf, { aFacade: 3 });
+            fillGi(buf);
+            const geometry = toGeometry(buf, { aFacade: 3, aGi: 2 });
             const material = level === 0 ? detailMaterial : level === 1 ? midMaterial : proxyMaterial;
             const mesh = new Mesh(geometry, material);
             mesh.name = `buildings-L${level}`;

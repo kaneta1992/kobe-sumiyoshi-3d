@@ -52,7 +52,7 @@ import {
 } from 'three/tsl';
 import { AREA_HALF, CULL_MARGIN } from '../config';
 import type { QualitySettings } from '../quality';
-import type { TreeInstance } from '../data/terrain-assets';
+import type { GiMap, TreeInstance } from '../data/terrain-assets';
 import type { BuildingShape, RoadLine } from '../data/vector';
 import { hash01, hashDir01, hashIndex01 } from './hash';
 import {
@@ -64,7 +64,14 @@ import {
     type MeshBuf,
 } from './geom';
 import { OCC_BUILDING, OCC_ROAD, OCC_ROADSIDE, type Occupancy } from './occupancy';
-import { sunColorNode, sunDirNode, windDirNode, windStrengthNode } from './sun';
+import {
+    GI_AO_STRENGTH,
+    bounceColorNode,
+    sunColorNode,
+    sunDirNode,
+    windDirNode,
+    windStrengthNode,
+} from './sun';
 
 /** 樹種 */
 const SP_CONIFER = 0;
@@ -77,6 +84,17 @@ const SPECIES_COUNT = 6;
 /** 樹木として3段LODを持つ樹種の数（生け垣・下草は近距離1段のみ） */
 const TREE_SPECIES = 4;
 const LOD_COUNT = 3;
+
+/**
+ * 冠幅 ÷ 樹高 の代表値（追記2）。
+ *
+ * インスタンス行列は x/z を冠幅・y を樹高で拡大するので、単位樹形で球を作ると
+ * ワールドでは縦に伸びた楕円体になり、近景で「溶けたロウ」に見える。葉塊とカードの
+ * 縦方向だけこの比で先に縮めておけば、ワールドでほぼ球に戻る。
+ * 実データ（trees.json 38,111本）の 冠幅÷樹高 は p10 0.316 / p50 0.349 / p90 0.353 と
+ * ほぼ一定なので、定数で足りる（樹種ごとの縦横比は clumpFlat で別に付ける）。
+ */
+const CROWN_ASPECT = 0.34;
 
 /** インスタンスを詰め直すカメラ移動量[m] */
 const REBUILD_DISTANCE = 11;
@@ -156,7 +174,7 @@ function addTube(
                 const v = quad[k];
                 const d = dirs[k === 1 || k === 2 ? 1 : 0];
                 pushVertex(b, v[0], v[1], v[2], d[0], d[1], d[2], color[0] * v[6], color[1] * v[6], color[2] * v[6]);
-                wind.push(v[5], 0);
+                wind.push(v[5], 0, 0);
                 if (texcoord) texcoord.push(v[3], v[4]);
             }
         }
@@ -164,8 +182,67 @@ function addTube(
 }
 
 /**
+ * 幹。根張り（付け根の広がり）とわずかな傾き・曲がりを持つ多段の管にする。
+ * 1本のまっすぐな角柱だと近景で「棒」に見えてしまう。
+ * 返すのは幹頂の位置（枝と樹冠をそこから生やす）。
+ */
+function addTrunk(
+    b: MeshBuf,
+    height: number,
+    baseR: number,
+    topR: number,
+    sides: number,
+    seed: number,
+    color: readonly [number, number, number],
+    tipWind: number,
+): [number, number, number] {
+    const SEGMENTS = 3;
+    const leanX = (hash01(seed, 1, 0x5c11) - 0.5) * height * 0.16;
+    const leanZ = (hash01(seed, 2, 0x5c11) - 0.5) * height * 0.16;
+    // 根張り: 最下段だけ短く太く
+    const flareY = height * 0.07;
+    addTube(b, 0, 0, 0, 0, flareY, 0, baseR * 1.75, baseR, sides, color, 0, 0.02);
+    let px = 0;
+    let py = flareY;
+    let pz = 0;
+    for (let i = 0; i < SEGMENTS; i++) {
+        const t0 = i / SEGMENTS;
+        const t1 = (i + 1) / SEGMENTS;
+        // 曲がりは上へ行くほど効かせる（sin で滑らかに立ち上がる）
+        const s1 = Math.sin(t1 * Math.PI * 0.5);
+        const x1 = leanX * s1;
+        const z1 = leanZ * s1;
+        const y1 = flareY + (height - flareY) * t1;
+        addTube(
+            b,
+            px,
+            py,
+            pz,
+            x1,
+            y1,
+            z1,
+            baseR + (topR - baseR) * Math.pow(t0, 0.75),
+            baseR + (topR - baseR) * Math.pow(t1, 0.75),
+            sides,
+            color,
+            t0 * tipWind,
+            t1 * tipWind,
+        );
+        px = x1;
+        py = y1;
+        pz = z1;
+    }
+    return [px, py, pz];
+}
+
+/**
  * 葉塊。位置だけノイズで崩し、法線は球状のまま残す。
  * 輪郭はざらつくのに陰影は柔らかい = 少ないポリゴンで「葉の塊」に見える。
+ *
+ * 崩し方は2段構え（追記2）:
+ *   低周波 = 3方向の「ふくらみ」。球がそのまま出ないよう塊の輪郭を非対称にする
+ *   高周波 = 方向ハッシュのざらつき。面の切り替わりを隠す
+ * どちらも方向から決まるので、同じ位置の頂点が複数回現れても割れない。
  */
 function addBlob(
     b: MeshBuf,
@@ -181,38 +258,185 @@ function addBlob(
     seed: number,
     /** 樹冠内部の暗さ（0=明るい外周 / 1=内側） */
     depth: number,
+    /** 下側の垂れ（1=垂れない） */
+    droopAmount = 1.12,
 ): void {
     const tris = fine ? icosahedronTrianglesFine() : icosahedronTriangles();
     const wind = b.extra['aWind'];
     const texcoord = b.extra['uv'];
+    // 低周波のふくらみを作る3方向
+    const lobes: number[] = [];
+    for (let k = 0; k < 3; k++) {
+        const a = hashIndex01(seed * 3 + k, 0x71c5) * Math.PI * 2;
+        const cy0 = hashIndex01(seed * 3 + k, 0x2ba9) * 1.6 - 0.8;
+        const s = Math.sqrt(Math.max(0, 1 - cy0 * cy0));
+        lobes.push(Math.cos(a) * s, cy0, Math.sin(a) * s, 0.18 + hashIndex01(seed * 3 + k, 0x9d) * 0.26);
+    }
     for (let i = 0; i < tris.length; i += 3) {
         const dx = tris[i];
         const dy = tris[i + 1];
         const dz = tris[i + 2];
-        const bump = 0.72 + hashDir01(dx, dy, dz, seed) * 0.56;
+        let bump = 0.78 + hashDir01(dx, dy, dz, seed) * 0.42;
+        for (let k = 0; k < 3; k++) {
+            const d = dx * lobes[k * 4] + dy * lobes[k * 4 + 1] + dz * lobes[k * 4 + 2];
+            if (d > 0) bump += d * d * d * lobes[k * 4 + 3];
+        }
         // 下側は少し垂れる（葉が重力で下がる感じ）
-        const droop = dy < 0 ? 1.1 : 1;
+        const droop = dy < 0 ? droopAmount : 1;
         const px = cx + dx * rx * bump;
         const py = cy + dy * ry * bump * droop;
         const pz = cz + dz * rz * bump;
         // ベイクAO: 樹冠の下側・内側を暗く（追記2-5 の頂点AO）
-        const shade = (0.42 + 0.58 * (dy * 0.5 + 0.5)) * (1 - depth * 0.34);
+        const shade = (0.4 + 0.6 * (dy * 0.5 + 0.5)) * (1 - depth * 0.36);
         pushVertex(b, px, py, pz, dx, dy, dz, color[0] * shade, color[1] * shade, color[2] * shade);
-        wind.push(trunkWind, 1);
+        wind.push(trunkWind, 1, 0);
         if (texcoord) texcoord.push(dx * 0.5 + 0.5, dy * 0.5 + 0.5);
     }
 }
 
-/** 樹種ごとの葉色（線形空間の概算値。実際の見えはライティングで作る） */
+/**
+ * 葉の房（アルファテストのカード）。葉塊の外周に立てて、多面体の角張った輪郭を崩す。
+ *
+ * 面の向きは決定的な乱れにする: どの角度から見ても何枚かは正面を向くので、
+ * ビルボードを使わずに輪郭が有機的に見える。シェーディング法線は樹冠中心からの
+ * 放射方向にして、表裏とも同じ向きで積む（葉は裏から見ても真っ黒にならない）。
+ * 半透明ブレンドは使わない — アルファテストのみでソート不要（E60）。
+ */
+function addLeafCard(
+    b: MeshBuf,
+    cx: number,
+    cy: number,
+    cz: number,
+    nx: number,
+    ny: number,
+    nz: number,
+    size: number,
+    color: readonly [number, number, number],
+    trunkWind: number,
+    seed: number,
+    shade: number,
+): void {
+    const a = hashIndex01(seed, 0x11b3) * Math.PI * 2;
+    const cosT = hashIndex01(seed, 0x22c7) * 2 - 1;
+    const sinT = Math.sqrt(Math.max(0, 1 - cosT * cosT));
+    // カード面の法線（見た目の向きだけを決める。陰影は放射法線を使う）
+    const mx = Math.cos(a) * sinT;
+    const my = cosT;
+    const mz = Math.sin(a) * sinT;
+    let ux = -mz;
+    let uy = 0;
+    let uz = mx;
+    if (Math.hypot(ux, uy, uz) < 1e-4) {
+        ux = 1;
+        uz = 0;
+    }
+    const ul = Math.hypot(ux, uy, uz);
+    ux /= ul;
+    uy /= ul;
+    uz /= ul;
+    const vx = my * uz - mz * uy;
+    const vy = mz * ux - mx * uz;
+    const vz = mx * uy - my * ux;
+    const h = size * 0.5;
+    const corners: [number, number, number, number][] = [
+        [-h, -h, 0, 0],
+        [h, -h, 1, 0],
+        [h, h, 1, 1],
+        [-h, h, 0, 1],
+    ];
+    const wind = b.extra['aWind'];
+    const texcoord = b.extra['uv'];
+    // 表裏の2枚ぶんを両方の巻き方向で積む（材質は片面のまま済ませられる）
+    for (const order of [
+        [0, 1, 2],
+        [0, 2, 3],
+        [2, 1, 0],
+        [3, 2, 0],
+    ]) {
+        for (const k of order) {
+            const c = corners[k];
+            pushVertex(
+                b,
+                cx + ux * c[0] + vx * c[1],
+                // 縦方向だけ先に縮めておく（インスタンス行列で樹高ぶん伸ばされるため）
+                cy + (uy * c[0] + vy * c[1]) * CROWN_ASPECT,
+                cz + uz * c[0] + vz * c[1],
+                nx,
+                ny,
+                nz,
+                color[0] * shade,
+                color[1] * shade,
+                color[2] * shade,
+            );
+            wind.push(trunkWind, 1, 1);
+            if (texcoord) texcoord.push(c[2], c[3]);
+        }
+    }
+}
+
+/**
+ * 葉の房ひと塊 = 葉塊1個 + その外周に散らしたカード。
+ * 近景ではカードが輪郭を、遠景では葉塊がボリュームを担当する。
+ */
+function addClump(
+    b: MeshBuf,
+    cx: number,
+    cy: number,
+    cz: number,
+    r: number,
+    flat: number,
+    fine: boolean,
+    color: readonly [number, number, number],
+    trunkWind: number,
+    seed: number,
+    depth: number,
+    cards: number,
+): void {
+    // flat は「ワールド空間での 縦÷横」。CROWN_ASPECT でインスタンス行列の伸びを打ち消す
+    const ry = r * flat * CROWN_ASPECT;
+    addBlob(b, cx, cy, cz, r, ry, r, fine, color, trunkWind, seed, depth);
+    for (let i = 0; i < cards; i++) {
+        const s = seed * 17 + i;
+        const a = hashIndex01(s, 0x4f21) * Math.PI * 2;
+        const cosT = hashIndex01(s, 0x6a35) * 1.7 - 0.75;
+        const sinT = Math.sqrt(Math.max(0, 1 - cosT * cosT));
+        const dx = Math.cos(a) * sinT;
+        const dy = cosT;
+        const dz = Math.sin(a) * sinT;
+        const reach = 0.86 + hashIndex01(s, 0x7b) * 0.34;
+        addLeafCard(
+            b,
+            cx + dx * r * reach,
+            cy + dy * ry * reach,
+            cz + dz * r * reach,
+            dx,
+            dy,
+            dz,
+            r * (1.15 + hashIndex01(s, 0x8c) * 0.7),
+            color,
+            trunkWind,
+            s,
+            0.72 + 0.5 * (dy * 0.5 + 0.5),
+        );
+    }
+}
+
+/**
+ * 樹種ごとの葉色（線形空間の概算値。実際の見えはライティングで作る）。
+ * 初夏の六甲山麓のトーンで統一しつつ、樹種の差は「暗く青い針葉樹 ←→ 明るく黄緑の
+ * 広葉樹」の軸で付ける（シルエットの差と合わせて樹種が読めるように）
+ */
 const FOLIAGE: Record<number, readonly [number, number, number]> = {
-    [SP_CONIFER]: [0.052, 0.093, 0.048],
-    [SP_ROUND]: [0.082, 0.132, 0.052],
-    [SP_SPREAD]: [0.094, 0.146, 0.058],
-    [SP_GARDEN]: [0.068, 0.125, 0.05],
+    [SP_CONIFER]: [0.044, 0.086, 0.05],
+    [SP_ROUND]: [0.082, 0.134, 0.052],
+    [SP_SPREAD]: [0.099, 0.152, 0.056],
+    [SP_GARDEN]: [0.072, 0.132, 0.05],
     [SP_HEDGE]: [0.038, 0.076, 0.03],
     [SP_GRASS]: [0.12, 0.165, 0.062],
 };
 const BARK: readonly [number, number, number] = [0.055, 0.045, 0.036];
+/** 樹種ごとの樹皮色（幹の太さ・色でも樹種を読ませる） */
+const BARK_CONIFER: readonly [number, number, number] = [0.062, 0.04, 0.031];
 
 /** 単位樹形（高さ1・冠幅1）を作る。lod 0=フル / 1=簡略 / 2=クロスカード */
 function buildTreeGeometry(species: number, lod: number): BufferGeometry {
@@ -242,7 +466,7 @@ function buildTreeGeometry(species: number, lod: number): BufferGeometry {
                 for (const k of [i0, i1, i2]) {
                     const v = quad[k];
                     pushVertex(buf, v[0], v[1], v[2], 0, 0.55, 0, leaf[0], leaf[1], leaf[2]);
-                    buf.extra['aWind'].push(0.85, 1);
+                    buf.extra['aWind'].push(0.85, 1, 1);
                     buf.extra['uv'].push(v[3], v[4]);
                 }
             }
@@ -262,11 +486,11 @@ function buildTreeGeometry(species: number, lod: number): BufferGeometry {
             for (const k of [i0, i1, i2]) {
                 const v = horiz[k];
                 pushVertex(buf, v[0], v[1], v[2], 0, 1, 0, leaf[0] * 0.9, leaf[1] * 0.9, leaf[2] * 0.9);
-                buf.extra['aWind'].push(0.85, 1);
+                buf.extra['aWind'].push(0.85, 1, 1);
                 buf.extra['uv'].push(v[3], v[4]);
             }
         }
-        return toGeometry(buf, { aWind: 2, uv: 2 });
+        return toGeometry(buf, { aWind: 3, uv: 2 });
     }
 
     const fine = lod === 0;
@@ -295,12 +519,12 @@ function buildTreeGeometry(species: number, lod: number): BufferGeometry {
                     const v = quad[k];
                     const shade = 0.55 + 0.55 * v[1];
                     pushVertex(buf, v[0], v[1], v[2], 0, 1, 0, leaf[0] * shade, leaf[1] * shade, leaf[2] * shade);
-                    buf.extra['aWind'].push(v[1] * 0.4, v[1]);
+                    buf.extra['aWind'].push(v[1] * 0.4, v[1], 1);
                     buf.extra['uv'].push(v[3], v[4]);
                 }
             }
         }
-        return toGeometry(buf, { aWind: 2, uv: 2 });
+        return toGeometry(buf, { aWind: 3, uv: 2 });
     }
 
     if (species === SP_HEDGE) {
@@ -321,7 +545,7 @@ function buildTreeGeometry(species: number, lod: number): BufferGeometry {
         const at = (ix: number, iz: number): number[] => cells[iz * (nx + 1) + ix];
         const push = (p: number[], nyv: number, shade: number, u: number, v: number): void => {
             pushVertex(buf, p[0], p[1], p[2], 0, nyv, 0, leaf[0] * shade, leaf[1] * shade, leaf[2] * shade);
-            buf.extra['aWind'].push(0.25, 0.7);
+            buf.extra['aWind'].push(0.25, 0.7, 0);
             buf.extra['uv'].push(u, v);
         };
         for (let iz = 0; iz < nz; iz++) {
@@ -359,84 +583,142 @@ function buildTreeGeometry(species: number, lod: number): BufferGeometry {
                     const nrx = x0 === x1 ? Math.sign(x0) : 0;
                     const nrz = z0 === z1 ? Math.sign(z0) : 0;
                     pushVertex(buf, v[0], v[1], v[2], nrx, 0.25, nrz, leaf[0] * v[3], leaf[1] * v[3], leaf[2] * v[3]);
-                    buf.extra['aWind'].push(0.2, 0.55);
+                    buf.extra['aWind'].push(0.2, 0.55, 0);
                     buf.extra['uv'].push(0, 0);
                 }
             }
         }
-        return toGeometry(buf, { aWind: 2, uv: 2 });
+        return toGeometry(buf, { aWind: 3, uv: 2 });
     }
 
     // --- 樹木本体 ---
+    const leafColor = FOLIAGE[species];
     if (species === SP_CONIFER) {
-        const trunkTop = 0.97;
-        addTube(buf, 0, 0, 0, 0, trunkTop, 0, 0.042, 0.008, sides, BARK, 0, 1);
-        const layers = lod === 0 ? 7 : 4;
+        // スギ・ヒノキ: 細く高い円錐。輪生枝を「層ごとに数個の房」で作り、
+        // 1枚の平たい円盤にしないことで輪郭がギザつく
+        addTrunk(buf, 0.99, 0.046, 0.007, sides, salt, BARK_CONIFER, 1);
+        const layers = lod === 0 ? 8 : 5;
         for (let i = 0; i < layers; i++) {
             const t = i / (layers - 1);
-            const y = 0.2 + t * 0.72;
-            const r = 0.5 * Math.pow(1 - t, 0.72) * (0.88 + hash01(i, species, salt) * 0.24) + 0.045;
-            const ox = (hash01(i, 3, salt) - 0.5) * 0.06;
-            const oz = (hash01(i, 7, salt) - 0.5) * 0.06;
-            addBlob(buf, ox, y, oz, r, r * 0.5, r, fine && i < 4, FOLIAGE[species], 0.25 + t * 0.75, salt + i, 1 - t * 0.75);
+            // 上ほど房が小さくなるので、層の間隔も同じ割合で詰める（穴が空かない）
+            const y = 0.16 + 0.78 * (1 - Math.pow(1 - t, 1.4));
+            const layerR = 0.5 * Math.pow(1 - t, 0.85) * (0.86 + hash01(i, species, salt) * 0.28) + 0.03;
+            const ring = lod === 0 ? (t > 0.75 ? 1 : 3) : 1;
+            for (let k = 0; k < ring; k++) {
+                const a = (k / ring) * Math.PI * 2 + t * 2.4 + hash01(i, k, salt) * 1.1;
+                const reach = ring === 1 ? 0 : layerR * 0.46;
+                const r = layerR * (ring === 1 ? 0.85 : 0.6) * (0.82 + hash01(i, k + 31, salt) * 0.4);
+                addClump(
+                    buf,
+                    Math.cos(a) * reach,
+                    y,
+                    Math.sin(a) * reach,
+                    r,
+                    1.15,
+                    fine && t < 0.6,
+                    leafColor,
+                    0.22 + t * 0.78,
+                    salt + i * 11 + k,
+                    1 - t * 0.7,
+                    lod === 0 ? 2 : 0,
+                );
+            }
         }
-        return toGeometry(buf, { aWind: 2, uv: 2 });
+        return toGeometry(buf, { aWind: 3, uv: 2 });
     }
 
     const spread = species === SP_SPREAD;
     const garden = species === SP_GARDEN;
-    const trunkTop = garden ? 0.2 : spread ? 0.3 : 0.4;
-    const trunkR = garden ? 0.03 : spread ? 0.055 : 0.05;
-    addTube(buf, 0, 0, 0, 0, trunkTop, 0, trunkR, trunkR * 0.6, sides, BARK, 0, trunkTop);
-
-    const branches = lod === 0 ? (garden ? 3 : spread ? 5 : 4) : 0;
-    const crownY = garden ? 0.62 : spread ? 0.72 : 0.68;
-    const crownR = spread ? 0.5 : garden ? 0.46 : 0.44;
-    const crownFlat = spread ? 0.62 : garden ? 0.8 : 0.86;
-
-    for (let i = 0; i < branches; i++) {
-        const a = (i / branches) * Math.PI * 2 + hash01(i, species, salt) * 0.9;
-        const reach = crownR * (0.5 + hash01(i, 11, salt) * 0.42);
-        const tip = crownY - 0.06 + hash01(i, 13, salt) * 0.16;
-        addTube(
-            buf,
-            0,
-            trunkTop * 0.82,
-            0,
-            Math.cos(a) * reach,
-            tip,
-            Math.sin(a) * reach,
-            trunkR * 0.55,
-            trunkR * 0.24,
-            4,
-            BARK,
-            trunkTop * 0.82,
-            tip,
-        );
+    // 庭木は株立ち（複数幹）。広葉樹は1本の主幹から枝分かれ
+    const trunkTop = garden ? 0.24 : spread ? 0.32 : 0.42;
+    const trunkR = garden ? 0.028 : spread ? 0.058 : 0.052;
+    if (garden && lod === 0) {
+        // 庭木は株立ち: 根元から3本が開いて立ち上がる
+        for (let s = 0; s < 3; s++) {
+            const a = (s / 3) * Math.PI * 2 + hash01(s, 5, salt) * 1.4;
+            const out = 0.09 * (0.7 + hash01(s, 9, salt) * 0.6);
+            addTube(
+                buf,
+                Math.cos(a) * out * 0.25,
+                0,
+                Math.sin(a) * out * 0.25,
+                Math.cos(a) * out,
+                trunkTop,
+                Math.sin(a) * out,
+                trunkR,
+                trunkR * 0.5,
+                sides,
+                BARK,
+                0,
+                trunkTop,
+            );
+        }
+    } else {
+        addTrunk(buf, trunkTop, trunkR * 1.15, trunkR * 0.62, sides, salt, BARK, trunkTop);
     }
 
-    const blobs = lod === 0 ? (garden ? 5 : spread ? 7 : 6) : garden ? 2 : 3;
-    for (let i = 0; i < blobs; i++) {
-        const a = (i / blobs) * Math.PI * 2 + hash01(i, 17, salt) * 1.3;
-        const ring = i === 0 ? 0 : crownR * (0.34 + hash01(i, 19, salt) * 0.4);
-        const y = crownY + (hash01(i, 23, salt) - 0.42) * (spread ? 0.2 : 0.3);
-        const r = crownR * (spread ? 0.44 : 0.5) * (0.78 + hash01(i, 29, salt) * 0.5);
-        addBlob(
+    // crownFlat は「ワールド空間での 縦÷横」（縦横比補正のあとの比率）
+    const crownY = garden ? 0.66 : spread ? 0.76 : 0.74;
+    const crownR = spread ? 0.5 : garden ? 0.46 : 0.44;
+    const crownFlat = spread ? 0.62 : garden ? 1 : 0.95;
+    /** 房の高さ方向のばらつき（樹冠の縦の広がり） */
+    const crownSpreadY = spread ? 0.07 : 0.1;
+    // 房の数と位置。近景は房を増やして密度を出す（追記2「近距離LODの密度追加」）
+    const clumps = lod === 0 ? (garden ? 6 : spread ? 8 : 7) : garden ? 2 : 3;
+
+    // 主枝: 房の付け根まで伸ばす。2段に分けて途中で曲げる（枝分かれ）
+    const branches = lod === 0 ? (garden ? 0 : spread ? 5 : 4) : 0;
+    for (let i = 0; i < branches; i++) {
+        const a = (i / branches) * Math.PI * 2 + hash01(i, species, salt) * 0.9;
+        const reach = crownR * (spread ? 0.72 : 0.56) * (0.7 + hash01(i, 11, salt) * 0.5);
+        const tip = crownY - 0.1 + hash01(i, 13, salt) * 0.18;
+        const midX = Math.cos(a) * reach * 0.45;
+        const midZ = Math.sin(a) * reach * 0.45;
+        const midY = trunkTop + (tip - trunkTop) * 0.62;
+        addTube(buf, 0, trunkTop * 0.88, 0, midX, midY, midZ, trunkR * 0.6, trunkR * 0.36, 4, BARK, trunkTop * 0.88, midY);
+        // 途中から2本に分かれる
+        for (const branchSide of [-1, 1]) {
+            const a2 = a + branchSide * (0.3 + hash01(i, 17, salt) * 0.35);
+            addTube(
+                buf,
+                midX,
+                midY,
+                midZ,
+                Math.cos(a2) * reach,
+                tip,
+                Math.sin(a2) * reach,
+                trunkR * 0.34,
+                trunkR * 0.15,
+                4,
+                BARK,
+                midY,
+                tip,
+            );
+        }
+    }
+
+    for (let i = 0; i < clumps; i++) {
+        const a = (i / clumps) * Math.PI * 2 + hash01(i, 17, salt) * 1.3;
+        const ring = i === 0 ? 0 : crownR * (spread ? 0.56 : 0.44) * (0.7 + hash01(i, 19, salt) * 0.6);
+        const y = crownY + (hash01(i, 23, salt) - 0.45) * crownSpreadY * 2;
+        const r = crownR * (spread ? 0.52 : 0.6) * (0.74 + hash01(i, 29, salt) * 0.5);
+        addClump(
             buf,
             Math.cos(a) * ring,
             y,
             Math.sin(a) * ring,
             r,
-            r * crownFlat,
-            r,
-            fine,
-            FOLIAGE[species],
+            crownFlat,
+            // 大きい房だけ細分割する（近景の面の粗さが目立つのは大きい房）
+            fine && r > crownR * 0.42,
+            leafColor,
             0.55 + (y - trunkTop) * 0.5,
             salt + i * 7,
             i === 0 ? 1 : 0.25,
+            lod === 0 ? (garden ? 4 : 3) : 0,
         );
     }
-    return toGeometry(buf, { aWind: 2, uv: 2 });
+    return toGeometry(buf, { aWind: 3, uv: 2 });
 }
 
 // --- テクスチャ（手続き生成・外部アセット不要） ---------------------------
@@ -512,12 +794,15 @@ function createGrassTexture(): Texture {
  *  - 透過感: 太陽を背にした葉が明るく抜ける（サブサーフェス風のバックライト）
  *  - 包み込み: 法線が太陽から外れても急に真っ黒にならないラップ項
  */
-function createFoliageMaterial(alphaMap: Texture | null): MeshStandardNodeMaterial {
+function createFoliageMaterial(alphaMap: Texture | null, doubleSided: boolean): MeshStandardNodeMaterial {
     const material = new MeshStandardNodeMaterial({ metalness: 0 });
-    const wind = attribute<'vec2'>('aWind', 'vec2');
-    const variation = attribute<'vec2'>('aVar', 'vec2');
+    // x=幹の揺れ係数 / y=葉らしさ / z=アルファテストするカードか（0=中実）
+    const wind = attribute<'vec3'>('aWind', 'vec3');
+    // x=風の位相 / y=葉色の個体差 / z=ベイクGIの空可視率
+    const variation = attribute<'vec3'>('aVar', 'vec3');
     const phase = variation.x.mul(6.2831853);
     const tint = variation.y;
+    const sky = variation.z;
 
     const slow = sin(time.mul(0.42).add(phase))
         .mul(0.62)
@@ -528,14 +813,20 @@ function createFoliageMaterial(alphaMap: Texture | null): MeshStandardNodeMateri
     const sway = slow.mul(wind.x.mul(wind.x)).mul(windStrengthNode).mul(0.038);
     const flutter = fast.mul(wind.y).mul(windStrengthNode).mul(0.013);
     const offset = windDirNode.mul(sway.add(flutter));
+    // 縦横比の補正（追記2）: インスタンス行列は x/z を冠幅・y を樹高で拡大するので、
+    // 単位樹形の球はワールドでは縦に伸びた楕円体になってしまう（近景で「溶けたロウ」に見える）。
+    // 葉塊・カードだけを房の中心まわりで aVar.w（冠幅÷樹高）ぶん縮めて球に戻す。
+    // 幹・枝・遠景カードは基準高さ = 自分の高さなので影響を受けない
     material.positionNode = positionLocal.add(vec3(offset.x, flutter.mul(-0.3), offset.y));
 
     const vcol = attribute<'vec3'>('color', 'vec3');
     // 個体差: わずかな黄緑〜深緑のふり幅（季節感を壊さない範囲）
     const hue = mix(vec3(0.84, 1.08, 0.82), vec3(1.18, 0.95, 0.66), tint);
-    // カード系はテクスチャの明暗だけ拾う（色そのものは葉色で決める）
-    const base = alphaMap
-        ? vcol.mul(hue).mul(mix(float(0.78), float(1.32), saturate(textureNode(alphaMap, uv()).g.mul(3))))
+    // カード部分だけテクスチャの明暗を拾う（色そのものは葉色で決める）。
+    // 中実の葉塊・幹は wind.z=0 なのでテクスチャの影響を受けない
+    const leafTex = alphaMap ? textureNode(alphaMap, uv()) : null;
+    const base = leafTex
+        ? vcol.mul(hue).mul(mix(float(1), mix(float(0.74), float(1.34), saturate(leafTex.g.mul(3))), wind.z))
         : vcol.mul(hue);
     material.colorNode = base;
 
@@ -543,18 +834,24 @@ function createFoliageMaterial(alphaMap: Texture | null): MeshStandardNodeMateri
     const view = positionWorld.sub(cameraPosition).normalize();
     const back = saturate(view.dot(sunDirNode)).pow(3.2);
     const wrap = saturate(normalWorld.dot(sunDirNode).mul(0.5).add(0.5)).pow(2);
+    // ベイクGI（追記1）: 林床・谷筋の樹木が沈む。塞がれたぶんは弱い回り込みで拾う
+    material.aoNode = mix(float(1), sky, GI_AO_STRENGTH);
     material.emissiveNode = base
         .mul(sunColorNode)
-        .mul(back.mul(wind.y).mul(0.85).add(wrap.mul(wind.y).mul(0.16)));
+        .mul(back.mul(wind.y).mul(0.85).add(wrap.mul(wind.y).mul(0.16)))
+        .add(base.mul(bounceColorNode).mul(sky.oneMinus().mul(0.22)));
     material.roughnessNode = mix(float(0.92), float(0.66), wind.y);
 
     if (alphaMap) {
-        material.opacityNode = textureNode(alphaMap, uv()).a;
+        // 中実部（wind.z=0）は常に不透明。カードだけテクスチャのアルファで抜く
+        material.opacityNode = mix(float(1), (leafTex as NonNullable<typeof leafTex>).a, wind.z);
         // ブレンド禁止・アルファテストのみ（追記2-5 オーバードロー抑制）。
         // ミップで葉が痩せすぎないよう閾値は低め
         material.alphaTest = 0.28;
-        material.side = DoubleSide;
     }
+    // 近景の樹形は表裏ぶんの三角形を自前で積んであるので片面のままでよい。
+    // 1枚板のクロスカード（遠景LOD・下草）だけ両面にする
+    if (doubleSided) material.side = DoubleSide;
     return material;
 }
 
@@ -571,6 +868,8 @@ interface VegItem {
     rot: number;
     phase: number;
     tint: number;
+    /** ベイクGIの空可視率（樹冠の高さで引いた値） */
+    sky: number;
 }
 
 interface CellRange {
@@ -669,6 +968,7 @@ function collectHedges(
                     rot,
                     phase: hash01(px, pz, 0x9a),
                     tint: hash01(px, pz, 0xb3),
+                    sky: 1,
                 });
             }
         }
@@ -719,6 +1019,7 @@ function collectGroundCover(
                         rot: hash01(px, pz, 0x1f) * Math.PI,
                         phase: hash01(px, pz, 0x2f),
                         tint: hash01(px, pz, 0x3f),
+                        sky: 1,
                     });
                 }
             }
@@ -732,6 +1033,7 @@ export function createVegetation(
     roads: readonly RoadLine[],
     occupancy: Occupancy,
     getElevationAt: (x: number, z: number) => number,
+    gi: GiMap | null,
     quality: QualitySettings,
 ): Vegetation {
     const items: VegItem[] = [];
@@ -755,10 +1057,19 @@ export function createVegetation(
             rot: hash01(tree.x, tree.z, 0x27) * Math.PI * 2,
             phase: hash01(tree.x, tree.z, 0x39),
             tint: hash01(tree.x, tree.z, 0x4b),
+            sky: 1,
         });
     }
     collectHedges(buildings, occupancy, getElevationAt, items);
     if (quality.groundCover) collectGroundCover(roads, occupancy, getElevationAt, items);
+
+    // ベイクGI（追記1）を株ごとに引く。樹木は樹冠の高さ、生け垣・下草は足元。
+    // これで林床・谷筋の樹木が沈み、開けた尾根の樹木は明るく残る
+    if (gi) {
+        for (const it of items) {
+            it.sky = gi.skyAt(it.x, it.z, it.species < TREE_SPECIES ? it.sy * 0.6 : 0.4);
+        }
+    }
 
     // セル → 樹種 の順に並べ替え、セル×樹種のインスタンスが連続領域になるようにする
     const cellIndexOf = (x: number, z: number): number => {
@@ -773,7 +1084,7 @@ export function createVegetation(
     });
 
     const matrices = new Float32Array(items.length * 16);
-    const variations = new Float32Array(items.length * 2);
+    const variations = new Float32Array(items.length * 3);
     for (let i = 0; i < items.length; i++) {
         const it = items[i];
         const c = Math.cos(it.rot);
@@ -795,8 +1106,9 @@ export function createVegetation(
         matrices[m + 13] = it.y;
         matrices[m + 14] = it.z;
         matrices[m + 15] = 1;
-        variations[i * 2] = it.phase;
-        variations[i * 2 + 1] = it.tint;
+        variations[i * 3] = it.phase;
+        variations[i * 3 + 1] = it.tint;
+        variations[i * 3 + 2] = it.sky;
     }
 
     // セルごとの連続レンジ（ビューは構築時に作り、実行時は set() するだけ）
@@ -821,7 +1133,7 @@ export function createVegetation(
             while (k < i && items[k].species === sp) k++;
             ranges[sp] = {
                 matrices: matrices.subarray(s0 * 16, k * 16),
-                variation: variations.subarray(s0 * 2, k * 2),
+                variation: variations.subarray(s0 * 3, k * 3),
                 count: k - s0,
             };
         }
@@ -844,9 +1156,12 @@ export function createVegetation(
     group.name = 'vegetation';
     const cardTexture = createLeafCardTexture();
     const grassTexture = createGrassTexture();
-    const solidMaterial = createFoliageMaterial(null);
-    const cardMaterial = createFoliageMaterial(cardTexture);
-    const grassMaterial = createFoliageMaterial(grassTexture);
+    // 近景（LOD0）は葉塊 + アルファテストのカード、中景（LOD1）は中実のみ、
+    // 遠景（LOD2）と下草は1枚板のクロスカード（両面）
+    const nearMaterial = createFoliageMaterial(cardTexture, false);
+    const solidMaterial = createFoliageMaterial(null, false);
+    const cardMaterial = createFoliageMaterial(cardTexture, true);
+    const grassMaterial = createFoliageMaterial(grassTexture, true);
 
     const capacityFor = (species: number, lod: number): number => {
         if (species === SP_HEDGE) return quality.preset === 'mobile' ? 900 : 2600;
@@ -868,7 +1183,14 @@ export function createVegetation(
             }
             const capacity = capacityFor(sp, lod);
             const geometry = buildTreeGeometry(sp, sp < TREE_SPECIES ? lod : 0);
-            const material = sp === SP_GRASS ? grassMaterial : lod === 2 ? cardMaterial : solidMaterial;
+            const material =
+                sp === SP_GRASS
+                    ? grassMaterial
+                    : lod === 2
+                      ? cardMaterial
+                      : lod === 0 && sp < TREE_SPECIES
+                        ? nearMaterial
+                        : solidMaterial;
             const mesh = new InstancedMesh(geometry, material, capacity);
             mesh.name = `veg-${sp}-${lod}`;
             mesh.instanceMatrix.setUsage(DynamicDrawUsage);
@@ -877,7 +1199,7 @@ export function createVegetation(
             mesh.receiveShadow = sp !== SP_GRASS;
             mesh.count = 0;
             mesh.visible = false;
-            const varAttr = new InstancedBufferAttribute(new Float32Array(capacity * 2), 2);
+            const varAttr = new InstancedBufferAttribute(new Float32Array(capacity * 3), 3);
             varAttr.setUsage(DynamicDrawUsage);
             geometry.setAttribute('aVar', varAttr);
             meshes[sp].push(mesh);
@@ -937,7 +1259,7 @@ export function createVegetation(
                     if (head + range.count > mesh.instanceMatrix.count) continue;
                 }
                 (mesh.instanceMatrix.array as Float32Array).set(range.matrices, head * 16);
-                (varAttributes[sp][lod] as InstancedBufferAttribute).array.set(range.variation, head * 2);
+                (varAttributes[sp][lod] as InstancedBufferAttribute).array.set(range.variation, head * 3);
                 writeHead[sp][lod] = head + range.count;
                 if (isTree) drawn[lod] += range.count;
             }

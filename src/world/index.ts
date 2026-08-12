@@ -10,7 +10,7 @@
 import { Frustum, Group, Matrix4, Scene, Vector3, type PerspectiveCamera, type WebGPURenderer } from 'three/webgpu';
 import { countDemTiles, loadElevationSampler } from '../data/dem';
 import { countPhotoTiles, loadAerialImage } from '../data/photo';
-import { loadBuildingHeights, loadHeightmap, loadTrees } from '../data/terrain-assets';
+import { loadBuildingHeights, loadGi, loadHeightmap, loadTrees } from '../data/terrain-assets';
 import type { TreeInstance } from '../data/terrain-assets';
 import { countVectorTiles, loadVectorFeatures } from '../data/vector';
 import type { WaterShape } from '../data/vector';
@@ -133,19 +133,21 @@ export async function buildWorld(
 
     // タイル3系統と前処理アセット3種を並列に取得する。到着順は問わない（E3）。
     // 前処理アセットは無ければ null が返り、タイルだけで従来どおり組み上がる
-    const [sampler, aerial, features, heightmap, measuredHeights, treePoints] = await Promise.all([
+    const [sampler, aerial, features, heightmap, gi, measuredHeights, treePoints] = await Promise.all([
         loadElevationSampler(onTile, signal),
         loadAerialImage(onTile, signal),
         loadVectorFeatures(onTile, signal),
         loadHeightmap(signal),
+        loadGi(signal),
         loadBuildingHeights(signal),
         loadTrees(signal),
     ]);
+    if (!gi) console.info('[world] ベイクGI が無いため実行時の粗い遮蔽で表示します（E58）');
 
     phase = '地形メッシュを生成中';
     emit();
     await nextFrame();
-    const terrain = createTerrain(sampler, aerial, heightmap, quality);
+    const terrain = createTerrain(sampler, aerial, heightmap, gi, quality);
 
     phase = '道路の縦断を解いています';
     emit();
@@ -168,13 +170,14 @@ export async function buildWorld(
         features.buildings,
         terrain.getElevationAt,
         measuredHeights,
+        gi,
         quality,
     );
 
     phase = '道路・歩道を生成中';
     emit();
     await nextFrame();
-    const roads = createRoads(profiled.paths, quality);
+    const roads = createRoads(profiled.paths, gi, quality);
     const bridges = createBridges(bridgeSpans, terrain.getElevationAt, quality);
     if (bridgeSpans.length > 0) {
         console.info(
@@ -201,6 +204,7 @@ export async function buildWorld(
             features.roads,
             occupancy,
             terrain.getElevationAt,
+            gi,
             quality,
         );
     }
