@@ -41,7 +41,8 @@ description: 神戸・住吉山手3D街歩きアプリ（kobe-sumiyoshi-3d）の
 ## 検証・運用
 
 - L1ゲート: `npx tsc --noEmit` / `npm run build` / `grep -RIn "Math.random" src/ | grep -v "// allow"; test $? -eq 1`
-- 動作確認URL: `?stats`（計測HUD）, `?walk`は廃止で既定が三人称, `?fly`（自由カメラ・物理なし）, `?quality=mobile`, `?webgl`, `?hour=17.5`, `?room=xxx`, `?solo`, `?spawn=x,z`（最寄り道路上に開始）, `?superman`（+Gキーで飛行デバッグ）
+- 動作確認URL: `?stats`（計測HUD）, `?walk`は廃止で既定が三人称, `?fly`（自由カメラ・物理なし）, `?quality=mobile`, `?webgl`, `?hour=17.5`, `?room=xxx`, `?solo`, `?spawn=x,z`（最寄り道路上に開始）, `?superman`（+Gキーで飛行デバッグ）, `?shot=1..6`（定点カメラ）, `?match`（トレジャーロワイヤル。検証は `?solo&match&matchauto&matchspeed=6&matchgoto=key`。他: ?matchseed/?matchspeed/?matchgoto=key|chest）
+- マッチの設計の正は docs/game-design.md。src/match/{index,rules,objects,hud}.ts。配置はシード+mulberry32で全員再現、裁定のみホスト（最小ピアID）
 - 渦森橋: ワールド座標 (x 82, z 132)。`?spawn=82,132` で直行
 - 2タブマルチ検証: 各タブを一度前面にしてロード完了させること（裏タブは描画停止でワールド構築が進まない）
 - コミットは日本語・機密スキャン後。契約ベース開発（.claude/contracts/、番号連番）
