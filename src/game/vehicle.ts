@@ -77,6 +77,16 @@ const WHEELS: readonly [number, number, number][] = [
     [-WHEEL_X, WHEEL_Y, -WHEEL_Z],
 ];
 
+/** 静止時にサスペンションが縮む量[m]（剛性40 の実測。上のコメント参照） */
+const STATIC_SAG = 0.06;
+/**
+ * 静止時の車輪の描画位置（車体ローカル）。遠隔プレイヤーの車はサスペンションの
+ * 伸縮を同期しないので、この固定値で描く（契約05）。
+ */
+export const WHEEL_REST_OFFSETS: readonly [number, number, number][] = WHEELS.map(
+    ([wx, wy, wz]) => [wx, wy - SUSPENSION_REST + STATIC_SAG, wz] as [number, number, number],
+);
+
 export function createVehicle(physics: Physics, x: number, y: number, z: number, yaw: number): Vehicle {
     const world = physics.world;
     const spawnRotation = new Quaternion().setFromAxisAngle(new Vector3(0, 1, 0), yaw);

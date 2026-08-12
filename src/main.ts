@@ -11,6 +11,8 @@
  *   ?stats              画面内 stats（fps / draw / tri / chunk / HLOD / scale / phys）
  *   ?fly                自由カメラ（デバッグ用。物理を読み込まない）
  *   ?hour=15.5          太陽の時刻
+ *   ?room=名前          マルチプレイのルーム（既定 kobe-sumiyoshi-3d-v1）
+ *   ?solo               マルチプレイを使わない
  *
  * 性能規律（契約03 追記2）:
  *   - フレームループ内で new を作らない
@@ -20,6 +22,7 @@
 import { ACESFilmicToneMapping, PCFSoftShadowMap, PerspectiveCamera, Scene, Vector3, WebGPURenderer } from 'three/webgpu';
 import { createFlyCamera } from './camera';
 import type { Game } from './game';
+import type { Multiplayer } from './net/multiplayer';
 import { createQuality, initialQuality, maxTier, sunHour, tierIsPinned, type QualitySettings } from './quality';
 import { createPostProcessing, type PostChain } from './render/post';
 import { createStatsOverlay } from './ui/stats';
@@ -80,6 +83,22 @@ async function start(): Promise<void> {
               return module;
           });
     let game: Game | null = null;
+    let multiplayer: Multiplayer | null = null;
+
+    /**
+     * P2Pマルチプレイ（契約05）。読み込みを待たせないよう遅延インポートし、
+     * 接続できなくても単独プレイとして動き続ける（E28）。?fly では使わない
+     */
+    const startMultiplayer = (active: Game): void => {
+        if (params.has('solo')) return;
+        void import('./net/multiplayer')
+            .then(({ createMultiplayer }) => {
+                multiplayer = createMultiplayer({ scene, quality, state: active.state });
+            })
+            .catch((err: unknown) => {
+                console.warn('[net] マルチプレイを開始できませんでした', err);
+            });
+    };
 
     const environment = createEnvironment(scene, quality);
     fogRangeNode.value.set(quality.fogNear, quality.fogFar);
@@ -125,6 +144,7 @@ async function start(): Promise<void> {
                     quality,
                 });
                 game.update(0); // カメラをプレイヤーの後方へ置いてから可視判定する
+                startMultiplayer(game);
             } catch (err) {
                 // 物理を用意できなくても真っ白にはしない（E25）
                 console.error('[game] 物理の初期化に失敗しました', err);
@@ -174,6 +194,7 @@ async function start(): Promise<void> {
         renderer.info.reset();
         if (game) game.update(dt);
         else controls?.update(dt);
+        multiplayer?.update(dt);
         environment.update(camera);
         world?.update(camera, quality);
 

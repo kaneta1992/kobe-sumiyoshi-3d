@@ -26,12 +26,16 @@ export interface PlayerAvatar {
     group: Group;
     /** 足元の位置・向き・歩行速度[m/s] を与えて1フレーム進める */
     update(feet: Vector3, yaw: number, speed: number, dt: number): void;
+    /** 服の色を差し替える（遠隔プレイヤーをピアごとに塗り分ける・契約05） */
+    setColor(color: number): void;
 }
 
 export interface CarAvatar {
     group: Group;
     /** 車輪 i の（車体ローカルの）位置・操舵角・回転角を与える */
     setWheel(i: number, offset: Vector3, steering: number, rotation: number): void;
+    /** 車体の色を差し替える */
+    setColor(color: number): void;
 }
 
 function material(color: number, roughness: number, metalness = 0): MeshStandardNodeMaterial {
@@ -96,6 +100,9 @@ export function createPlayerAvatar(quality: QualitySettings): PlayerAvatar {
             // 歩いている間だけわずかに上下する
             group.position.y += Math.abs(Math.sin(phase)) * amount * 0.04;
         },
+        setColor(color) {
+            cloth.color.setHex(color);
+        },
     };
 }
 
@@ -143,6 +150,9 @@ export function createCarAvatar(quality: QualitySettings): CarAvatar {
             pivots[i].position.copy(offset);
             pivots[i].rotation.y = steering;
             spins[i].rotation.x = rotation;
+        },
+        setColor(color) {
+            paint.color.setHex(color);
         },
     };
 }

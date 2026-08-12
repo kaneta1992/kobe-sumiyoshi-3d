@@ -44,10 +44,21 @@
             #status {
                 top: 10px;
                 left: 10px;
+                /* 右上のマルチプレイ表示と重ならないよう、手前で折り返す */
+                max-width: min(64em, 68vw);
             }
             #help {
                 bottom: 10px;
                 left: 10px;
+            }
+            /* マルチプレイの接続人数（契約05）。中身が無いときは枠ごと出さない */
+            #net {
+                top: 10px;
+                right: 10px;
+                text-align: right;
+            }
+            #net:empty {
+                display: none;
             }
             /* 出典表記は各データの利用条件（常時表示・非表示にしないこと）:
                地理院タイル = 出典明示、兵庫県 50cmメッシュ DSM/DEM = CC-BY 4.0 */
@@ -178,6 +189,7 @@
         <div id="app"></div>
 
         <div id="status" class="panel">起動中…</div>
+        <div id="net" class="panel"></div>
         <div id="help" class="panel">WASD: 移動　Shift: 走る　ドラッグ/マウス: 視点　F: 乗車　R: 位置リセット</div>
         <div id="credit" class="panel">
             出典:
