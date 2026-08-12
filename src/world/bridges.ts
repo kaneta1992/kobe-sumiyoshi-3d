@@ -48,6 +48,11 @@ const FOOTING_DEPTH = 1.2;
 
 const CONCRETE: readonly [number, number, number] = [0.3, 0.297, 0.283];
 const CONCRETE_DARK: readonly [number, number, number] = [0.2, 0.198, 0.19];
+/**
+ * 桁の側面。高欄（明るい）と桁（暗い）で横帯のコントラストを作ると、
+ * 遠景でも「橋が架かっている」と読める（契約07 R2）
+ */
+const GIRDER_SIDE: readonly [number, number, number] = [0.175, 0.172, 0.163];
 
 /** 橋1本ぶんの断面情報。描画と物理コライダーで共有する */
 export interface BridgeSpan {
@@ -251,7 +256,7 @@ export function createBridges(
                 [lA, lB, tA, tB, bA, bB, dir[1], -dir[0]],
                 [rA, rB, tA, tB, bA, bB, -dir[1], dir[0]],
             ] as [[number, number], [number, number], number, number, number, number, number, number][]) {
-                pushQuadFacing(buf, P(a, ba), P(b2, bb), P(b2, tb), P(a, ta), sx, 0, sz, CONCRETE[0], CONCRETE[1], CONCRETE[2]);
+                pushQuadFacing(buf, P(a, ba), P(b2, bb), P(b2, tb), P(a, ta), sx, 0, sz, GIRDER_SIDE[0], GIRDER_SIDE[1], GIRDER_SIDE[2]);
             }
             // 高欄（左右）: 外面・内面・天端
             for (const side of [-1, 1]) {

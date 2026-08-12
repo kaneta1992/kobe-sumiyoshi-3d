@@ -4,7 +4,7 @@
  *
  * 時刻はパラメータ化（?hour=）。値は決定的なので全クライアントで同じ空になる。
  */
-import { Color, Vector2, Vector3 } from 'three/webgpu';
+import { Color, SRGBColorSpace, Vector2, Vector3 } from 'three/webgpu';
 import { uniform } from 'three/tsl';
 
 /** 原点から太陽へ向かう単位ベクトル */
@@ -40,12 +40,14 @@ export const ambientColorNode = uniform(ambientColor);
 export const bounceColorNode = uniform(bounceColor);
 /** 夜の度合い（0=昼 / 1=夜）。窓明かりなどの点灯に使う */
 export const nightNode = uniform(0);
+/** 夕景の度合い（0=高い太陽 / 1=地平近く）。太陽まわりのにじみの広さに使う */
+export const duskNode = uniform(0);
 
 /**
  * ベイクGIの効き。1 で焼いた値そのまま、0 で無効。
  * aoNode は環境光（間接）にだけ掛かるので、直射日光は削らない。
  */
-export const GI_AO_STRENGTH = 0.86;
+export const GI_AO_STRENGTH = 0.78;
 /** バウンス項の格納スケール（tools/lib/gi.mjs の BOUNCE_SCALE と対応させること） */
 export const GI_BOUNCE_SCALE = 0.3;
 
@@ -67,6 +69,55 @@ const DECLINATION = 18.8 * DEG;
 function smoothstep01(edge0: number, edge1: number, x: number): number {
     const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
     return t * t * (3 - 2 * t);
+}
+
+/**
+ * 時刻のカラースクリプト（昼白 → 夕橙 → 夜青）。
+ *
+ * キーは太陽高度の sin（1=天頂 / 0=地平線 / 負=地平線下）。時刻ではなく高度で引くので、
+ * 季節や緯度を変えても「同じ高さの太陽なら同じ色」になる。
+ *   sun     直射光の色 / sunI  直射光の強さ
+ *   zenith  天頂の空 / horizon 太陽と反対側の地平 / haze 太陽側の地平（夕焼けのオレンジ）
+ *   amb     環境光（空からの光）の強さ
+ * 色は **sRGB** で置いてある（絵として読みやすいため）。Color.setRGB で線形へ変換する。
+ */
+const SKY_SCRIPT = [
+    { alt: 0.9, sun: [1, 0.98, 0.94], sunI: 3.6, zenith: [0.19, 0.39, 0.78], horizon: [0.72, 0.82, 0.95], haze: [0.86, 0.89, 0.96], amb: 1.05 },
+    { alt: 0.55, sun: [1, 0.94, 0.84], sunI: 3.35, zenith: [0.17, 0.35, 0.74], horizon: [0.7, 0.79, 0.93], haze: [0.95, 0.88, 0.78], amb: 0.98 },
+    { alt: 0.3, sun: [1, 0.8, 0.54], sunI: 2.75, zenith: [0.13, 0.27, 0.64], horizon: [0.64, 0.68, 0.84], haze: [1, 0.76, 0.48], amb: 0.82 },
+    { alt: 0.15, sun: [1, 0.63, 0.3], sunI: 2.05, zenith: [0.1, 0.19, 0.54], horizon: [0.56, 0.56, 0.76], haze: [1, 0.58, 0.25], amb: 0.62 },
+    { alt: 0.05, sun: [1, 0.45, 0.17], sunI: 1.2, zenith: [0.07, 0.12, 0.42], horizon: [0.45, 0.44, 0.66], haze: [1, 0.4, 0.14], amb: 0.44 },
+    { alt: -0.04, sun: [0.86, 0.42, 0.3], sunI: 0.38, zenith: [0.05, 0.07, 0.27], horizon: [0.26, 0.26, 0.43], haze: [0.72, 0.28, 0.14], amb: 0.24 },
+    { alt: -0.14, sun: [0.55, 0.66, 1], sunI: 0.16, zenith: [0.02, 0.03, 0.08], horizon: [0.09, 0.1, 0.16], haze: [0.11, 0.12, 0.19], amb: 0.1 },
+] as const;
+
+/** カラースクリプトを太陽高度で引く。区間の外は端の値で止める */
+function gradeAt(sinAlt: number): {
+    sun: number[];
+    sunI: number;
+    zenith: number[];
+    horizon: number[];
+    haze: number[];
+    amb: number;
+} {
+    let i = 0;
+    while (i < SKY_SCRIPT.length - 2 && sinAlt < SKY_SCRIPT[i + 1].alt) i++;
+    const a = SKY_SCRIPT[i];
+    const b = SKY_SCRIPT[i + 1];
+    const t = Math.max(0, Math.min(1, (a.alt - sinAlt) / (a.alt - b.alt)));
+    const mix3 = (p: readonly number[], q: readonly number[]): number[] => [
+        p[0] + (q[0] - p[0]) * t,
+        p[1] + (q[1] - p[1]) * t,
+        p[2] + (q[2] - p[2]) * t,
+    ];
+    return {
+        sun: mix3(a.sun, b.sun),
+        sunI: a.sunI + (b.sunI - a.sunI) * t,
+        zenith: mix3(a.zenith, b.zenith),
+        horizon: mix3(a.horizon, b.horizon),
+        haze: mix3(a.haze, b.haze),
+        amb: a.amb + (b.amb - a.amb) * t,
+    };
 }
 
 /**
@@ -99,47 +150,39 @@ export function setSunHour(hour: number): void {
         .normalize();
 
     // day = 昼の度合い（薄明を挟んで 0↔1）/ night = その逆
-    const day = smoothstep01(-0.075, 0.12, sinAlt);
+    const day = smoothstep01(-0.09, 0.06, sinAlt);
     const night = 1 - day;
     lighting.night = night;
-    // 太陽高度が低いほど赤く弱く
-    const t = Math.max(0, Math.min(1, sinAlt));
-    const warm = Math.pow(1 - t, 2.2);
+    // dusk = 夕景の度合い。太陽が低いほど 1（空のにじみを広く暖かくする）
+    const dusk = smoothstep01(0.58, 0.04, sinAlt);
 
-    sunColor.setRGB(1, 0.97 - warm * 0.22, 0.9 - warm * 0.44);
-    // 月光は青白く、色としては太陽の位置に置いたまま強さだけ落とす
-    sunColor.lerp(MOON_COLOR, night);
-    lighting.sun = 3.4 * (0.12 + 0.88 * Math.pow(day, 0.75)) * (1 - night * 0.955) + 0.09;
-
-    skyZenith.setHSL(0.6, 0.55 - warm * 0.2, 0.34 + t * 0.12);
-    skyHorizon.setHSL(0.58 - warm * 0.08, 0.34 + warm * 0.2, 0.74 - warm * 0.1);
-    groundHaze.setHSL(0.09, 0.14 + warm * 0.1, 0.5 + t * 0.1);
-    // 夜空: 真っ黒にはせず、街明かりの照り返しを地平に残す（E39）
-    skyZenith.lerp(NIGHT_ZENITH, night);
-    skyHorizon.lerp(NIGHT_HORIZON, night);
-    groundHaze.lerp(NIGHT_HORIZON, night * 0.85);
-    fogColor.copy(skyHorizon).lerp(skyZenith, 0.18);
-    hazeSunColor.copy(skyHorizon).lerp(sunColor, 0.45 + warm * 0.2);
+    const g = gradeAt(sinAlt);
+    sunColor.setRGB(g.sun[0], g.sun[1], g.sun[2], SRGBColorSpace);
+    lighting.sun = g.sunI;
+    skyZenith.setRGB(g.zenith[0], g.zenith[1], g.zenith[2], SRGBColorSpace);
+    skyHorizon.setRGB(g.horizon[0], g.horizon[1], g.horizon[2], SRGBColorSpace);
+    hazeSunColor.setRGB(g.haze[0], g.haze[1], g.haze[2], SRGBColorSpace);
+    // 地平線より下（空ドームの下半分）は地表のかすみ。夕方は路面の照り返しで暖かい
+    groundHaze.copy(skyHorizon).lerp(hazeSunColor, 0.35).multiplyScalar(0.72);
+    // 距離フォグは「空と同じ色」でないと山並みが浮く。太陽側の暖かさは
+    // materials 側（hazeSunNode）が視線方向で足す
+    fogColor.copy(skyHorizon).lerp(skyZenith, 0.22);
 
     // --- ベイクGI の変調色（追記1） ---
-    // 環境光は空の色そのもの。強さは昼夜で大きく変える
-    ambientColor.copy(skyHorizon).lerp(skyZenith, 0.4);
-    lighting.ambient = 1.05 * (0.1 + 0.9 * day);
-    // 1バウンスは「日の当たった地面・壁の色」。太陽が高いほど強く、夜はほぼ消える
-    bounceColor.copy(sunColor).multiplyScalar(0.75 * Math.pow(t, 0.6) + 0.05);
-    bounceColor.r += ambientColor.r * 0.35;
-    bounceColor.g += ambientColor.g * 0.35;
-    bounceColor.b += ambientColor.b * 0.35;
-    bounceColor.multiply(GROUND_ALBEDO).multiplyScalar(0.25 + 0.75 * day);
+    // 環境光は空の色そのもの（天頂寄り）。強さはカラースクリプトが持つ
+    ambientColor.copy(skyZenith).lerp(skyHorizon, 0.55);
+    lighting.ambient = g.amb;
+    // 1バウンスは「日の当たった地面・壁の色」。夕方はオレンジの照り返しになる
+    bounceColor.copy(sunColor).multiplyScalar(0.6 * Math.pow(Math.max(0, sinAlt), 0.45) + 0.06);
+    bounceColor.r += ambientColor.r * 0.4;
+    bounceColor.g += ambientColor.g * 0.4;
+    bounceColor.b += ambientColor.b * 0.4;
+    bounceColor.multiply(GROUND_ALBEDO).multiplyScalar(0.3 + 0.7 * day);
 
     nightNode.value = night;
+    duskNode.value = dusk;
 }
 
-/** 月光の色（青白い） */
-const MOON_COLOR = new Color(0.62, 0.72, 1);
-/** 夜空（天頂 / 地平）。地平は市街地の照り返しでわずかに暖かい */
-const NIGHT_ZENITH = new Color(0.012, 0.018, 0.038);
-const NIGHT_HORIZON = new Color(0.055, 0.058, 0.075);
 /** 1バウンスの反射色（アスファルト・土・モルタルのならし） */
 const GROUND_ALBEDO = new Color(1, 0.94, 0.82);
 

@@ -26,6 +26,7 @@ import { exp, float, mix, positionLocal, positionView, positionWorld, cameraPosi
 import type { QualitySettings } from '../quality';
 import {
     ambientColor,
+    duskNode,
     fogColorNode,
     fogHeightNode,
     fogRangeNode,
@@ -48,12 +49,22 @@ function createSkyDome(): Mesh {
     const up = dir.y;
     const sunDot = dir.dot(sunDirNode);
 
-    const above = mix(skyHorizonNode, skyZenithNode, saturate(up).pow(0.55));
-    const below = mix(skyHorizonNode, groundHazeNode, saturate(up.negate().mul(3)));
+    // 地平は方位で色が変わる: 太陽側は夕焼けのオレンジ、反対側は冷たい青。
+    // 「地平線オレンジ → 天頂群青」のグラデはここで作る
+    const towardSun = saturate(sunDot.mul(0.5).add(0.5).mul(1.3).sub(0.3));
+    const horizon = mix(skyHorizonNode, hazeSunNode, towardSun.pow(2.2));
+    const above = mix(horizon, skyZenithNode, saturate(up).pow(mix(float(0.55), float(0.42), duskNode)));
+    const below = mix(horizon, groundHazeNode, saturate(up.negate().mul(3)));
     const base = mix(below, above, smoothstep(-0.03, 0.03, up));
-    // 太陽まわりのミー散乱風のにじみ + 太陽本体（トーンマップとブルームに載せる）
-    const glow = sunColorNode.mul(saturate(sunDot).pow(7).mul(0.34));
-    const disc = sunColorNode.mul(smoothstep(0.9986, 0.99955, sunDot).mul(14));
+    // 太陽まわりのミー散乱風のにじみ。夕方は広く暖かく広がる
+    const glowColor = mix(sunColorNode, hazeSunNode, duskNode.mul(0.65));
+    const glow = glowColor.mul(
+        saturate(sunDot).pow(mix(float(8), float(2.4), duskNode)).mul(mix(float(0.3), float(0.95), duskNode)),
+    );
+    // 太陽本体（トーンマップとブルームに載せる）。夕方は本体もオレンジに寄せる
+    const disc = mix(sunColorNode, hazeSunNode, duskNode.mul(0.8)).mul(
+        smoothstep(0.9982, 0.99945, sunDot).mul(mix(float(12), float(17), duskNode)),
+    );
 
     const material = new MeshBasicNodeMaterial();
     material.colorNode = base.add(glow).add(disc);

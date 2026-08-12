@@ -149,10 +149,18 @@ function createMaterial(map: Texture, quality: QualitySettings): MeshStandardNod
     // （50cm DEM は擁壁を地形の段差としてそのまま持っているため、別ジオメトリは足さない）
     const soil = vec3(0.34, 0.27, 0.2);
     const wall = vec3(0.3, 0.295, 0.28);
+    /** 林床の落ち葉・腐葉土 */
+    const litter = vec3(0.19, 0.145, 0.09);
     const slope = saturate(baked.y.sub(0.42).mul(1.9));
     const cliff = saturate(baked.y.sub(0.74).mul(3.4));
     const soiled = mix(albedo, albedo.mul(0.55).add(soil.mul(0.45)), slope);
-    const tinted = mix(soiled, albedo.mul(0.3).add(wall.mul(0.7)), cliff);
+    const walled = mix(soiled, albedo.mul(0.3).add(wall.mul(0.7)), cliff);
+    // 林床（R2）: 空が塞がれているところは航空写真の暗い緑がそのまま黒く沈むので、
+    // 落ち葉・腐葉土の色へ寄せて情報量を残す。ベイクGIの空可視率で引く
+    // 緑が勝っている画素（= 樹冠が写っている所）にだけ効かせる。住宅地の路地には出さない
+    const greenish = saturate(albedo.g.mul(2.1).sub(albedo.r).sub(albedo.b).mul(3));
+    const litterMask = saturate(float(0.42).sub(baked.x).mul(2.6)).mul(greenish);
+    const tinted = mix(walled, walled.mul(0.5).add(litter.mul(0.5)), litterMask);
     // 近景だけ高周波のムラを足す（航空写真が甘くなる 1.6m 視点対策）
     const closeness = smoothstep(20, 150, positionView.length()).oneMinus();
     const grain = mx_noise_float(positionWorld.mul(0.85)).mul(0.5).add(0.5);

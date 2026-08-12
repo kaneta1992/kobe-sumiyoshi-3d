@@ -60,7 +60,8 @@ async function start(): Promise<void> {
     renderer.setPixelRatio(basePixelRatio);
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.toneMapping = ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.05;
+    // ポスト側でS字のトーンカーブを掛けるので、露出はやや控えめにして白飛びを抑える
+    renderer.toneMappingExposure = 1.0;
     renderer.shadowMap.enabled = quality.shadows;
     renderer.shadowMap.type = PCFSoftShadowMap;
     // ポストプロセスは1フレームに複数回 render するので、自動リセットを止めて

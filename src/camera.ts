@@ -4,6 +4,7 @@
  */
 import { PerspectiveCamera, Vector3 } from 'three/webgpu';
 import { AREA_HALF } from './config';
+import { sunDirection } from './world/sun';
 
 const KEY_AXIS: Record<string, [number, number, number]> = {
     KeyW: [0, 0, 1],
@@ -91,9 +92,8 @@ export function shotView(index: number, world: ShotWorld): ShotView | null {
     const dz = spawn.dirZ;
 
     switch (index) {
-        case 1:
-        case 4: {
-            // ①④ スポーン地点の街路。歩行者の目線で道なりに見る
+        case 1: {
+            // ① スポーン地点の街路。歩行者の目線で道なりに見る
             const ex = spawn.x - dx * 7;
             const ez = spawn.z - dz * 7;
             return {
@@ -103,15 +103,34 @@ export function shotView(index: number, world: ShotWorld): ShotView | null {
                     groundAt(spawn.x + dx * 45, spawn.z + dz * 45) + 3.4,
                     spawn.z + dz * 45,
                 ),
-                label: index === 4 ? '夕方の街路' : 'スポーン地点の街路',
+                label: 'スポーン地点の街路',
+            };
+        }
+        case 4: {
+            // ④ 夕方の街路。太陽の方位へ向ける（太陽ディスク・地平のオレンジ・
+            // 建物のリムを1枚に収めるため。①と同じ向きだと逆光側で夕方に見えない）
+            const sx = sunDirection.x;
+            const sz = sunDirection.z;
+            const sl = Math.hypot(sx, sz) || 1;
+            // 道路上（スポーン点）から動かさない — 横へ振ると宅地の中に入る
+            const ex = spawn.x;
+            const ez = spawn.z;
+            // 屋根より上へ出る。低い太陽（高度16°前後）とオレンジの地平が画角に入り、
+            // 手前の屋根・壁が夕日を受ける
+            const ey = groundAt(ex, ez) + 11;
+            return {
+                eye: new Vector3(ex, ey, ez),
+                target: new Vector3(ex + (sx / sl) * 140, ey + 9, ez + (sz / sl) * 140),
+                label: '夕方の街路',
             };
         }
         case 2: {
-            // ② 俯瞰全景。市街地から六甲山麓の稜線までを1枚に収める
+            // ② 俯瞰全景。手前に市街地、奥に六甲山麓の稜線が入る高さと引きにする。
+            // 山は北（-z）側なので、南東の上空から北西を見る
             const peak = findPeak(world);
             return {
-                eye: new Vector3(peak.x + 260, world.maxElevation + 430, peak.z + 1250),
-                target: new Vector3(peak.x - 60, world.minElevation + 160, peak.z - 120),
+                eye: new Vector3(700, world.maxElevation * 0.55 + 360, 1150),
+                target: new Vector3(peak.x * 0.5 - 120, peak.y * 0.45 + 40, peak.z * 0.5 - 60),
                 label: '俯瞰全景',
             };
         }
@@ -143,12 +162,12 @@ export function shotView(index: number, world: ShotWorld): ShotView | null {
             // ⑥ 渦森橋の側面（谷側から見上げる）。橋の景観レビュー用
             const { x, z } = UZUMORI_BRIDGE;
             const deck = groundAt(x, z);
-            const a = valleyAzimuth(world, x, z, 95);
-            const ex = x + Math.cos(a) * 95;
-            const ez = z + Math.sin(a) * 95;
+            const a = valleyAzimuth(world, x, z, 70);
+            const ex = x + Math.cos(a) * 70;
+            const ez = z + Math.sin(a) * 70;
             return {
-                eye: new Vector3(ex, groundAt(ex, ez) + 16, ez),
-                target: new Vector3(x, deck + 12, z),
+                eye: new Vector3(ex, groundAt(ex, ez) + 13, ez),
+                target: new Vector3(x, deck + 14, z),
                 label: '渦森橋の側面',
             };
         }

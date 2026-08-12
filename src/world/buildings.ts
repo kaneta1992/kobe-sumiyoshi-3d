@@ -186,19 +186,21 @@ function fallbackHeight(code: number, area: number, r: number): number {
 function buildingColors(code: number, r0: number, r1: number): { wall: Color; roof: Color } {
     const wall = new Color();
     const roof = new Color();
+    // 外壁のアルベドは実物の塗り壁・サイディング相当（0.35〜0.65）に抑える。
+    // ここを上げると昼に白飛びして立体感が消える（契約07 R2）
     if (code === BLD_FIREPROOF) {
-        wall.setHSL(0.09 + r0 * 0.03, 0.04 + r1 * 0.05, 0.56 + r0 * 0.18);
-        roof.setHSL(0.58, 0.03 + r1 * 0.04, 0.34 + r1 * 0.1);
+        wall.setHSL(0.09 + r0 * 0.03, 0.04 + r1 * 0.05, 0.47 + r0 * 0.15);
+        roof.setHSL(0.58, 0.03 + r1 * 0.04, 0.32 + r1 * 0.09);
     } else if (code === BLD_NO_WALL) {
-        wall.setHSL(0.09, 0.05, 0.5);
-        roof.setHSL(0.55, 0.05, 0.42);
+        wall.setHSL(0.09, 0.05, 0.44);
+        roof.setHSL(0.55, 0.05, 0.38);
     } else {
         // 外壁: 白〜ベージュのモルタル/サイディングが多数派。
         // そこへ濃色サイディングと青灰の外壁を少数混ぜて「箱の羅列」を崩す
         const w = hash01(r0 * 1000, r1 * 1000, 0x3f21);
-        if (w < 0.13) wall.setHSL(0.07 + r0 * 0.03, 0.18 + r0 * 0.14, 0.2 + r0 * 0.13);
-        else if (w < 0.26) wall.setHSL(0.56 + r0 * 0.06, 0.05 + r0 * 0.08, 0.34 + r0 * 0.16);
-        else wall.setHSL(0.09 + r0 * 0.05, 0.05 + r1 * 0.13, 0.5 + r0 * 0.3);
+        if (w < 0.13) wall.setHSL(0.07 + r0 * 0.03, 0.18 + r0 * 0.14, 0.19 + r0 * 0.12);
+        else if (w < 0.26) wall.setHSL(0.56 + r0 * 0.06, 0.05 + r0 * 0.08, 0.31 + r0 * 0.14);
+        else wall.setHSL(0.09 + r0 * 0.05, 0.06 + r1 * 0.14, 0.42 + r0 * 0.24);
         // 屋根瓦: 青灰（いぶし）を基本に、茶（洋瓦）・黒・銀（金属板）を混ぜる
         if (r1 < 0.2) roof.setHSL(0.055 + r0 * 0.02, 0.3 + r0 * 0.12, 0.24 + r0 * 0.08);
         else if (r1 < 0.32) roof.setHSL(0.09, 0.03, 0.17 + r0 * 0.05);

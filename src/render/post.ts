@@ -6,11 +6,16 @@
  * 呼び出し側は素の renderer.render に落ちる（E5-b / E17）。
  */
 import { PostProcessing, type PerspectiveCamera, type Scene, type WebGPURenderer } from 'three/webgpu';
-import { float, mix, mrt, normalView, output, pass, renderOutput } from 'three/tsl';
+import { float, mix, mrt, normalView, output, pass, renderOutput, vec3, vec4 } from 'three/tsl';
 import { ao } from 'three/addons/tsl/display/GTAONode.js';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
 import type { QualitySettings } from '../quality';
+
+/** トーンカーブの効き（0=素のACES / 1=S字いっぱい） */
+const GRADE_CONTRAST = 0.3;
+/** 彩度（1=そのまま） */
+const GRADE_SATURATION = 1.12;
 
 export interface PostChain {
     render(): void;
@@ -48,9 +53,17 @@ export function createPostProcessing(
         const strength = quality.preset === 'mobile' ? 0.26 : 0.42;
         const node = quality.bloom ? lit.add(bloom(lit, strength, 0.55, 0.86)) : lit;
 
-        // トーンマップ + 出力色空間を自前の位置で掛け、その後に FXAA を通す
+        // トーンマップ + 出力色空間を自前の位置で掛け、その後にグレーディング → FXAA
         post.outputColorTransform = false;
-        const graded = renderOutput(node);
+        const toned = renderOutput(node);
+        // フィルミックなトーンカーブ: 表示色に S 字を掛けて中間のコントラストを稼ぎ、
+        // 白飛び側を寝かせる。UI は DOM なのでポストの外（E41）
+        const c = toned.rgb;
+        const sCurve = c.mul(c).mul(float(3).sub(c.mul(2)));
+        const contrasted = mix(c, sCurve, float(GRADE_CONTRAST));
+        // わずかな彩度上げ。フォトリアルに寄せすぎない範囲でリッチにする（候補6）
+        const luma = contrasted.dot(vec3(0.2126, 0.7152, 0.0722));
+        const graded = vec4(mix(vec3(luma), contrasted, float(GRADE_SATURATION)), toned.a);
         post.outputNode = quality.fxaa ? fxaa(graded) : graded;
 
         let broken = false;

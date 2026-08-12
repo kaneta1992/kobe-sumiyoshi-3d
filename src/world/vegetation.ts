@@ -66,6 +66,7 @@ import {
 import { OCC_BUILDING, OCC_ROAD, OCC_ROADSIDE, type Occupancy } from './occupancy';
 import {
     GI_AO_STRENGTH,
+    ambientColorNode,
     bounceColorNode,
     sunColorNode,
     sunDirNode,
@@ -287,7 +288,7 @@ function addBlob(
         const py = cy + dy * ry * bump * droop;
         const pz = cz + dz * rz * bump;
         // ベイクAO: 樹冠の下側・内側を暗く（追記2-5 の頂点AO）
-        const shade = (0.4 + 0.6 * (dy * 0.5 + 0.5)) * (1 - depth * 0.36);
+        const shade = (0.48 + 0.52 * (dy * 0.5 + 0.5)) * (1 - depth * 0.3);
         pushVertex(b, px, py, pz, dx, dy, dz, color[0] * shade, color[1] * shade, color[2] * shade);
         wind.push(trunkWind, 1, 0);
         if (texcoord) texcoord.push(dx * 0.5 + 0.5, dy * 0.5 + 0.5);
@@ -620,7 +621,7 @@ function buildTreeGeometry(species: number, lod: number): BufferGeometry {
                     0.22 + t * 0.78,
                     salt + i * 11 + k,
                     1 - t * 0.7,
-                    lod === 0 ? 2 : 0,
+                    lod === 0 ? 3 : 0,
                 );
             }
         }
@@ -715,7 +716,7 @@ function buildTreeGeometry(species: number, lod: number): BufferGeometry {
             0.55 + (y - trunkTop) * 0.5,
             salt + i * 7,
             i === 0 ? 1 : 0.25,
-            lod === 0 ? (garden ? 4 : 3) : 0,
+            lod === 0 ? (garden ? 6 : 5) : 0,
         );
     }
     return toGeometry(buf, { aWind: 3, uv: 2 });
@@ -839,7 +840,10 @@ function createFoliageMaterial(alphaMap: Texture | null, doubleSided: boolean): 
     material.emissiveNode = base
         .mul(sunColorNode)
         .mul(back.mul(wind.y).mul(0.85).add(wrap.mul(wind.y).mul(0.16)))
-        .add(base.mul(bounceColorNode).mul(sky.oneMinus().mul(0.22)));
+        // 影側の持ち上げ（R2）: 日が当たらない葉も、開けているぶんだけ空の光を受ける。
+        // 影の中だけに効くので、日向側のコントラストは潰れない
+        .add(base.mul(ambientColorNode).mul(sky.mul(0.45)))
+        .add(base.mul(bounceColorNode).mul(sky.oneMinus().mul(0.3)));
     material.roughnessNode = mix(float(0.92), float(0.66), wind.y);
 
     if (alphaMap) {
