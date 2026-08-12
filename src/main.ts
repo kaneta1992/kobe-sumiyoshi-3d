@@ -27,6 +27,7 @@ import type { Multiplayer } from './net/multiplayer';
 import { createQuality, initialQuality, maxTier, sunHour, tierIsPinned, type QualitySettings } from './quality';
 import { createPostProcessing, type PostChain } from './render/post';
 import { createStatsOverlay } from './ui/stats';
+import { createMapOverlay, type MapOverlay } from './ui/map';
 import { hideLoading, setHelp, setLoadingProgress, setStatus, showFatal } from './ui/loading';
 import { createEnvironment } from './world/environment';
 import { fogRangeNode, setSunHour } from './world/sun';
@@ -85,6 +86,7 @@ async function start(): Promise<void> {
           });
     let game: Game | null = null;
     let multiplayer: Multiplayer | null = null;
+    let map: MapOverlay | null = null;
 
     /**
      * P2Pマルチプレイ（契約05）。読み込みを待たせないよう遅延インポートし、
@@ -146,6 +148,19 @@ async function start(): Promise<void> {
                 });
                 game.update(0); // カメラをプレイヤーの後方へ置いてから可視判定する
                 startMultiplayer(game);
+                // ミニマップ + 全体マップ（契約09）。ベース地図の生成が入るので
+                // ローディング表示が出ているうちに作る
+                setLoadingProgress(1, 1, 'マップを描画中');
+                const active = game;
+                map = createMapOverlay({
+                    world: ready,
+                    quality,
+                    state: active.state,
+                    // ?solo や未接続なら誰も渡らない（E52）
+                    eachRemote: (visit) => multiplayer?.eachPlayer(visit),
+                    // マップ表示中はゲーム入力を止める（E49）
+                    onToggle: (open) => active.setInputSuspended(open),
+                });
             } catch (err) {
                 // 物理を用意できなくても真っ白にはしない（E25）
                 console.error('[game] 物理の初期化に失敗しました', err);
@@ -196,6 +211,7 @@ async function start(): Promise<void> {
         if (game) game.update(dt);
         else controls?.update(dt);
         multiplayer?.update(dt);
+        map?.update(dt); // 中で10Hzに間引く（マーカー層だけ描き直す）
         environment.update(camera);
         world?.update(camera, quality);
 

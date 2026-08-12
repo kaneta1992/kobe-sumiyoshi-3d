@@ -37,6 +37,11 @@ export interface Input {
     beginFrame(): void;
     /** 毎フレーム末に呼ぶ。視点差分と押下エッジを消す */
     endFrame(): void;
+    /**
+     * ゲーム入力の一時停止（E49）。マップを開いている間は true にする。
+     * 止めている間は state が中立のままで、キー・ドラッグ・タッチのどれも通さない
+     */
+    setSuspended(suspended: boolean): void;
     /** 乗降ボタンの表示を切り替える */
     setMode(mode: ControlMode): void;
     /** 乗降できる状態か（近くに車がある / 乗車中）をUIへ伝える */
@@ -79,8 +84,10 @@ export function createInput(element: HTMLElement): Input {
     let keyRun = false;
     let keyBrake = false;
     let keyDown = false;
+    let suspended = false;
 
     const onKeyDown = (e: KeyboardEvent): void => {
+        if (suspended) return;
         if (e.code in MOVE_KEYS) {
             pressed.add(e.code);
             e.preventDefault();
@@ -109,7 +116,7 @@ export function createInput(element: HTMLElement): Input {
     const locked = (): boolean => document.pointerLockElement === element;
 
     const onPointerDown = (e: PointerEvent): void => {
-        if (e.button !== 0) return;
+        if (suspended || e.button !== 0) return;
         if (e.pointerType === 'mouse' && !locked()) {
             // ロックできない環境（iPadOS 等）ではドラッグに落ちる
             void element.requestPointerLock?.();
@@ -118,6 +125,7 @@ export function createInput(element: HTMLElement): Input {
         element.setPointerCapture(e.pointerId);
     };
     const onPointerMove = (e: PointerEvent): void => {
+        if (suspended) return;
         if (!locked() && e.pointerId !== dragPointer) return;
         state.lookX += e.movementX ?? 0;
         state.lookY += e.movementY ?? 0;
@@ -149,6 +157,12 @@ export function createInput(element: HTMLElement): Input {
         state,
         touch,
         beginFrame() {
+            if (suspended) {
+                // タッチUIの押下が溜まっていても、閉じた瞬間に暴発させない
+                touch?.consumeInteract();
+                touch?.consumeJump();
+                return;
+            }
             let x = 0;
             let z = 0;
             for (const code of pressed) {
@@ -178,6 +192,26 @@ export function createInput(element: HTMLElement): Input {
             state.respawn = false;
             state.jump = false;
             state.toggleFly = false;
+        },
+        setSuspended(value) {
+            if (suspended === value) return;
+            suspended = value;
+            if (!value) return;
+            // 押しっぱなしを持ち越さず、視点も中立へ戻す。マウスを掴んだままでは
+            // マップのボタンを押せないのでポインタロックも解く
+            onBlur();
+            state.moveX = 0;
+            state.moveZ = 0;
+            state.run = false;
+            state.brake = false;
+            state.down = false;
+            state.jump = false;
+            state.toggleFly = false;
+            state.lookX = 0;
+            state.lookY = 0;
+            state.interact = false;
+            state.respawn = false;
+            if (locked()) document.exitPointerLock();
         },
         setMode(mode) {
             touch?.setMode(mode);

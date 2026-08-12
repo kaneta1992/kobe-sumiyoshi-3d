@@ -47,6 +47,12 @@
                 /* 右上のマルチプレイ表示と重ならないよう、手前で折り返す */
                 max-width: min(64em, 68vw);
             }
+            /* 狭い画面では右上のミニマップ（116px）の下に潜り込ませない（E50） */
+            @media (max-width: 700px) {
+                #status {
+                    max-width: 56vw;
+                }
+            }
             #help {
                 bottom: 10px;
                 left: 10px;
@@ -108,6 +114,86 @@
             #loading-label {
                 font-size: 12px;
                 color: #a8b4c2;
+            }
+            /* ミニマップ + 全体マップ（src/ui/map.ts が中身を作る・契約09）。
+               右上のマルチプレイ表示の下に置く。モバイルではタッチUI（左下スティック・
+               右下ボタン）と重ならないよう、上端側だけを使う（E50） */
+            #minimap {
+                position: fixed;
+                z-index: 12;
+                top: calc(env(safe-area-inset-top, 0px) + 40px);
+                right: max(10px, env(safe-area-inset-right, 0px));
+                width: 168px;
+                height: 168px;
+                border-radius: 50%;
+                overflow: hidden;
+                cursor: pointer;
+                touch-action: none;
+                border: 2px solid rgba(255, 255, 255, 0.55);
+                box-shadow: 0 3px 12px rgba(0, 0, 0, 0.42);
+                background: #f7f2e6;
+                transition: opacity 0.15s ease;
+            }
+            #minimap canvas {
+                display: block;
+                width: 100%;
+                height: 100%;
+            }
+            /* 全体マップを開いている間は引っ込める */
+            #minimap.dimmed {
+                opacity: 0;
+                pointer-events: none;
+            }
+            @media (max-width: 700px), (max-height: 560px) {
+                #minimap {
+                    width: 116px;
+                    height: 116px;
+                }
+            }
+            #map-full {
+                position: fixed;
+                inset: 0;
+                z-index: 25;
+                background: #dcd6c8;
+                touch-action: none;
+                user-select: none;
+                -webkit-user-select: none;
+            }
+            #map-full.hidden {
+                display: none;
+            }
+            #map-full canvas {
+                display: block;
+                width: 100%;
+                height: 100%;
+            }
+            #map-full .map-close,
+            #map-full .map-hint {
+                position: absolute;
+                border-radius: 8px;
+                background: rgba(12, 16, 22, 0.72);
+                color: #e8edf2;
+                font-size: 13px;
+            }
+            #map-full .map-close {
+                top: max(12px, env(safe-area-inset-top, 0px));
+                right: max(12px, env(safe-area-inset-right, 0px));
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                width: 44px;
+                height: 44px;
+                font-size: 18px;
+                cursor: pointer;
+                touch-action: none;
+            }
+            #map-full .map-hint {
+                left: 50%;
+                bottom: calc(env(safe-area-inset-bottom, 0px) + 14px);
+                transform: translateX(-50%);
+                padding: 6px 12px;
+                white-space: nowrap;
+                pointer-events: none;
             }
             /* タッチUI（src/ui/touch.ts が中身を作る）。タッチ端末でだけ表示される */
             #touch-ui {

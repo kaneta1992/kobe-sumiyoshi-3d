@@ -97,11 +97,26 @@ interface Peer {
     s: Float32Array;
     /** 現在の状態（乗降のたびにバッファを捨てるので、段ごとには持たない） */
     driving: boolean;
+    /** マーカーの色（ピアIDのハッシュ由来。3Dのゴーストと同じ色） */
+    color: number;
+    /** 直近に描いた補間位置。2Dマップ（契約09）が読む */
+    drawX: number;
+    drawZ: number;
+    drawYaw: number;
+    /** このフレームに描かれたか（未受信・スロット無しのピアはマップにも出さない） */
+    drawn: boolean;
 }
 
 export interface Multiplayer {
     /** 毎フレーム呼ぶ（game.update のあと。state を読んで送り、遠隔ぶんを描く） */
     update(dt: number): void;
+    /**
+     * いま描かれている遠隔プレイヤーを1人ずつ渡す（契約09 の2Dマップ用）。
+     * 配列を作らずコールバックで渡す（フレーム内アロケーションを増やさない）
+     */
+    eachPlayer(
+        visit: (x: number, z: number, yaw: number, driving: boolean, color: number) => void,
+    ): void;
     dispose(): void;
 }
 
@@ -180,9 +195,10 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
     showCount();
 
     const add = (id: string): Peer => {
+        const color = peerColor(id);
         const peer: Peer = {
             id,
-            slot: remote.acquire(peerColor(id)),
+            slot: remote.acquire(color),
             offset: 0,
             received: performance.now(),
             head: 0,
@@ -194,6 +210,11 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
             a: new Float32Array(CAPACITY),
             s: new Float32Array(CAPACITY),
             driving: false,
+            color,
+            drawX: 0,
+            drawZ: 0,
+            drawYaw: 0,
+            drawn: false,
         };
         peers.push(peer);
         byId.set(id, peer);
@@ -257,7 +278,10 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
 
     /** renderTime を挟む2段を探して補間し、1フレームぶん描く */
     const draw = (peer: Peer, renderTime: number, dt: number): void => {
-        if (peer.count === 0 || peer.slot < 0) return;
+        if (peer.count === 0 || peer.slot < 0) {
+            peer.drawn = false;
+            return;
+        }
         const newest = peer.head;
         let ai = newest;
         let bi = newest;
@@ -286,6 +310,10 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
         const yaw = peer.a[ai] + angleDelta(peer.a[ai], peer.a[bi]) * k;
         const speed = peer.s[ai] + (peer.s[bi] - peer.s[ai]) * k;
         remote.show(peer.slot, peer.driving, x, y, z, yaw, speed, dt);
+        peer.drawX = x;
+        peer.drawZ = z;
+        peer.drawYaw = yaw;
+        peer.drawn = true;
     };
 
     // --- 接続。届かない環境でも例外を投げっぱなしにしない（E28） ---
@@ -385,6 +413,12 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
                 const peer = peers[i];
                 if (now - peer.received > PEER_TIMEOUT) removeAt(i);
                 else draw(peer, renderTime, dt);
+            }
+        },
+        eachPlayer(visit) {
+            for (const peer of peers) {
+                if (!peer.drawn) continue;
+                visit(peer.drawX, peer.drawZ, peer.drawYaw, peer.driving, peer.color);
             }
         },
         dispose() {

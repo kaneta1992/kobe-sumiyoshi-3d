@@ -86,6 +86,8 @@ export interface Game {
     state: GameState;
     physics: Physics;
     update(dt: number): void;
+    /** マップ表示中はゲーム入力を止める（E49）。物理と描画はそのまま進む */
+    setInputSuspended(suspended: boolean): void;
     dispose(): void;
 }
 
@@ -473,6 +475,9 @@ export function createGame(options: GameOptions): Game {
             state.vehicle.occupied = driving;
 
             input.endFrame();
+        },
+        setInputSuspended(value) {
+            input.setSuspended(value);
         },
         dispose() {
             input.dispose();

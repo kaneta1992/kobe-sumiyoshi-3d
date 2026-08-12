@@ -11,7 +11,9 @@ import { Frustum, Group, Matrix4, Scene, Vector3, type PerspectiveCamera, type W
 import { countDemTiles, loadElevationSampler } from '../data/dem';
 import { countPhotoTiles, loadAerialImage } from '../data/photo';
 import { loadBuildingHeights, loadHeightmap, loadTrees } from '../data/terrain-assets';
+import type { TreeInstance } from '../data/terrain-assets';
 import { countVectorTiles, loadVectorFeatures } from '../data/vector';
+import type { WaterShape } from '../data/vector';
 import type { QualitySettings } from '../quality';
 import { buildRoadProfiles, type RoadPath } from '../shared/road-profile.js';
 import { worldStats } from '../ui/stats';
@@ -45,6 +47,18 @@ export interface World {
         /** 縦断プロファイル付きの道路（描画リボンと同じ高さでコライダーを作る） */
         roads: readonly RoadPath[];
         bridges: readonly BridgeSpan[];
+    };
+    /**
+     * 2Dマップ（契約09 / src/ui/map.ts）への受け渡し口。読み込み済みの配列を
+     * そのまま参照させる（タイルを取り直さない・コピーも作らない）。
+     * 地形の起伏は getElevationAt から直接サンプルする
+     */
+    mapFeatures: {
+        roads: readonly RoadPath[];
+        buildings: readonly BuildingCollision[];
+        water: readonly WaterShape[];
+        /** 前処理アセットが無い環境では空（緑地レイヤーが出ないだけ・E57） */
+        trees: readonly TreeInstance[];
     };
     /** 地表標高[m]。エリア外は端の値にクランプされる */
     getElevationAt(x: number, z: number): number;
@@ -240,6 +254,12 @@ export async function buildWorld(
         vegetation,
         spawn,
         collision: { buildings: buildings.collision, roads: profiled.paths, bridges: bridgeSpans },
+        mapFeatures: {
+            roads: profiled.paths,
+            buildings: buildings.collision,
+            water: features.water,
+            trees: treePoints ?? [],
+        },
         getElevationAt: terrain.getElevationAt,
         update(camera, q, force = false) {
             camera.updateMatrixWorld();
