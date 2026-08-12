@@ -19,9 +19,7 @@ import {
     CapsuleGeometry,
     Color,
     CylinderGeometry,
-    Euler,
     Group,
-    Matrix4,
     Mesh,
     MeshStandardNodeMaterial,
     Object3D,
@@ -30,6 +28,7 @@ import {
     Vector3,
 } from 'three/webgpu';
 import type { QualitySettings } from '../quality';
+import { mergeParts as merge, partMatrix as place } from '../world/geom';
 import { hashIndex01 } from '../world/hash';
 import { CHASSIS_HALF, WHEEL_RADIUS } from './vehicle';
 
@@ -101,79 +100,6 @@ export interface CarAvatar {
 // ---------------------------------------------------------------------------
 // ジオメトリ生成のヘルパー（すべて構築時のみ。フレームループでは呼ばない）
 // ---------------------------------------------------------------------------
-
-interface Part {
-    geometry: BufferGeometry;
-    matrix?: Matrix4;
-    /** 頂点色（省略時は白）。色違いのパーツを1メッシュに束ねて描画コールを減らす */
-    color?: number;
-}
-
-/** 位置・スケール・回転から行列を作る（構築時のみ使う） */
-function place(
-    x: number,
-    y: number,
-    z: number,
-    sx = 1,
-    sy = 1,
-    sz = 1,
-    rx = 0,
-    ry = 0,
-    rz = 0,
-): Matrix4 {
-    const m = new Matrix4();
-    m.makeRotationFromEuler(new Euler(rx, ry, rz));
-    m.scale(new Vector3(sx, sy, sz));
-    m.setPosition(x, y, z);
-    return m;
-}
-
-/**
- * 複数のジオメトリを1つへ束ねる（BufferGeometryUtils は addons なので使えない）。
- * 位置と法線だけを持つ非インデックスのジオメトリにする（テクスチャを使わないので uv は不要）。
- */
-const mergeColor = new Color();
-function merge(parts: readonly Part[]): BufferGeometry {
-    const pieces: BufferGeometry[] = [];
-    let total = 0;
-    let colored = false;
-    for (const part of parts) {
-        const geometry = part.geometry.index ? part.geometry.toNonIndexed() : part.geometry.clone();
-        if (part.matrix) geometry.applyMatrix4(part.matrix);
-        pieces.push(geometry);
-        total += geometry.attributes.position.count;
-        if (part.color !== undefined) colored = true;
-    }
-    const position = new Float32Array(total * 3);
-    const normal = new Float32Array(total * 3);
-    // 頂点色はリニア（three の作業色空間）で書く。Color.setHex が sRGB から変換してくれる
-    const color = colored ? new Float32Array(total * 3) : null;
-    let offset = 0;
-    for (let i = 0; i < pieces.length; i++) {
-        const piece = pieces[i];
-        const pos = piece.attributes.position as BufferAttribute;
-        const nrm = piece.attributes.normal as BufferAttribute;
-        position.set(pos.array as Float32Array, offset);
-        normal.set(nrm.array as Float32Array, offset);
-        if (color) {
-            mergeColor.setHex(parts[i].color ?? 0xffffff);
-            for (let v = 0; v < pos.count; v++) {
-                color[offset + v * 3] = mergeColor.r;
-                color[offset + v * 3 + 1] = mergeColor.g;
-                color[offset + v * 3 + 2] = mergeColor.b;
-            }
-        }
-        offset += pos.count * 3;
-        piece.dispose();
-    }
-    for (const part of parts) part.geometry.dispose();
-    const out = new BufferGeometry();
-    out.setAttribute('position', new BufferAttribute(position, 3));
-    out.setAttribute('normal', new BufferAttribute(normal, 3));
-    if (color) out.setAttribute('color', new BufferAttribute(color, 3));
-    out.computeBoundingSphere();
-    return out;
-}
 
 /**
  * 角丸ボックス。RoundedBoxGeometry は addons にしか無いので、

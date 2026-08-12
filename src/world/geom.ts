@@ -6,7 +6,7 @@
  * three は 4バイト境界に満たない属性をアップロード時にパディングするので
  * itemSize=3 のまま扱ってよい（WebGPU/WebGL2 どちらのバックエンドでも同じ）。
  */
-import { BufferAttribute, BufferGeometry } from 'three/webgpu';
+import { BufferAttribute, BufferGeometry, Color, Euler, Matrix4, Vector3 } from 'three/webgpu';
 
 export interface MeshBuf {
     pos: number[];
@@ -235,5 +235,83 @@ export function icosahedronTrianglesFine(): Float32Array {
         }
     }
     icosaFineCache = out;
+    return out;
+}
+
+// --- three のプリミティブを1メッシュへ束ねる -------------------------------
+// BufferGeometryUtils は addons にしかない（コア二重ロードを起こすので使えない）。
+// アバター（契約06）とマッチの小物（契約10）が同じ実装を共有する。
+
+/** merge に渡す1パーツ。matrix が置き場所、color が頂点色（省略時は白） */
+export interface GeometryPart {
+    geometry: BufferGeometry;
+    matrix?: Matrix4;
+    color?: number;
+}
+
+/** 位置・スケール・回転から行列を作る（構築時のみ使う） */
+export function partMatrix(
+    x: number,
+    y: number,
+    z: number,
+    sx = 1,
+    sy = 1,
+    sz = 1,
+    rx = 0,
+    ry = 0,
+    rz = 0,
+): Matrix4 {
+    const m = new Matrix4();
+    m.makeRotationFromEuler(new Euler(rx, ry, rz));
+    m.scale(new Vector3(sx, sy, sz));
+    m.setPosition(x, y, z);
+    return m;
+}
+
+/**
+ * 複数のジオメトリを1つへ束ねる。位置と法線だけを持つ非インデックスのジオメトリにする
+ * （テクスチャを使わないので uv は不要）。1つでも color を持てば color 属性が付く。
+ * 渡したジオメトリは破棄する（構築時のみ使う前提）。
+ */
+const mergeColor = new Color();
+export function mergeParts(parts: readonly GeometryPart[]): BufferGeometry {
+    const pieces: BufferGeometry[] = [];
+    let total = 0;
+    let colored = false;
+    for (const part of parts) {
+        const geometry = part.geometry.index ? part.geometry.toNonIndexed() : part.geometry.clone();
+        if (part.matrix) geometry.applyMatrix4(part.matrix);
+        pieces.push(geometry);
+        total += geometry.attributes.position.count;
+        if (part.color !== undefined) colored = true;
+    }
+    const position = new Float32Array(total * 3);
+    const normal = new Float32Array(total * 3);
+    // 頂点色はリニア（three の作業色空間）で書く。Color.setHex が sRGB から変換してくれる
+    const color = colored ? new Float32Array(total * 3) : null;
+    let offset = 0;
+    for (let i = 0; i < pieces.length; i++) {
+        const piece = pieces[i];
+        const pos = piece.attributes.position as BufferAttribute;
+        const nrm = piece.attributes.normal as BufferAttribute;
+        position.set(pos.array as Float32Array, offset);
+        normal.set(nrm.array as Float32Array, offset);
+        if (color) {
+            mergeColor.setHex(parts[i].color ?? 0xffffff);
+            for (let v = 0; v < pos.count; v++) {
+                color[offset + v * 3] = mergeColor.r;
+                color[offset + v * 3 + 1] = mergeColor.g;
+                color[offset + v * 3 + 2] = mergeColor.b;
+            }
+        }
+        offset += pos.count * 3;
+        piece.dispose();
+    }
+    for (const part of parts) part.geometry.dispose();
+    const out = new BufferGeometry();
+    out.setAttribute('position', new BufferAttribute(position, 3));
+    out.setAttribute('normal', new BufferAttribute(normal, 3));
+    if (color) out.setAttribute('color', new BufferAttribute(color, 3));
+    out.computeBoundingSphere();
     return out;
 }

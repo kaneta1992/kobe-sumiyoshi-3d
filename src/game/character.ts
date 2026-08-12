@@ -36,6 +36,8 @@ const GROUND_STICK = 2;
  * 60cm の段差を余裕をもって越えられる。二段ジャンプはしない
  */
 const JUMP_SPEED = 4.6;
+/** 体当たりで押し飛ばす時間[s]（契約10）。この間だけ移動へ押し出しを上乗せする */
+const KNOCKBACK_TIME = 0.28;
 
 export interface Character {
     collider: RAPIER.Collider;
@@ -54,6 +56,13 @@ export interface Character {
     interpolate(alpha: number): void;
     teleport(x: number, y: number, z: number, yaw: number): void;
     setActive(active: boolean): void;
+    /** 移動速度の倍率（安置の外での減速に使う・契約10）。1 = 等倍 */
+    setSpeedScale(scale: number): void;
+    /**
+     * 体当たりで押し飛ばされる（契約10）。水平方向 (dirX, dirZ) へ distance[m] ぶんを
+     * KNOCKBACK_TIME 秒かけて押し出す。壁があれば当然そこで止まる（移動は controller 経由）
+     */
+    knockback(dirX: number, dirZ: number, distance: number): void;
     /** 物理上の現在位置（補間なし） */
     readonly current: Vector3;
 }
@@ -92,6 +101,11 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
     let previousFacing = yaw;
     let renderYaw = yaw;
     let active = true;
+    let speedScale = 1;
+    /** 押し出しの速度[m/s] と残り時間[s] */
+    let pushX = 0;
+    let pushZ = 0;
+    let pushLeft = 0;
 
     return {
         collider,
@@ -124,7 +138,7 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
                 }
             }
 
-            const wanted = run ? RUN_SPEED : WALK_SPEED;
+            const wanted = (run ? RUN_SPEED : WALK_SPEED) * speedScale;
             const length = Math.hypot(dirX, dirZ);
             const scale = length > 1 ? 1 / length : 1;
             const factor = 1 - Math.exp(-ACCEL * dt);
@@ -137,6 +151,13 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
             next.x = velocity.x * dt;
             next.y = verticalVelocity * dt;
             next.z = velocity.z * dt;
+            // 体当たりの押し出しは入力とは別に上乗せする（入力で打ち消せない）
+            if (pushLeft > 0) {
+                const span = Math.min(dt, pushLeft);
+                next.x += pushX * span;
+                next.z += pushZ * span;
+                pushLeft -= dt;
+            }
             controller.computeColliderMovement(collider, next);
             const movement = controller.computedMovement();
             grounded = controller.computedGrounded();
@@ -174,6 +195,7 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
             velocity.set(0, 0, 0);
             verticalVelocity = 0;
             jumpLatched = false;
+            pushLeft = 0;
             if (!snapped) {
                 controller.enableSnapToGround(0.5);
                 snapped = true;
@@ -191,7 +213,19 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
                 velocity.set(0, 0, 0);
                 verticalVelocity = 0;
                 speed = 0;
+                pushLeft = 0;
             }
+        },
+        setSpeedScale(scale) {
+            speedScale = Math.max(0.05, Math.min(4, scale));
+        },
+        knockback(dirX, dirZ, distance) {
+            const length = Math.hypot(dirX, dirZ);
+            if (length < 1e-4 || distance <= 0) return;
+            const speedOut = distance / KNOCKBACK_TIME;
+            pushX = (dirX / length) * speedOut;
+            pushZ = (dirZ / length) * speedOut;
+            pushLeft = KNOCKBACK_TIME;
         },
     };
 }

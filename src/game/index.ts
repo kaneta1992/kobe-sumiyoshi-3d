@@ -18,6 +18,7 @@ import { CHARACTER_CENTER_OFFSET, createCharacter } from './character';
 import { createFollowCamera } from './follow-camera';
 import { createInput, LOOK_SPEED } from './input';
 import { createPhysics, type Physics } from './physics';
+import { createSkydive, type SkyState } from './skydive';
 import { CHASSIS_HALF, VEHICLE_GROUND_OFFSET, createVehicle } from './vehicle';
 
 export { initPhysics } from './physics';
@@ -48,6 +49,12 @@ const FLY_ACCEL = 3.6;
 const FLY_CLEARANCE = 1.1;
 /** 飛行中のカメラ距離[m] */
 const FLY_DISTANCE = 7;
+/** 降下中のカメラ距離[m]（契約10。空では引いたほうが地形が読める） */
+const SKY_DISTANCE = 9;
+/** 降下中の注視点の追従の速さ[1/s]。落下が速いので徒歩より強く追わせる */
+const SKY_FOLLOW_RATE = 55;
+/** 降下に入るときの最低の見下ろし角[rad]（着地点を見ながら降りられるように） */
+const SKY_PITCH = -0.5;
 
 const HELP_WALK =
     'WASD: 移動　Shift: 走る　Space: ジャンプ　ドラッグ/マウス: 視点　F: 乗車　R: 位置リセット';
@@ -55,8 +62,11 @@ const HELP_DRIVE = 'W/S: アクセル・後退　A/D: ハンドル　Space: ブ�
 const HELP_FLY = '★スーパーマン　W: 前進　Shift: ブースト　Space/C: 上下　視点で方向転換　G: 解除';
 const HELP_SUPERMAN = '　G: スーパーマン';
 const HELP_NEAR_CAR = '　★ F で乗車';
+const HELP_RIDE = '★輸送機　Space: 飛び降りる　ドラッグ/マウス: 視点';
+const HELP_FALL = '★降下中　WASD: 移動　高度 110m で自動的に傘が開く';
 
-export type PlayerMode = 'walk' | 'drive';
+/** 'sky' は輸送機からの降下中（契約10）。同期上は徒歩と同じ扱い */
+export type PlayerMode = 'walk' | 'drive' | 'sky';
 
 /** 外（マルチプレイ同期・UI）から読むための状態。毎フレーム同じオブジェクトを書き換える */
 export interface GameState {
@@ -82,12 +92,40 @@ export interface GameState {
     };
 }
 
+/**
+ * 輸送機からの降下（契約10）。経路はマッチ側がシードから決めて毎フレーム座席の姿勢を渡し、
+ * 落下・傘・着地の物理はこちらが持つ
+ */
+export interface GameSky {
+    readonly state: SkyState;
+    /** 座席の姿勢を与える（off から呼ぶと搭乗開始） */
+    ride(x: number, y: number, z: number, yaw: number): void;
+    /** 飛び降りる（搭乗中に Space を押しても同じことが起きる） */
+    leave(): void;
+    /** 途中で打ち切って地上へ戻す（リマッチ・E67） */
+    cancel(): void;
+}
+
 export interface Game {
     state: GameState;
     physics: Physics;
+    sky: GameSky;
     update(dt: number): void;
-    /** マップ表示中はゲーム入力を止める（E49）。物理と描画はそのまま進む */
-    setInputSuspended(suspended: boolean): void;
+    /**
+     * ゲーム入力を止める（E49）。物理と描画はそのまま進む。
+     * 止める理由ごとに数えるので、マップとマッチのパネルが同時に開いても取り合わない
+     */
+    setInputSuspended(suspended: boolean, reason?: string): void;
+    /** 徒歩の移動速度倍率（安置の外での減速・契約10） */
+    setSpeedScale(scale: number): void;
+    /** 体当たりで押し飛ばされる（契約10） */
+    knockback(dirX: number, dirZ: number, distance: number): void;
+    /**
+     * デバッグ用の瞬間移動（契約10 追記の ?matchgoto）。指定座標の地表へ立たせ、
+     * 以後は R の位置リセットもここへ戻す（＝目標の手前へ何度でも戻れる）。
+     * ?matchgoto を付けたときにしか呼ばれない — 通常フローの挙動は変わらない
+     */
+    warpTo(x: number, z: number, yaw: number): void;
     dispose(): void;
 }
 
@@ -143,6 +181,7 @@ export function createGame(options: GameOptions): Game {
     const input = createInput(element);
     const follow = createFollowCamera(camera, physics);
     follow.yaw = spawnYaw;
+    const skydive = createSkydive();
 
     const feet = new Vector3();
     const spot = new Vector3();
@@ -172,11 +211,18 @@ export function createGame(options: GameOptions): Game {
     let sinceLook = 10;
     let helpText = '';
     let interactEnabled = false;
+    /** 入力を止めている理由（マップ / マッチのパネル）。1つでもあれば止める */
+    const suspendReasons = new Set<string>();
     /** 踏み切りまでの残り時間[s]（負 = 待機なし） */
     let jumpPending = -1;
     const superman = new URLSearchParams(location.search).has('superman');
     let flying = false;
     let flyYaw = spawnYaw;
+    /** デバッグの行き先（?matchgoto）。一度飛ぶと R の戻り先になる */
+    let warped = false;
+    let warpX = 0;
+    let warpZ = 0;
+    let warpYaw = 0;
 
     const showHelp = (text: string): void => {
         if (text === helpText) return;
@@ -273,7 +319,60 @@ export function createGame(options: GameOptions): Game {
         player.setFlying(false, 0);
     };
 
+    /**
+     * 降下の開始／終了（契約10）。開始時は物理キャラを止め、着地したらその場へ戻す。
+     * 着地の高さは足場（道路・建物の上面も拾う）から取るので屋根の上にも降りられる（E66）
+     */
+    const startSky = (): void => {
+        if (mode === 'sky') return;
+        if (flying) stopFlying(world.getElevationAt(flyPos.x, flyPos.z));
+        if (mode === 'drive') exitVehicle();
+        mode = 'sky';
+        character.setActive(false);
+        jumpPending = -1;
+        input.setMode('walk');
+        follow.pitch = Math.min(follow.pitch, SKY_PITCH);
+        follow.snap();
+    };
+
+    const endSky = (): void => {
+        if (mode !== 'sky') return;
+        const { x, z } = skydive.position;
+        character.teleport(
+            x,
+            physics.surfaceHeight(x, z) + CHARACTER_CENTER_OFFSET + 0.05,
+            z,
+            skydive.yaw,
+        );
+        character.setActive(true);
+        skydive.stop();
+        mode = 'walk';
+        player.setFlying(false, 0);
+        follow.snap();
+    };
+
+    /** 指定座標の地表へ立たせる（デバッグ移動の共通処理）。乗車・飛行・降下中でも徒歩へ戻す */
+    const placeAt = (x: number, z: number, yaw: number): void => {
+        if (mode === 'sky') endSky();
+        if (flying) stopFlying(world.getElevationAt(flyPos.x, flyPos.z));
+        if (mode === 'drive') exitVehicle();
+        character.teleport(
+            x,
+            physics.surfaceHeight(x, z) + CHARACTER_CENTER_OFFSET + 0.05,
+            z,
+            yaw,
+        );
+        follow.yaw = yaw;
+        follow.snap();
+    };
+
     const respawn = (): void => {
+        // デバッグの行き先があるあいだは R もそこへ戻す（?matchgoto の「R で再実行」）
+        if (warped) {
+            placeAt(warpX, warpZ, warpYaw);
+            return;
+        }
+        if (mode === 'sky') endSky();
         if (flying) stopFlying(world.getElevationAt(flyPos.x, flyPos.z));
         if (mode === 'drive') {
             // 乗車中は姿勢を立て直すだけ（エリア外へ落ちていたら道路へ戻す）
@@ -301,6 +400,24 @@ export function createGame(options: GameOptions): Game {
     return {
         state,
         physics,
+        sky: {
+            get state() {
+                return skydive.state;
+            },
+            ride(x, y, z, seatYaw) {
+                // 搭乗した瞬間だけカメラを機首方向へ向ける（そうしないと胴体の中に入る）
+                const boarding = mode !== 'sky';
+                startSky();
+                if (boarding) follow.yaw = seatYaw;
+                skydive.ride(x, y, z, seatYaw);
+            },
+            leave() {
+                skydive.leave();
+            },
+            cancel() {
+                endSky();
+            },
+        },
         update(dt) {
             input.beginFrame();
             const keys = input.state;
@@ -317,15 +434,20 @@ export function createGame(options: GameOptions): Game {
                 else startFlying();
             }
 
+            const sky = mode === 'sky';
+            // 搭乗中は Space が「飛び降りる」になる（ジャンプの踏み切りは走らせない）
+            if (sky && keys.jump && skydive.state === 'ride') skydive.leave();
+
             const near =
                 !flying &&
+                !sky &&
                 mode === 'walk' &&
                 Math.hypot(
                     vehicle.position.x - character.current.x,
                     vehicle.position.z - character.current.z,
                 ) < ENTER_RADIUS &&
                 Math.abs(vehicle.position.y - character.current.y) < 3;
-            if (keys.interact) {
+            if (keys.interact && !sky) {
                 if (mode === 'drive') exitVehicle();
                 else if (near) enterVehicle();
             }
@@ -345,7 +467,7 @@ export function createGame(options: GameOptions): Game {
             const driving = mode === 'drive';
 
             // --- ジャンプ: 入力で沈み込み、少し溜めてから踏み切る（アンティシペーション） ---
-            if (keys.jump && !driving && !flying && character.grounded && jumpPending < 0) {
+            if (keys.jump && !driving && !flying && !sky && character.grounded && jumpPending < 0) {
                 jumpPending = JUMP_ANTICIPATION;
                 player.anticipateJump();
             }
@@ -405,8 +527,18 @@ export function createGame(options: GameOptions): Game {
                 }
             }
 
+            // --- 降下（契約10。搭乗中は ride() で与えられた座席姿勢に張り付く） ---
+            if (sky && skydive.state !== 'ride') {
+                const surface = physics.surfaceHeight(skydive.position.x, skydive.position.z);
+                if (skydive.update(dt, moveDir.x, moveDir.z, surface)) endSky();
+            }
+
             // --- 描画の更新 ---
-            if (flying) {
+            if (mode === 'sky') {
+                player.setFlying(skydive.state !== 'ride', skydive.pitch);
+                feet.copy(skydive.position);
+                player.update(feet, skydive.yaw, 0, dt, true);
+            } else if (flying) {
                 flySpeed = Math.hypot(flyVel.x, flyVel.z);
                 const target = flySpeed > 0.8 ? Math.atan2(-flyVel.x, -flyVel.z) : follow.yaw;
                 const diff = Math.atan2(Math.sin(target - flyYaw), Math.cos(target - flyYaw));
@@ -431,7 +563,10 @@ export function createGame(options: GameOptions): Game {
             car.update(vehicle.speed, steering, vehicleInput.brake && driving, dt);
 
             // --- カメラ ---
-            if (flying) {
+            if (mode === 'sky') {
+                // 60m/s で落ちるので、既定の追従では対象が画面外へ流れる
+                follow.update(dt, feet, WALK_FOCUS, SKY_DISTANCE, SKY_FOLLOW_RATE);
+            } else if (flying) {
                 follow.update(dt, feet, WALK_FOCUS, FLY_DISTANCE);
             } else if (driving) {
                 // 走っている間、視点操作が無ければ進行方向へ向き直す
@@ -443,30 +578,34 @@ export function createGame(options: GameOptions): Game {
                 follow.update(dt, feet, WALK_FOCUS, WALK_DISTANCE);
             }
 
-            // --- 落下・エリア外からの復帰（E19） ---
-            if (!flying) {
+            // --- 落下・エリア外からの復帰（E19。降下中は空にいるのが正常なので見ない） ---
+            if (!flying && mode !== 'sky') {
                 const active = driving ? vehicle.position : character.position;
                 if (active.y < world.getElevationAt(active.x, active.z) - FALL_LIMIT) respawn();
             }
 
             showHelp(
-                flying
-                    ? HELP_FLY
-                    : driving
-                      ? HELP_DRIVE
-                      : (near ? HELP_WALK + HELP_NEAR_CAR : HELP_WALK) +
-                        (superman ? HELP_SUPERMAN : ''),
+                mode === 'sky'
+                    ? skydive.state === 'ride'
+                        ? HELP_RIDE
+                        : HELP_FALL
+                    : flying
+                      ? HELP_FLY
+                      : driving
+                        ? HELP_DRIVE
+                        : (near ? HELP_WALK + HELP_NEAR_CAR : HELP_WALK) +
+                          (superman ? HELP_SUPERMAN : ''),
             );
 
-            // --- 外部から読む状態（飛行中も座標だけで表現する。同期項目は増やさない） ---
+            // --- 外部から読む状態（飛行・降下中も座標だけで表現する。同期項目は増やさない） ---
             state.mode = mode;
             state.x = feet.x;
             state.y = feet.y;
             state.z = feet.z;
-            state.yaw = flying ? flyYaw : character.yaw;
-            state.speed = flying ? Math.min(flySpeed, 6) : character.speed;
+            state.yaw = mode === 'sky' ? skydive.yaw : flying ? flyYaw : character.yaw;
+            state.speed = mode === 'sky' ? 0 : flying ? Math.min(flySpeed, 6) : character.speed;
             state.running = keys.run;
-            state.grounded = !flying && character.grounded;
+            state.grounded = !flying && mode !== 'sky' && character.grounded;
             state.vehicle.x = vehicle.position.x;
             state.vehicle.y = vehicle.position.y;
             state.vehicle.z = vehicle.position.z;
@@ -476,8 +615,23 @@ export function createGame(options: GameOptions): Game {
 
             input.endFrame();
         },
-        setInputSuspended(value) {
-            input.setSuspended(value);
+        setInputSuspended(value, reason = 'map') {
+            if (value) suspendReasons.add(reason);
+            else suspendReasons.delete(reason);
+            input.setSuspended(suspendReasons.size > 0);
+        },
+        setSpeedScale(scale) {
+            character.setSpeedScale(scale);
+        },
+        knockback(dirX, dirZ, distance) {
+            if (mode === 'walk') character.knockback(dirX, dirZ, distance);
+        },
+        warpTo(x, z, yaw) {
+            warped = true;
+            warpX = x;
+            warpZ = z;
+            warpYaw = yaw;
+            placeAt(x, z, yaw);
         },
         dispose() {
             input.dispose();

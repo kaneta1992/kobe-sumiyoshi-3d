@@ -77,6 +77,39 @@ type Snapshot = {
     s: number;
 };
 
+/**
+ * マッチ同期（契約10）。state とは**別のチャンネル**なので、このチャンネルを知らない
+ * クライアントとも従来どおりアバターは見え続ける（後方互換）。
+ * 配置は全員がシードから再現するので、ここを流れるのは開始の合図と裁定だけ。
+ *
+ *   start  マッチ開始（seed / 開始時刻 / 送信時刻）
+ *   claim  取得の申告（非ホスト → ホスト）
+ *   award  ホストの裁定（これが正。二重回収を防ぐ・E64）
+ *   open   宝箱のチャンネリング開始（実況用）
+ *   bump   体当たり（相手のチャンネリングを中断させる）
+ *   vote   リマッチ投票
+ */
+export type MatchPacket = {
+    k: 'start' | 'claim' | 'award' | 'open' | 'bump' | 'vote';
+    /** マッチ通番。前のマッチのパケットを取り違えないための世代（E67） */
+    n: number;
+    /** start: マッチシード */
+    seed?: number;
+    /** start: 送信側の performance.now() 基準の開始時刻[ms] */
+    at?: number;
+    /** start: 送信時刻[ms]。受信側でローカル時計へのオフセットを作る（E63） */
+    now?: number;
+    /** claim / award: 対象 */
+    w?: 'key' | 'chest';
+    /** award: 取得者のピアID */
+    who?: string;
+    /** bump: 押し飛ばす相手のピアID */
+    to?: string;
+    /** bump: 押し出す水平方向 */
+    dx?: number;
+    dz?: number;
+};
+
 /** ピアごとの受信バッファ。配列は参加時に確保し、以後は書き換えるだけ */
 interface Peer {
     id: string;
@@ -117,6 +150,18 @@ export interface Multiplayer {
     eachPlayer(
         visit: (x: number, z: number, yaw: number, driving: boolean, color: number) => void,
     ): void;
+    /** 描かれている遠隔プレイヤーを ID つきで巡回する（体当たりの相手探し・契約10） */
+    eachPeerPosition(visit: (id: string, x: number, z: number) => void): void;
+    /** 自分のピアID（ホスト選出に使う・契約10） */
+    readonly selfId: string;
+    /** 自分を含む全ピアIDの昇順リスト。毎回同じ配列を詰め直して返す */
+    peerIds(): readonly string[];
+    /** ピアIDに対応する色（3Dゴースト・マップのマーカーと同じ） */
+    colorOf(id: string): number;
+    /** マッチチャンネルへ送る（契約10） */
+    sendMatch(packet: MatchPacket): void;
+    /** マッチチャンネルの受信ハンドラ（1つだけ。後から差し替えられる） */
+    onMatch(handler: ((packet: MatchPacket, peerId: string) => void) | null): void;
     dispose(): void;
 }
 
@@ -177,6 +222,8 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
 
     const peers: Peer[] = [];
     const byId = new Map<string, Peer>();
+    /** peerIds() が返す使い回しの配列（呼ぶたびに新しい配列を作らない） */
+    const idList: string[] = [];
 
     let hud = '';
     let relayLive = true;
@@ -326,6 +373,10 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
         showCount();
     };
 
+    // マッチ同期（契約10）は state と別チャンネルで、送れなくても本体は動き続ける
+    let sendMatchPacket: ((packet: MatchPacket) => Promise<void>) | null = null;
+    let matchHandler: ((packet: MatchPacket, peerId: string) => void) | null = null;
+
     try {
         session = joinRoom({ appId: APP_ID }, room, {
             onJoinError: (details) => offline(details.error),
@@ -333,6 +384,14 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
         const action = session.makeAction<Snapshot>('state');
         action.onMessage = (packet, context) => receive(packet, context.peerId);
         send = (packet) => action.send(packet);
+        const matchAction = session.makeAction<MatchPacket>('match');
+        matchAction.onMessage = (packet, context) => {
+            // 中身の検証は受け手（マッチ側）が行う。ここは形だけ見る（E27）
+            if (packet && typeof packet === 'object' && typeof packet.k === 'string') {
+                matchHandler?.(packet, context.peerId);
+            }
+        };
+        sendMatchPacket = (packet) => matchAction.send(packet);
         session.onPeerJoin = (id) => {
             if (!byId.has(id)) add(id);
         };
@@ -421,7 +480,31 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
                 visit(peer.drawX, peer.drawZ, peer.drawYaw, peer.driving, peer.color);
             }
         },
+        eachPeerPosition(visit) {
+            for (const peer of peers) {
+                if (!peer.drawn) continue;
+                visit(peer.id, peer.drawX, peer.drawZ);
+            }
+        },
+        selfId,
+        peerIds() {
+            idList.length = 0;
+            idList.push(selfId);
+            for (const peer of peers) idList.push(peer.id);
+            idList.sort();
+            return idList;
+        },
+        colorOf(id) {
+            return byId.get(id)?.color ?? peerColor(id);
+        },
+        sendMatch(packet) {
+            void sendMatchPacket?.(packet).catch(() => undefined);
+        },
+        onMatch(handler) {
+            matchHandler = handler;
+        },
         dispose() {
+            matchHandler = null;
             clearInterval(keepalive);
             if (relayTimer) clearInterval(relayTimer);
             void session?.leave();

@@ -25,7 +25,12 @@ export interface FollowCamera {
     alignTo(targetYaw: number, rate: number, dt: number): void;
     /** 追従先が飛んだとき（リスポーン・乗降）に補間を切る */
     snap(): void;
-    update(dt: number, target: Vector3, height: number, distance: number): void;
+    /**
+     * rate は注視点の追従の速さ[1/s]。既定（16）は徒歩・運転向けで、
+     * 定常のずれは 速度/rate になる。降下のように速い落下ではここを上げないと
+     * 対象が画面外へ流れる（契約10）
+     */
+    update(dt: number, target: Vector3, height: number, distance: number, rate?: number): void;
     /** 水平の前方向 */
     forward(out: Vector3): Vector3;
     /** 水平の右方向 */
@@ -64,11 +69,11 @@ export function createFollowCamera(camera: PerspectiveCamera, physics: Physics):
         right(out) {
             return out.set(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
         },
-        update(dt, target, height, wanted) {
+        update(dt, target, height, wanted, rate = 16) {
             focus.copy(target);
             focus.y += height;
             if (!smoothed) smoothed = focus.clone();
-            else smoothed.lerp(focus, 1 - Math.exp(-16 * dt));
+            else smoothed.lerp(focus, 1 - Math.exp(-rate * dt));
 
             const cp = Math.cos(this.pitch);
             dir.set(-Math.sin(this.yaw) * cp, Math.sin(this.pitch), -Math.cos(this.yaw) * cp);

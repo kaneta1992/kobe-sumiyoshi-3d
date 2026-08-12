@@ -15,6 +15,9 @@
  *   ?spawn=x,z          指定座標にいちばん近い道路上から開始（橋などの目視検証用）
  *   ?room=名前          マルチプレイのルーム（既定 kobe-sumiyoshi-3d-v1）
  *   ?solo               マルチプレイを使わない
+ *   ?match              マッチモード（降下→安置収縮→鍵→宝箱→勝利→リマッチ・契約10）
+ *   ?matchspeed=6       マッチ時計を早送り（デバッグ）／?matchseed= シード固定／?matchauto 自動開始
+ *   ?matchgoto=key|chest  いまの目標の3m手前へテレポート（デバッグ。R で再実行）
  *
  * 性能規律（契約03 追記2）:
  *   - フレームループ内で new を作らない
@@ -24,6 +27,7 @@
 import { ACESFilmicToneMapping, PCFSoftShadowMap, PerspectiveCamera, Scene, Vector3, WebGPURenderer } from 'three/webgpu';
 import { createFlyCamera, shotHour, shotIndex, shotView, type ShotView } from './camera';
 import type { Game } from './game';
+import type { Match } from './match';
 import type { Multiplayer } from './net/multiplayer';
 import { createQuality, initialQuality, maxTier, sunHour, tierIsPinned, type QualitySettings } from './quality';
 import { createPostProcessing, type PostChain } from './render/post';
@@ -92,19 +96,23 @@ async function start(): Promise<void> {
     let game: Game | null = null;
     let multiplayer: Multiplayer | null = null;
     let map: MapOverlay | null = null;
+    let match: Match | null = null;
 
     /**
      * P2Pマルチプレイ（契約05）。読み込みを待たせないよう遅延インポートし、
-     * 接続できなくても単独プレイとして動き続ける（E28）。?fly では使わない
+     * 接続できなくても単独プレイとして動き続ける（E28）。?fly では使わない。
+     * マッチ（契約10）はホスト選出にピアIDが要るので、生成を待てるよう Promise を返す
      */
-    const startMultiplayer = (active: Game): void => {
-        if (params.has('solo')) return;
-        void import('./net/multiplayer')
+    const startMultiplayer = (active: Game): Promise<Multiplayer | null> => {
+        if (params.has('solo')) return Promise.resolve(null);
+        return import('./net/multiplayer')
             .then(({ createMultiplayer }) => {
                 multiplayer = createMultiplayer({ scene, quality, state: active.state });
+                return multiplayer;
             })
             .catch((err: unknown) => {
                 console.warn('[net] マルチプレイを開始できませんでした', err);
+                return null;
             });
     };
 
@@ -158,11 +166,18 @@ async function start(): Promise<void> {
                     quality,
                 });
                 game.update(0); // カメラをプレイヤーの後方へ置いてから可視判定する
-                startMultiplayer(game);
+                const active = game;
+                // マッチはホスト選出にピアIDが要るので、接続の確定を待ってから作る
+                const net = await startMultiplayer(active);
+                if (params.has('match')) {
+                    setLoadingProgress(1, 1, 'マッチを準備中');
+                    const { createMatch } = await import('./match');
+                    match = createMatch({ scene, world: ready, quality, game: active, net });
+                }
                 // ミニマップ + 全体マップ（契約09）。ベース地図の生成が入るので
                 // ローディング表示が出ているうちに作る
                 setLoadingProgress(1, 1, 'マップを描画中');
-                const active = game;
+                const overlay = match;
                 map = createMapOverlay({
                     world: ready,
                     quality,
@@ -170,7 +185,9 @@ async function start(): Promise<void> {
                     // ?solo や未接続なら誰も渡らない（E52）
                     eachRemote: (visit) => multiplayer?.eachPlayer(visit),
                     // マップ表示中はゲーム入力を止める（E49）
-                    onToggle: (open) => active.setInputSuspended(open),
+                    onToggle: (open) => active.setInputSuspended(open, 'map'),
+                    // 安置円・目標マーカー（契約10）。?match でなければ描かない
+                    drawMatch: overlay ? (draw) => overlay.drawMap(draw) : null,
                 });
             } catch (err) {
                 // 物理を用意できなくても真っ白にはしない（E25）
@@ -233,6 +250,8 @@ async function start(): Promise<void> {
         const dt = Math.min(0.1, (now - last) / 1000);
         last = now;
         renderer.info.reset();
+        // マッチは輸送機の座席姿勢を先に渡すので game より前（契約10）
+        match?.update(dt);
         if (game) game.update(dt);
         else controls?.update(dt);
         // 定点カメラは操作系のあとに上書きする（物理・アバターはそのまま動く）

@@ -13,11 +13,29 @@
  * 座標系: ワールドは東 = +x / 北 = -z（docs/data-spec.md §1）なので、
  * 北を上にした地図はワールド x → 画面右、ワールド z → 画面下でそのまま一致する（回転不要）。
  */
-import { AREA_HALF, ORIGIN_LAT, ORIGIN_LON } from '../config';
-import { latToZ, lonToX } from '../geo';
+import { AREA_HALF } from '../config';
 import type { GameState } from '../game';
 import type { QualitySettings } from '../quality';
 import type { World } from '../world';
+import { LANDMARKS } from '../world/landmarks';
+
+/**
+ * オーバーレイ層（レイヤー2）へ描き足す側に渡す道具（契約10 の安置円・目標マーカー）。
+ * 毎更新で同じオブジェクトを詰め直して渡す（更新経路でアロケーションを増やさない）
+ */
+export interface MapDraw {
+    ctx: CanvasRenderingContext2D;
+    /** ワールド x → 画面の CSS px */
+    screenX(x: number): number;
+    /** ワールド z → 画面の CSS px */
+    screenY(z: number): number;
+    /** 1メートルあたりの CSS px */
+    ppm: number;
+    /** マーカーの拡大率（ミニマップ 0.85 / 全体マップ 1） */
+    scale: number;
+    /** 全体マップか（ラベルを出してよいか） */
+    full: boolean;
+}
 
 export interface MapOverlayOptions {
     world: World;
@@ -30,6 +48,8 @@ export interface MapOverlayOptions {
     ): void;
     /** 全体マップの開閉通知。ゲーム入力の遮断に使う（E49） */
     onToggle(open: boolean): void;
+    /** マッチの安置円・目標マーカー（契約10）。?match でないときは null */
+    drawMatch?: ((draw: MapDraw) => void) | null;
 }
 
 export interface MapOverlay {
@@ -79,16 +99,6 @@ const C = {
     label: '#4a4133',
     labelHalo: 'rgba(255, 255, 255, 0.92)',
 };
-
-/**
- * ランドマーク。座標は docs/data-spec.md に載っているものだけを使う（創作しない）。
- * 渦森台・展望台公園・千丈谷は方角の記述しか無いので、座標が確定するまで出さない。
- */
-const LANDMARKS = [
-    { name: '渦が森小学校', lon: 135.2503338, lat: 34.7389573 },
-    { name: '渦森橋', lon: 135.25301, lat: 34.739446 },
-    { name: '住吉山手9丁目', lon: ORIGIN_LON, lat: ORIGIN_LAT },
-].map((l) => ({ name: l.name, x: lonToX(l.lon), z: latToZ(l.lat) }));
 
 /** 表示キャンバスの見え方（ワールド中心・縮尺・CSS px サイズ） */
 interface MapView {
@@ -259,7 +269,7 @@ function buildBaseMap(world: World, size: number): HTMLCanvasElement {
 // --- 表示 -----------------------------------------------------------------
 
 export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
-    const { world, quality, state, eachRemote, onToggle } = options;
+    const { world, quality, state, eachRemote, onToggle, drawMatch = null } = options;
     const base = buildBaseMap(world, quality.preset === 'mobile' ? BASE_PX_MOBILE : BASE_PX_DESKTOP);
     const basePerMeter = base.width / (AREA_HALF * 2);
 
@@ -366,11 +376,11 @@ export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
     };
 
     /**
-     * レイヤー2: オーバーレイ。いまはエリア境界だけ。
-     * 安置円（docs/game-design.md）はここに「円を1つ描く」だけで載る:
-     *   ctx.arc(screenX(cx), screenY(cz), radius * view.ppm, 0, TAU)
+     * レイヤー2: オーバーレイ。エリア境界と、マッチの安置円・目標マーカー（契約10）。
+     * マッチ側は drawMatch で MapDraw を受け取り、ここへ好きに描き足す
      */
-    const drawOverlays = (ctx: CanvasRenderingContext2D): void => {
+    let matchDraw: MapDraw | null = null;
+    const drawOverlays = (ctx: CanvasRenderingContext2D, scale: number, full: boolean): void => {
         ctx.save();
         ctx.strokeStyle = C.border;
         ctx.lineWidth = 1.5;
@@ -381,6 +391,15 @@ export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
             AREA_HALF * 2 * view.ppm,
             AREA_HALF * 2 * view.ppm,
         );
+        ctx.restore();
+        if (!drawMatch) return;
+        if (!matchDraw) matchDraw = { ctx, screenX, screenY, ppm: view.ppm, scale, full };
+        matchDraw.ctx = ctx;
+        matchDraw.ppm = view.ppm;
+        matchDraw.scale = scale;
+        matchDraw.full = full;
+        ctx.save();
+        drawMatch(matchDraw);
         ctx.restore();
     };
 
@@ -522,7 +541,7 @@ export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
         miniCtx.arc(miniSize / 2, miniSize / 2, miniSize / 2, 0, TAU);
         miniCtx.clip();
         drawBase(miniCtx);
-        drawOverlays(miniCtx);
+        drawOverlays(miniCtx, 0.85, false);
         drawMarkers(miniCtx, false, 0.85);
         miniCtx.restore();
 
@@ -543,7 +562,7 @@ export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
         view.h = fullH;
         clampView();
         drawBase(fullCtx);
-        drawOverlays(fullCtx);
+        drawOverlays(fullCtx, 1, true);
         drawMarkers(fullCtx, true, 1);
     };
 
