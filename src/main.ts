@@ -56,12 +56,12 @@ async function start(): Promise<void> {
             new Vector3(0, groundY + 60, -260),
         );
         hideLoading();
+        const s = world.stats;
         setStatus(
-            `${backend}　建物 ${world.stats.buildings}　道路 ${world.stats.roads}　` +
-                `標高 ${world.stats.minElevation.toFixed(0)}〜${world.stats.maxElevation.toFixed(0)}m` +
-                (world.stats.vectorTilesFailed > 0
-                    ? `　欠損タイル ${world.stats.vectorTilesFailed}`
-                    : ''),
+            `${backend}　建物 ${s.buildings}（実測高さ ${s.buildingsMeasured}）　道路 ${s.roads}　` +
+                `樹木 ${s.trees}　標高 ${s.minElevation.toFixed(0)}〜${s.maxElevation.toFixed(0)}m` +
+                `　地形 ${s.hiresTerrain ? '50cm' : 'DEM5A'}` +
+                (s.vectorTilesFailed > 0 ? `　欠損タイル ${s.vectorTilesFailed}` : ''),
         );
     });
 

@@ -2,23 +2,22 @@
  * 最適化ベクトルタイル（optimal_bvmap-v1 z16）のデコード。
  * BldA（建物ポリゴン）と RdCL（道路中心線）をローカル座標のジオメトリに変換する。
  * pbf v5 は PbfReader を named export する（data-spec.md §4 の実測注意書き）。
+ *
+ * BldA のデコードは前処理スクリプトと共有する（src/shared/bvmap-buildings.js）。
  */
-import { VectorTile, classifyRings } from '@mapbox/vector-tile';
+import { VectorTile } from '@mapbox/vector-tile';
 import { PbfReader } from 'pbf';
 import { AREA_HALF, CULL_MARGIN, VECTOR_URL, VECTOR_Z, tileUrl } from '../config';
-import { latToZ, lonToX, tileCoords, tileRange, tileXToLon, tileYToLat } from '../geo';
+import { tileCoords, tileRange, tileXToLon, tileYToLat } from '../geo';
+import { latToZ, lonToX } from '../geo';
+import { readBuildingShapes } from '../shared/bvmap-buildings.js';
+import type { SharedBuildingShape, SharedPoint2 } from '../shared/bvmap-buildings.js';
 import { fetchTileBuffer, mapPool } from '../net/tiles';
 
-export interface Point2 {
-    x: number;
-    z: number;
-}
+export type Point2 = SharedPoint2;
 
 /** 建物: rings[0] が外周、rings[1..] が穴 */
-export interface BuildingShape {
-    rings: Point2[][];
-    code: number;
-}
+export type BuildingShape = SharedBuildingShape;
 
 export interface RoadLine {
     points: Point2[];
@@ -104,23 +103,8 @@ function readTile(
         return { x: lonToX(lon), z: latToZ(lat) };
     };
 
-    const bld = tile.layers['BldA'];
-    if (bld) {
-        for (let i = 0; i < bld.length; i++) {
-            const f = bld.feature(i);
-            const code = Number(f.properties['vt_code'] ?? 0);
-            const extent = f.extent;
-            // 穴つきポリゴンに分解する（E7）
-            for (const polygon of classifyRings(f.loadGeometry())) {
-                const rings = polygon
-                    .map((ring) => ring.map((p) => toWorld(p.x, p.y, extent)))
-                    .filter((ring) => ring.length >= 4);
-                if (rings.length === 0) continue;
-                if (!rings[0].some(inArea)) continue;
-                buildings.push({ rings, code });
-            }
-        }
-    }
+    // 穴つきポリゴンへの分解（E7）とエリア外カリングは共有モジュール側で行う
+    for (const shape of readBuildingShapes(buf, tx, ty)) buildings.push(shape);
 
     const rd = tile.layers['RdCL'];
     if (rd) {

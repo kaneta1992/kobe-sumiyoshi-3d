@@ -1,6 +1,10 @@
 /**
  * 建物メッシュ。bvmap の BldA ポリゴンを押し出して1枚のジオメトリにまとめる。
- * 高さ・色の揺らぎは座標由来の決定的ハッシュで決める（実行時乱数の使用は禁止:
+ *
+ * 高さは 兵庫県 50cmメッシュ DSM/DEM から前処理で測った実高さを使う。フットプリントの
+ * 決定的ハッシュ（src/shared/geo.js の footprintKey）で引き、引けなかった建物だけ
+ * 従来の階数ヒューリスティックに落とす（契約02 E12）。
+ * 色の揺らぎは座標由来の決定的ハッシュで決める（実行時乱数の使用は禁止:
  * 全クライアントが同じ町を見る必要があるため — data-spec.md §4）。
  */
 import {
@@ -12,6 +16,8 @@ import {
     ShapeUtils,
 } from 'three/webgpu';
 import { BLD_FIREPROOF, BLD_NO_WALL, BLD_ORDINARY } from '../config';
+import { footprintKey } from '../geo';
+import type { BuildingHeightMap } from '../data/terrain-assets';
 import type { BuildingShape, Point2 } from '../data/vector';
 
 /** 傾斜地で屋根を持ち上げる補正量の上限[m] */
@@ -79,13 +85,23 @@ function buildingColors(code: number, r0: number, r1: number): { wall: Color; ro
     return { wall, roof };
 }
 
+export interface BuildingsResult {
+    mesh: Mesh;
+    /** 実測高さを適用できた建物数 */
+    measured: number;
+    total: number;
+}
+
 export function createBuildings(
     shapes: readonly BuildingShape[],
     getElevationAt: (x: number, z: number) => number,
-): Mesh {
+    measuredHeights: BuildingHeightMap | null,
+): BuildingsResult {
     const positions: number[] = [];
     const normals: number[] = [];
     const colors: number[] = [];
+    let measured = 0;
+    let total = 0;
 
     const pushVertex = (
         x: number,
@@ -129,9 +145,23 @@ export function createBuildings(
             }
         }
         if (!Number.isFinite(gmin) || !Number.isFinite(gmax)) continue;
+        total++;
+
+        // 実測値があれば「測ったときの地面 + 高さ」が屋根の絶対標高そのもの。
+        // 無ければ従来どおり、足元の最低標高から傾斜ぶんを持ち上げて推定する
+        const entry = measuredHeights?.get(footprintKey(outer, shape.code));
+        let top: number;
+        if (entry) {
+            top = entry[1] + entry[0];
+            measured++;
+        } else {
+            const slope = Math.min(gmax - gmin, MAX_SLOPE_LIFT);
+            top = gmin + slope + buildingHeight(shape.code, area, r0);
+        }
+        // 屋根が地面に潜ってしまう（測定値と地形がずれる）ときの保険
+        if (top < gmin + 2.5) top = gmin + 2.5;
+        // 足元は接地面の最低標高より1m下げて浮きを消す（E5-a / E6）
         const base = gmin - 1;
-        const slope = Math.min(gmax - gmin, MAX_SLOPE_LIFT);
-        const top = gmin + slope + buildingHeight(shape.code, area, r0);
 
         const { wall, roof } = buildingColors(shape.code, r0, r1);
 
@@ -204,5 +234,5 @@ export function createBuildings(
     mesh.name = 'buildings';
     mesh.castShadow = true;
     mesh.receiveShadow = true;
-    return mesh;
+    return { mesh, measured, total };
 }

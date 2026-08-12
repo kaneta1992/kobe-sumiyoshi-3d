@@ -49,10 +49,13 @@
                 bottom: 10px;
                 left: 10px;
             }
-            /* 地理院タイルの出典表記は利用条件（常時表示・非表示にしないこと） */
+            /* 出典表記は各データの利用条件（常時表示・非表示にしないこと）:
+               地理院タイル = 出典明示、兵庫県 50cmメッシュ DSM/DEM = CC-BY 4.0 */
             #credit {
                 right: 10px;
                 bottom: 10px;
+                max-width: min(46em, 70vw);
+                text-align: right;
             }
             #credit a {
                 color: #9fc7ff;
@@ -106,7 +109,13 @@
             出典:
             <a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank" rel="noreferrer">
                 地理院タイル（国土地理院）
-            </a>
+            </a><br />
+            この作品は、以下の著作物を改変して利用しています。兵庫県 50cmメッシュ DSM/DEM（2021〜2022年度）、[兵庫県]（<a
+                href="https://creativecommons.org/licenses/by/4.0/deed.ja"
+                target="_blank"
+                rel="noreferrer"
+                >CC BY 4.0</a
+            >）。建物高さ・地形・樹木は本アプリが上記データを加工して生成したもので、兵庫県が作成・公表したものではありません。
         </div>
 
         <div id="loading">

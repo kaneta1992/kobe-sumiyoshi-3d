@@ -1,23 +1,25 @@
 /**
  * ワールド定数（docs/data-spec.md の凍結仕様に対応）。
  * ここに書かれた URL・ズーム・座標は実測検証済みのため変更しないこと。
+ *
+ * 原点・エリア範囲・カリング幅・ベクトルタイルZは前処理スクリプトとの共有定義
+ * （src/shared/geo.js）から取る。二重定義を作らないこと。
  */
+export {
+    AREA_HALF,
+    CULL_MARGIN,
+    ORIGIN_LAT,
+    ORIGIN_LON,
+    VECTOR_Z,
+} from './shared/geo.js';
 
-/** ワールド原点: 神戸市東灘区住吉山手九丁目11番 */
-export const ORIGIN_LON = 135.252243;
-export const ORIGIN_LAT = 34.740726;
-
-/** エリアは原点中心の正方形 2400m × 2400m */
-export const AREA_HALF = 1200;
-
-/** 地形メッシュの1辺頂点数（512×512 目安） */
-export const TERRAIN_VERTS = 512;
+/** 地形メッシュの1辺頂点数。高精細ハイトマップ（1025点）に合わせて上げてある */
+export const TERRAIN_VERTS = 1025;
 
 /** タイルのズームレベル（data-spec.md §2〜§4） */
 export const DEM_Z = 15;
 export const DEM_FALLBACK_Z = 14;
 export const PHOTO_Z = 17;
-export const VECTOR_Z = 16;
 
 /** タイルURL（拡張子は実測済み: DEM=.png / 写真=.jpg / ベクトル=.pbf） */
 export const DEM_URL = 'https://cyberjapandata.gsi.go.jp/xyz/dem5a_png/{z}/{x}/{y}.png';
@@ -36,8 +38,11 @@ export const BLD_ORDINARY = 3101;
 export const BLD_FIREPROOF = 3102;
 export const BLD_NO_WALL = 3111;
 
-/** エリア外の地物を捨てる余裕幅[m] */
-export const CULL_MARGIN = 120;
+/** 前処理で生成した高精細アセット（存在しなければ従来のタイル由来にフォールバックする） */
+export const HEIGHTMAP_URL = 'data/heightmap.png';
+export const HEIGHTMAP_META_URL = 'data/heightmap.json';
+export const BUILDING_HEIGHTS_URL = 'data/building-heights.json';
+export const TREES_URL = 'data/trees.json';
 
 export function tileUrl(template: string, z: number, x: number, y: number): string {
     return template.replace('{z}', String(z)).replace('{x}', String(x)).replace('{y}', String(y));

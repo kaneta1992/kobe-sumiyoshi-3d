@@ -1,5 +1,8 @@
 /**
- * 地形メッシュ。DEM から 512×512 のハイトフィールドを作り、航空写真を貼る。
+ * 地形メッシュ。ハイトフィールドを作り、航空写真を貼る。
+ *
+ * 標高は 兵庫県 50cmメッシュ DEM 由来の高精細ハイトマップを優先し、それが無い／
+ * 欠けている箇所だけ地理院 DEM5A(5m) で埋める（契約02 E1）。
  * ハイトフィールドは後続タスク（物理コライダー生成）から再利用できるよう
  * getElevationAt(x, z) として公開する。
  */
@@ -17,6 +20,7 @@ import { AREA_HALF, TERRAIN_VERTS } from '../config';
 import { latToTileY, lonToTileX, xToLon, zToLat } from '../geo';
 import type { ElevationSampler } from '../data/dem';
 import type { AerialImage } from '../data/photo';
+import type { Heightmap } from '../data/terrain-assets';
 
 export interface Terrain {
     mesh: Mesh;
@@ -24,12 +28,18 @@ export interface Terrain {
     getElevationAt(x: number, z: number): number;
     minElevation: number;
     maxElevation: number;
+    /** 高精細ハイトマップを使えたか（使えなければ DEM5A のみ） */
+    hires: boolean;
 }
 
 const N = TERRAIN_VERTS;
 const STEP = (AREA_HALF * 2) / (N - 1);
 
-export function createTerrain(sample: ElevationSampler, aerial: AerialImage): Terrain {
+export function createTerrain(
+    sample: ElevationSampler,
+    aerial: AerialImage,
+    heightmap: Heightmap | null,
+): Terrain {
     const heights = new Float32Array(N * N);
     const positions = new Float32Array(N * N * 3);
     const uvs = new Float32Array(N * N * 2);
@@ -45,7 +55,9 @@ export function createTerrain(sample: ElevationSampler, aerial: AerialImage): Te
         for (let col = 0; col < N; col++) {
             const x = -AREA_HALF + col * STEP;
             const lon = xToLon(x);
-            const h = sample(lon, lat);
+            // 50cm 由来の値を優先し、無い箇所だけ DEM5A で埋める（E1）
+            let h = heightmap ? heightmap.sampleAt(x, z) : NaN;
+            if (!Number.isFinite(h)) h = sample(lon, lat);
             const i = row * N + col;
             heights[i] = h;
             if (h < minElevation) minElevation = h;
@@ -121,5 +133,6 @@ export function createTerrain(sample: ElevationSampler, aerial: AerialImage): Te
         getElevationAt,
         minElevation: Number.isFinite(minElevation) ? minElevation : 0,
         maxElevation: Number.isFinite(maxElevation) ? maxElevation : 0,
+        hires: heightmap !== null,
     };
 }

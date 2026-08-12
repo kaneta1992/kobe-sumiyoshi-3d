@@ -8,10 +8,12 @@
 import { Group, Scene } from 'three/webgpu';
 import { countDemTiles, loadElevationSampler } from '../data/dem';
 import { countPhotoTiles, loadAerialImage } from '../data/photo';
+import { loadBuildingHeights, loadHeightmap, loadTrees } from '../data/terrain-assets';
 import { countVectorTiles, loadVectorFeatures } from '../data/vector';
 import { createBuildings } from './buildings';
 import { createRoads } from './roads';
 import { createTerrain, type Terrain } from './terrain';
+import { createTrees } from './trees';
 
 export interface World {
     group: Group;
@@ -20,7 +22,12 @@ export interface World {
     getElevationAt(x: number, z: number): number;
     stats: {
         buildings: number;
+        /** 50cm DSM/DEM 由来の実測高さを適用できた建物数 */
+        buildingsMeasured: number;
         roads: number;
+        trees: number;
+        /** 高精細ハイトマップ（50cm DEM 由来）を使えたか */
+        hiresTerrain: boolean;
         vectorTilesFailed: number;
         minElevation: number;
         maxElevation: number;
@@ -62,26 +69,44 @@ export async function buildWorld(scene: Scene, signal?: AbortSignal): Promise<Wo
     };
     emit();
 
-    // 3系統を並列に取得する。到着順は問わない（E3）
-    const [sampler, aerial, features] = await Promise.all([
+    // タイル3系統と前処理アセット3種を並列に取得する。到着順は問わない（E3）。
+    // 前処理アセットは無ければ null が返り、タイルだけで従来どおり組み上がる
+    const [sampler, aerial, features, heightmap, measuredHeights, treePoints] = await Promise.all([
         loadElevationSampler(onTile, signal),
         loadAerialImage(onTile, signal),
         loadVectorFeatures(onTile, signal),
+        loadHeightmap(signal),
+        loadBuildingHeights(signal),
+        loadTrees(signal),
     ]);
 
     phase = '地形メッシュを生成中';
     emit();
-    const terrain = createTerrain(sampler, aerial);
+    const terrain = createTerrain(sampler, aerial, heightmap);
 
     phase = '建物・道路を生成中';
     emit();
-    const buildings = createBuildings(features.buildings, terrain.getElevationAt);
+    const buildings = createBuildings(features.buildings, terrain.getElevationAt, measuredHeights);
     const roads = createRoads(features.roads, terrain.getElevationAt);
 
     const group = new Group();
     group.name = 'world';
-    group.add(terrain.mesh, roads, buildings);
+    group.add(terrain.mesh, roads, buildings.mesh);
+
+    if (treePoints && treePoints.length > 0) {
+        phase = '樹木を配置中';
+        emit();
+        const trees = createTrees(treePoints, terrain.getElevationAt);
+        if (trees) group.add(trees);
+    }
     scene.add(group);
+
+    if (buildings.total > 0 && !measuredHeights) {
+        console.info('[world] 建物実高さアセットが無いため階数ヒューリスティックで表示します');
+    } else if (buildings.total > 0) {
+        const rate = ((buildings.measured / buildings.total) * 100).toFixed(1);
+        console.info(`[world] 建物実高さの一致率 ${rate}% (${buildings.measured}/${buildings.total})`);
+    }
 
     const world: World = {
         group,
@@ -89,7 +114,10 @@ export async function buildWorld(scene: Scene, signal?: AbortSignal): Promise<Wo
         getElevationAt: terrain.getElevationAt,
         stats: {
             buildings: features.buildings.length,
+            buildingsMeasured: buildings.measured,
             roads: features.roads.length,
+            trees: treePoints?.length ?? 0,
+            hiresTerrain: terrain.hires,
             vectorTilesFailed: features.tilesFailed,
             minElevation: terrain.minElevation,
             maxElevation: terrain.maxElevation,
