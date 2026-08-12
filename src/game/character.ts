@@ -31,6 +31,11 @@ const GRAVITY = 9.81;
 const MAX_FALL = 55;
 /** 接地中に地面へ押し付ける速度[m/s]（下り坂で浮かないように） */
 const GROUND_STICK = 2;
+/**
+ * ジャンプの初速[m/s]（契約06 追記1）。到達高さ = v²/2g ≒ 1.08m で、
+ * 60cm の段差を余裕をもって越えられる。二段ジャンプはしない
+ */
+const JUMP_SPEED = 4.6;
 
 export interface Character {
     collider: RAPIER.Collider;
@@ -43,6 +48,8 @@ export interface Character {
     readonly grounded: boolean;
     /** 物理ステップ1回ぶん進める。dir は**ワールド座標**の水平移動方向（長さ 0..1） */
     fixedUpdate(dt: number, dirX: number, dirZ: number, run: boolean): void;
+    /** 次の物理ステップで踏み切る（接地していなければ無視される = 二段ジャンプなし） */
+    jump(): void;
     /** 描画位置を前ステップとの間で補間する */
     interpolate(alpha: number): void;
     teleport(x: number, y: number, z: number, yaw: number): void;
@@ -78,6 +85,8 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
 
     let verticalVelocity = 0;
     let grounded = false;
+    let jumpLatched = false;
+    let snapped = true;
     let speed = 0;
     let facing = yaw;
     let previousFacing = yaw;
@@ -104,6 +113,17 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
             previousFacing = facing;
             if (!active) return;
 
+            // 踏み切り。上りに転じている間は snap-to-ground を切らないと地面へ吸い戻される
+            if (jumpLatched) {
+                jumpLatched = false;
+                if (grounded) {
+                    verticalVelocity = JUMP_SPEED;
+                    grounded = false;
+                    controller.disableSnapToGround();
+                    snapped = false;
+                }
+            }
+
             const wanted = run ? RUN_SPEED : WALK_SPEED;
             const length = Math.hypot(dirX, dirZ);
             const scale = length > 1 ? 1 / length : 1;
@@ -120,6 +140,10 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
             controller.computeColliderMovement(collider, next);
             const movement = controller.computedMovement();
             grounded = controller.computedGrounded();
+            if (grounded && !snapped) {
+                controller.enableSnapToGround(0.5);
+                snapped = true;
+            }
 
             current.x += movement.x;
             current.y += movement.y;
@@ -135,6 +159,9 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
                 facing += diff * Math.min(1, TURN_RATE * dt);
             }
         },
+        jump() {
+            jumpLatched = true;
+        },
         interpolate(alpha) {
             position.lerpVectors(previous, current, alpha);
             const diff = Math.atan2(Math.sin(facing - previousFacing), Math.cos(facing - previousFacing));
@@ -146,6 +173,11 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
             position.copy(current);
             velocity.set(0, 0, 0);
             verticalVelocity = 0;
+            jumpLatched = false;
+            if (!snapped) {
+                controller.enableSnapToGround(0.5);
+                snapped = true;
+            }
             facing = tyaw;
             previousFacing = tyaw;
             renderYaw = tyaw;

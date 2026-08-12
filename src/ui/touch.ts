@@ -20,6 +20,8 @@ export interface TouchControls {
     readonly brake: boolean;
     /** 乗降ボタンの押下を1回ぶん取り出す */
     consumeInteract(): boolean;
+    /** ジャンプボタンの押下を1回ぶん取り出す（徒歩のときだけ出る） */
+    consumeJump(): boolean;
     setMode(mode: ControlMode): void;
     /** 乗降ボタンを押せる状態か（近くに車がある / 乗車中）を伝える */
     setInteractEnabled(enabled: boolean): void;
@@ -58,15 +60,17 @@ export function createTouchControls(): TouchControls | null {
     const interactButton = button('乗る', 'touch-interact');
     const accelButton = button('走る', 'touch-accel');
     const brakeButton = button('ブレーキ', 'touch-brake');
-    buttons.append(brakeButton, accelButton, interactButton);
+    const jumpButton = button('ジャンプ', 'touch-jump');
+    buttons.append(brakeButton, jumpButton, accelButton, interactButton);
 
-    // 起動時は徒歩。ブレーキボタンは運転中だけ出す
+    // 起動時は徒歩。ブレーキボタンは運転中だけ・ジャンプボタンは徒歩のときだけ出す
     brakeButton.classList.add('hidden');
     root.append(stickBase, buttons);
     document.body.appendChild(root);
 
     const state = { stickX: 0, stickZ: 0, accel: false, brake: false };
     let interactPressed = false;
+    let jumpPressed = false;
     let stickPointer = -1;
 
     const updateStick = (e: PointerEvent): void => {
@@ -141,6 +145,16 @@ export function createTouchControls(): TouchControls | null {
     const interactUp = (): void => interactButton.classList.remove('active');
     interactButton.addEventListener('pointerup', interactUp);
     interactButton.addEventListener('pointercancel', interactUp);
+    // ジャンプは押した瞬間に1回ぶんだけ出す（押しっぱなしで連続ジャンプしない）
+    jumpButton.addEventListener('pointerdown', (e) => {
+        jumpPressed = true;
+        jumpButton.classList.add('active');
+        e.preventDefault();
+    });
+    const jumpUp = (): void => jumpButton.classList.remove('active');
+    jumpButton.addEventListener('pointerup', jumpUp);
+    jumpButton.addEventListener('pointercancel', jumpUp);
+    jumpButton.addEventListener('pointerleave', jumpUp);
 
     // マウス機でも最初にタッチしたら出す（E20）
     const onFirstTouch = (e: PointerEvent): void => {
@@ -156,6 +170,7 @@ export function createTouchControls(): TouchControls | null {
         state.brake = false;
         accelButton.classList.remove('active');
         brakeButton.classList.remove('active');
+        jumpButton.classList.remove('active');
     };
     window.addEventListener('blur', onBlur);
 
@@ -177,11 +192,17 @@ export function createTouchControls(): TouchControls | null {
             interactPressed = false;
             return value;
         },
+        consumeJump() {
+            const value = jumpPressed;
+            jumpPressed = false;
+            return value;
+        },
         setMode(mode) {
             const driving = mode === 'drive';
             interactButton.textContent = driving ? '降りる' : '乗る';
             accelButton.textContent = driving ? 'アクセル' : '走る';
             brakeButton.classList.toggle('hidden', !driving);
+            jumpButton.classList.toggle('hidden', driving);
         },
         setInteractEnabled(enabled) {
             interactButton.classList.toggle('disabled', !enabled);

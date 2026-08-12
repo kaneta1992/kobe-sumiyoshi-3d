@@ -11,9 +11,18 @@
  *     （全員の車が同じ場所にスポーンするので、置くと重なるだけになる）
  */
 import { Vector3, type Scene } from 'three/webgpu';
-import { createCarAvatar, createPlayerAvatar, type CarAvatar, type PlayerAvatar } from '../game/avatar';
+import {
+    DRIVER_SEAT,
+    createCarAvatar,
+    createPlayerAvatar,
+    type CarAvatar,
+    type PlayerAvatar,
+} from '../game/avatar';
 import { WHEEL_RADIUS, WHEEL_REST_OFFSETS } from '../game/vehicle';
 import type { QualitySettings } from '../quality';
+
+/** 舵角の推定に使うホイールベース[m]（vehicle.ts の WHEEL_Z * 2） */
+const WHEELBASE = 2.84;
 
 interface Slot {
     player: PlayerAvatar;
@@ -21,6 +30,13 @@ interface Slot {
     used: boolean;
     /** 車輪の回転角[rad]。車速から積分する（相手の車輪角は同期しない） */
     spin: number;
+    /** 乗車中か（人型を車の子にしているか） */
+    riding: boolean;
+    /** 前フレームの車体 yaw[rad]。舵角と車体ロールの推定に使う */
+    yaw: number;
+    hasYaw: boolean;
+    /** 推定した舵角[rad]（12Hz の受信間隔でガタつかないよう平滑化する） */
+    steer: number;
 }
 
 export interface RemotePlayers {
@@ -61,12 +77,29 @@ export function createRemotePlayers(
         player.group.visible = false;
         car.group.visible = false;
         scene.add(player.group, car.group);
-        return { player, car, used: false, spin: 0 };
+        return { player, car, used: false, spin: 0, riding: false, yaw: 0, hasYaw: false, steer: 0 };
+    };
+
+    /** 乗車 / 降車で人型の親を付け替える（スロット再利用でも状態が残らないように・E37） */
+    const setRiding = (slot: Slot, riding: boolean): void => {
+        if (slot.riding === riding) return;
+        slot.riding = riding;
+        if (riding) {
+            slot.car.group.add(slot.player.group);
+            slot.player.group.position.copy(DRIVER_SEAT);
+            slot.player.group.rotation.set(0, Math.PI, 0);
+        } else {
+            scene.add(slot.player.group);
+            slot.player.group.rotation.set(0, 0, 0);
+        }
+        slot.player.setRiding(riding);
     };
 
     const assign = (slot: Slot, color: number): void => {
         slot.used = true;
         slot.spin = 0;
+        slot.hasYaw = false;
+        setRiding(slot, false);
         slot.player.setColor(color);
         slot.car.setColor(color);
     };
@@ -88,26 +121,43 @@ export function createRemotePlayers(
             const entry = slots[slot];
             if (!entry) return;
             entry.used = false;
+            setRiding(entry, false);
             entry.player.group.visible = false;
             entry.car.group.visible = false;
         },
         show(slot, driving, x, y, z, yaw, speed, dt) {
             const entry = slots[slot];
             if (!entry || !entry.used) return;
-            entry.player.group.visible = !driving;
+            setRiding(entry, driving);
+            // 乗車中は人型が車の子なので、車を消すと中の人も消える
+            entry.player.group.visible = true;
             entry.car.group.visible = driving;
+            const step = Math.min(0.05, Math.max(0.0001, dt));
             if (driving) {
                 entry.car.group.position.set(x, y, z);
                 entry.car.group.rotation.y = yaw;
-                entry.spin += (speed / WHEEL_RADIUS) * dt;
+                entry.spin += (speed / WHEEL_RADIUS) * step;
+                // 舵角は同期していない。旋回の角速度から推定する（同期項目を増やさない）
+                let target = 0;
+                if (entry.hasYaw && Math.abs(speed) > 1) {
+                    const turn = Math.atan2(Math.sin(yaw - entry.yaw), Math.cos(yaw - entry.yaw)) / step;
+                    target = Math.max(-0.5, Math.min(0.5, Math.atan((turn * WHEELBASE) / speed)));
+                }
+                entry.yaw = yaw;
+                entry.hasYaw = true;
+                entry.steer += (target - entry.steer) * (1 - Math.exp(-9 * step));
+                const steering = entry.steer;
                 for (let i = 0; i < WHEEL_REST_OFFSETS.length; i++) {
                     const offset = WHEEL_REST_OFFSETS[i];
                     wheel.set(offset[0], offset[1], offset[2]);
-                    entry.car.setWheel(i, wheel, 0, entry.spin);
+                    entry.car.setWheel(i, wheel, i < 2 ? steering : 0, entry.spin);
                 }
+                entry.car.update(speed, steering, false, step);
+                entry.player.update(feet, yaw, speed, step);
             } else {
+                entry.hasYaw = false;
                 feet.set(x, y, z);
-                entry.player.update(feet, yaw, speed, dt);
+                entry.player.update(feet, yaw, speed, step);
             }
         },
         dispose() {

@@ -14,8 +14,14 @@ export interface InputState {
     moveZ: number;
     /** 走る（徒歩）/ アクセル全開（運転） */
     run: boolean;
-    /** ブレーキ・パーキングブレーキ */
+    /** ブレーキ・パーキングブレーキ（飛行中は上昇） */
     brake: boolean;
+    /** 下降（飛行中のみ使う。Cキー） */
+    down: boolean;
+    /** ジャンプの押下（フレーム末に消費する） */
+    jump: boolean;
+    /** スーパーマンモードの切り替え押下（?superman のときだけ使う・フレーム末に消費） */
+    toggleFly: boolean;
     /** 視点の相対移動[px]。フレーム末に消費する */
     lookX: number;
     lookY: number;
@@ -59,6 +65,9 @@ export function createInput(element: HTMLElement): Input {
         moveZ: 0,
         run: false,
         brake: false,
+        down: false,
+        jump: false,
+        toggleFly: false,
         lookX: 0,
         lookY: 0,
         interact: false,
@@ -69,6 +78,7 @@ export function createInput(element: HTMLElement): Input {
     let dragPointer = -1;
     let keyRun = false;
     let keyBrake = false;
+    let keyDown = false;
 
     const onKeyDown = (e: KeyboardEvent): void => {
         if (e.code in MOVE_KEYS) {
@@ -78,9 +88,13 @@ export function createInput(element: HTMLElement): Input {
         if (e.repeat) return;
         if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') keyRun = true;
         if (e.code === 'Space') {
+            // 徒歩ではジャンプ・運転ではブレーキ・飛行では上昇（下流で使い分ける）
             keyBrake = true;
+            state.jump = true;
             e.preventDefault();
         }
+        if (e.code === 'KeyC') keyDown = true;
+        if (e.code === 'KeyG') state.toggleFly = true;
         if (e.code === 'KeyF' || e.code === 'KeyE') state.interact = true;
         if (e.code === 'KeyR') state.respawn = true;
     };
@@ -88,6 +102,7 @@ export function createInput(element: HTMLElement): Input {
         pressed.delete(e.code);
         if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') keyRun = false;
         if (e.code === 'Space') keyBrake = false;
+        if (e.code === 'KeyC') keyDown = false;
     };
 
     // --- 視点 ---------------------------------------------------------------
@@ -116,6 +131,7 @@ export function createInput(element: HTMLElement): Input {
         pressed.clear();
         keyRun = false;
         keyBrake = false;
+        keyDown = false;
         dragPointer = -1;
     };
 
@@ -145,6 +161,7 @@ export function createInput(element: HTMLElement): Input {
             state.moveZ = Math.max(-1, Math.min(1, z));
             state.run = keyRun;
             state.brake = keyBrake;
+            state.down = keyDown;
             if (!touch) return;
             // タッチはキーボードに重ねる（両方ある端末でどちらも効く・E20）
             if (touch.stickX !== 0) state.moveX = touch.stickX;
@@ -152,12 +169,15 @@ export function createInput(element: HTMLElement): Input {
             if (touch.accel) state.run = true;
             if (touch.brake) state.brake = true;
             if (touch.consumeInteract()) state.interact = true;
+            if (touch.consumeJump()) state.jump = true;
         },
         endFrame() {
             state.lookX = 0;
             state.lookY = 0;
             state.interact = false;
             state.respawn = false;
+            state.jump = false;
+            state.toggleFly = false;
         },
         setMode(mode) {
             touch?.setMode(mode);
