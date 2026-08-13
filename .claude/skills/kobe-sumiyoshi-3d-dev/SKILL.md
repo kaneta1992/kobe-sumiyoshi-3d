@@ -73,3 +73,11 @@ description: 神戸・住吉山手3D街歩きアプリ（kobe-sumiyoshi-3d）の
 - ?match = トレジャーロワイヤル完成形: 降下→安置3段収縮→アイテム（7種+イノシシ笛・千里眼=9種+切れ端）→鍵→宝箱→勝利→リマッチ。BOT最大8体（src/match/bots.ts・ホスト思考・別チャンネルbots配信）、ヘリ（src/game/helicopter.ts・アーケード積分）、イノシシ（src/match/wildlife.ts）、ディレクター（src/match/director.ts・リード<2で前倒し）
 - 検証チートシート: ?solo&match&matchauto&matchspeed=6&matchseed=N&stats + matchgoto=key|chest|item|mimic|lookout + matchitem=door,stick,cape,tabi,umbrella,map,fog,whistle,eye|all + matchdebug + matchherd + matchlead=99
 - 道路グラフ: src/world/road-graph.ts（A*・ノード2万）— BOTナビ以外にも流用可
+
+## 2026-08-13 後半の更新（契約13〜15）
+
+- ルールv2: 鍵・チャンネリング・体当たり廃止。宝箱=隠し配置+接触で即勝利。情報レイヤー（収縮/ステッキ方向線/切れ端40m円/気配15m/ミミック）。所持アイテムは4種（ドア/ステッキ/足袋/マント=上空打ち上げ）
+- 速度: 既定10.4m/s・Shift=歩く・⚡永続収集(+3%/個,上限2.0)・足袋は上限突破・ジャンプ2m
+- 昼夜: 壁時計から決定的導出5分/周（?daylen/?hour固定）。夜間照明はハロー全灯+近傍PointLightプール（増減させるな — ライト構成変更で全シェーダー再コンパイル）
+- 検証の落とし穴: **長時間稼働のVite devサーバーはHMRキャッシュが腐る**（存在しない識別子のReferenceError等）→ 検証前に再起動 / 動的解像度はプリウォーム後のplayableゲートで動く（E114）
+- モバイル影が出ない時は光源距離がshadow far内か確認（契約13で修正した既存バグ）
