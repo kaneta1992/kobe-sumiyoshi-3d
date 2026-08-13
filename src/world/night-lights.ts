@@ -70,14 +70,21 @@ const FADE_RATE = 2.5;
 
 /** 街灯の実ライト: 色・届く距離[m]・強さ・減衰 */
 const LAMP_LIGHT_COLOR = 0xffd9a2;
-const LAMP_LIGHT_RANGE = 24;
-const LAMP_LIGHT_INTENSITY = 26;
-const LAMP_LIGHT_DECAY = 1.35;
-/** 提灯風のライト: 暖色・半径8m目安（契約15-3） */
+const LAMP_LIGHT_RANGE = 27;
+const LAMP_LIGHT_INTENSITY = 34;
+const LAMP_LIGHT_DECAY = 1.25;
+/**
+ * 提灯風のライト（自分・遠隔・BOT 共通の定数なので、強化はそのまま全員に効く）。
+ *
+ * 「夜が暗すぎる」というユーザー評価を受けて半径8m→15m・強度を大幅に上げた。
+ * 減衰を 1.2 → 0.85 へ**寝かせている**のが肝で、これをやらずに強度だけ上げると
+ * 足元だけ白飛びして周りは暗いまま（1/d^decay なので中心に寄りすぎる）。
+ * 寝かせたぶん遠くまで平らに届き、道路と壁の面がはっきり読める
+ */
 const LANTERN_LIGHT_COLOR = 0xffc078;
-const LANTERN_LIGHT_RANGE = 9;
-const LANTERN_LIGHT_INTENSITY = 3.2;
-const LANTERN_LIGHT_DECAY = 1.2;
+const LANTERN_LIGHT_RANGE = 15;
+const LANTERN_LIGHT_INTENSITY = 11;
+const LANTERN_LIGHT_DECAY = 0.85;
 /** 人の灯りを吊るす高さ[m]（足元から）。チビ体型の頭より上に置く */
 const LANTERN_HEIGHT = 1.8;
 
@@ -249,7 +256,16 @@ function createHaloLayer(
 /** 使い回しのスクラッチ（フレームループで new を作らない） */
 const focusPoint = new Vector3();
 
-export function createNightLights(scene: Scene, quality: QualitySettings): NightLights {
+/**
+ * enabled=false（昼固定で夜が来ない構成）ではライトもハローも一切作らない。
+ * プールは消灯していても全マテリアルのシェーダーに乗る固定費なので、
+ * 夜が来ないと分かっているなら「0灯で組む」のが唯一の正しい省き方になる
+ */
+export function createNightLights(
+    scene: Scene,
+    quality: QualitySettings,
+    enabled = true,
+): NightLights {
     const makeSlots = (count: number, color: number, range: number, decay: number): Slot[] => {
         const slots: Slot[] = [];
         for (let i = 0; i < count; i++) {
@@ -264,13 +280,13 @@ export function createNightLights(scene: Scene, quality: QualitySettings): Night
     };
     // ライトはここで作りきる。以後 scene から出し入れしない（再コンパイルを起こさない）
     const lampSlots = makeSlots(
-        LAMP_SLOTS[quality.preset],
+        enabled ? LAMP_SLOTS[quality.preset] : 0,
         LAMP_LIGHT_COLOR,
         LAMP_LIGHT_RANGE,
         LAMP_LIGHT_DECAY,
     );
     const lanternSlots = makeSlots(
-        LANTERN_SLOTS[quality.preset],
+        enabled ? LANTERN_SLOTS[quality.preset] : 0,
         LANTERN_LIGHT_COLOR,
         LANTERN_LIGHT_RANGE,
         LANTERN_LIGHT_DECAY,
@@ -280,14 +296,16 @@ export function createNightLights(scene: Scene, quality: QualitySettings): Night
     const haloFar = Math.min(HALO_FAR_MAX, quality.viewDistance);
     let lamps: readonly LampAnchor[] = [];
     let lampHalo: HaloLayer | null = null;
-    const lanternHalo = createHaloLayer(
-        LANTERN_HALOS,
-        HALO_LANTERN_SIZE,
-        new Color(LANTERN_LIGHT_COLOR),
-        HALO_LANTERN_BRIGHT,
-        haloFar,
-    );
-    scene.add(lanternHalo.mesh);
+    const lanternHalo = enabled
+        ? createHaloLayer(
+              LANTERN_HALOS,
+              HALO_LANTERN_SIZE,
+              new Color(LANTERN_LIGHT_COLOR),
+              HALO_LANTERN_BRIGHT,
+              haloFar,
+          )
+        : null;
+    if (lanternHalo) scene.add(lanternHalo.mesh);
 
     // 人の位置は毎フレーム詰め直す固定長バッファ（0 番目は自分）
     const lanternXyz = new Float32Array(LANTERN_HALOS * 3);
@@ -420,6 +438,7 @@ export function createNightLights(scene: Scene, quality: QualitySettings): Night
 
     return {
         setLamps(next) {
+            if (!enabled) return;
             lamps = next;
             if (lampHalo) {
                 scene.remove(lampHalo.mesh);
@@ -439,6 +458,7 @@ export function createNightLights(scene: Scene, quality: QualitySettings): Night
             scene.add(lampHalo.mesh);
         },
         update(dt, focus, self, peers) {
+            if (!enabled || !lanternHalo) return;
             focusPoint.set(focus.x, focus.y, focus.z);
 
             // --- 人の灯り（自分 → 遠隔・BOT の順。並びは巡回元が決める） ---
@@ -481,8 +501,10 @@ export function createNightLights(scene: Scene, quality: QualitySettings): Night
         dispose() {
             for (const slot of lampSlots) scene.remove(slot.light);
             for (const slot of lanternSlots) scene.remove(slot.light);
-            scene.remove(lanternHalo.mesh);
-            lanternHalo.dispose();
+            if (lanternHalo) {
+                scene.remove(lanternHalo.mesh);
+                lanternHalo.dispose();
+            }
             if (lampHalo) {
                 scene.remove(lampHalo.mesh);
                 lampHalo.dispose();

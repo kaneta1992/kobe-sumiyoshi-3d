@@ -4,8 +4,9 @@
  *   ?quality=mobile | desktop      プリセット強制
  *   ?tier=0|1|2                    プリセット内の段階を強制（動的降格を止める）
  *   ?stats                         画面内 stats を表示
- *   ?hour=15.5                     太陽の時刻（指定すると昼夜サイクルが止まる）
- *   ?daylen=60                     昼夜が一周する実時間[s]（既定300 = 5分）
+ *   ?hour=15.5                     太陽の時刻を固定する（既定は昼固定の 13.5時）
+ *   ?daynight                      昼夜サイクルを有効にする（既定は無効＝昼固定）
+ *   ?daylen=60                     サイクル1周の実時間[s]（既定300 = 5分。指定すると ?daynight 扱い）
  *
  * 動的解像度スケーリング（追記2-2）と自動降格はここが持つ数値に従う。
  * 「性能が足りないときは段階的に落として止まらない」ことを最優先にする。
@@ -208,6 +209,23 @@ export function sunHour(): number {
     if (value === null) return 15;
     const raw = Number(value);
     return Number.isFinite(raw) ? Math.max(0, Math.min(24, raw)) : 15;
+}
+
+/**
+ * 通常プレイの既定時刻[h]（ユーザー裁定 2026-08-13）。
+ * 昼夜サイクルは既定オフで、マッチ中も含めて常にこの昼下がりで見せる。
+ * ?shot の既定は sunHour()（15時）のまま — 定点カメラは契約07 でその時刻を基準に
+ * 構図と光を詰めてあるので、ここを動かすと画が変わってしまう
+ */
+export const DEFAULT_PLAY_HOUR = 13.5;
+
+/**
+ * 昼夜サイクルを回すか。既定は**回さない**（昼固定）。
+ * ?daynight で有効化、?daylen=秒 を付けた場合も有効とみなす（周期指定＝回す意思）
+ */
+export function dayNightEnabled(): boolean {
+    const params = new URLSearchParams(location.search);
+    return params.has('daynight') || params.has('daylen');
 }
 
 /**

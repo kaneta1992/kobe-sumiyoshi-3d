@@ -32,6 +32,7 @@ import {
     type ItemId,
     type ItemLayout,
 } from './items';
+import { OCC_BUILDING } from '../world/occupancy';
 import type { MatchObjects } from './objects';
 import {
     ANTI_STALL_AFTER,
@@ -273,7 +274,13 @@ export function createDirector(options: DirectorOptions): Director {
         if (fx.effect === 'glide') items.wings.push(x, y + 1.5, z, 0, 1);
     };
 
-    /** 立てる地点へ寄せる（建物の中・急斜面へ落とさない・E74） */
+    /**
+     * 立てる地点へ寄せる（建物の中・急斜面へ落とさない・E74）。
+     *
+     * 傾きだけを見ていたので、**建物のフットプリントの中**を平らな good spot として
+     * 選んでしまい、どこでもドアで建物に閉じ込められていた（ユーザー報告 2026-08-13）。
+     * 占有図で建物を除外して、道路・空地の側から選ぶ
+     */
     const findStandable = (x: number, z: number): { x: number; z: number } => {
         const surface = game.physics.surfaceHeight;
         for (const radius of LAND_RINGS) {
@@ -282,6 +289,7 @@ export function createDirector(options: DirectorOptions): Director {
                 const angle = (i / steps) * TAU;
                 const cx = x + Math.cos(angle) * radius;
                 const cz = z + Math.sin(angle) * radius;
+                if ((world.occupancy.at(cx, cz) & OCC_BUILDING) !== 0) continue;
                 const h = surface(cx, cz);
                 const slope = Math.max(
                     Math.abs(h - surface(cx + 2, cz)),

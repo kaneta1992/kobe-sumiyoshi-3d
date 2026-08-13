@@ -12,6 +12,7 @@ import { AREA_HALF } from '../config';
 import type { QualitySettings } from '../quality';
 import { setHelp } from '../ui/loading';
 import { worldStats } from '../ui/stats';
+import { OCC_BUILDING } from '../world/occupancy';
 import type { World } from '../world';
 import {
     BOAR_SEAT,
@@ -36,6 +37,12 @@ export { initPhysics } from './physics';
 
 /** 乗車できる距離[m]（車体中心から。全長4.1mの車なのでバンパーから約1m） */
 const ENTER_RADIUS = 5;
+/**
+ * 建物の中から逃がすときに調べる半径[m]と方位数。
+ * マンションのフットプリントでも抜けられるよう 32m まで広げてある
+ */
+const ESCAPE_RINGS = [3, 5, 8, 12, 17, 23, 32];
+const ESCAPE_STEPS = 12;
 /** 地形からこれだけ下に落ちたらリスポーン[m]（E19） */
 const FALL_LIMIT = 20;
 /**
@@ -543,13 +550,45 @@ export function createGame(options: GameOptions): Game {
         follow.snap();
     };
 
+    /**
+     * 建物のフットプリントの外へ逃がす（ユーザー報告 2026-08-13）。
+     *
+     * どこでもドアの着地補正も R の復帰も、建物の中を指してしまうと壁コライダーに
+     * 囲まれて出られなくなる。占有グリッドを外へ向かって舐めて、いちばん近い
+     * 「建物でない」地点へずらす。**すべてのテレポートが placeAt を通る**ので、
+     * ここ1か所で ドア・warpTo・R の全部が救われる
+     */
+    const escapeSpot = { x: 0, z: 0 };
+    const escapeBuildings = (x: number, z: number): { x: number; z: number } => {
+        escapeSpot.x = x;
+        escapeSpot.z = z;
+        if ((world.occupancy.at(x, z) & OCC_BUILDING) === 0) return escapeSpot;
+        for (const radius of ESCAPE_RINGS) {
+            for (let i = 0; i < ESCAPE_STEPS; i++) {
+                const angle = (i / ESCAPE_STEPS) * Math.PI * 2;
+                const cx = x + Math.cos(angle) * radius;
+                const cz = z + Math.sin(angle) * radius;
+                if ((world.occupancy.at(cx, cz) & OCC_BUILDING) !== 0) continue;
+                escapeSpot.x = cx;
+                escapeSpot.z = cz;
+                return escapeSpot;
+            }
+        }
+        // 逃げ場が見つからないほど建物が密なら諦めて元の座標。
+        // 屋根コライダーが入ったので、少なくとも上から出られる
+        return escapeSpot;
+    };
+
     /** 指定座標の地表へ立たせる（デバッグ移動の共通処理）。乗車・飛行・降下中でも徒歩へ戻す */
-    const placeAt = (x: number, z: number, yaw: number): void => {
+    const placeAt = (rawX: number, rawZ: number, yaw: number): void => {
         if (mode === 'sky') endSky();
         if (flying) stopFlying(world.getElevationAt(flyPos.x, flyPos.z));
         if (mode === 'drive') exitVehicle();
         if (mode === 'heli') exitHeli();
         if (mode === 'boar') dismountBoar();
+        const spot = escapeBuildings(rawX, rawZ);
+        const x = spot.x;
+        const z = spot.z;
         character.teleport(
             x,
             physics.surfaceHeight(x, z) + CHARACTER_CENTER_OFFSET + 0.05,

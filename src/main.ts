@@ -31,8 +31,10 @@ import type { Game } from './game';
 import type { Match } from './match';
 import type { Multiplayer } from './net/multiplayer';
 import {
+    DEFAULT_PLAY_HOUR,
     createQuality,
     dayLengthSeconds,
+    dayNightEnabled,
     initialQuality,
     maxTier,
     sunHour,
@@ -46,7 +48,7 @@ import { createMapOverlay, type MapOverlay } from './ui/map';
 import { hideLoading, setHelp, setLoadingProgress, setStatus, showFatal } from './ui/loading';
 import { createEnvironment } from './world/environment';
 import { createNightLights } from './world/night-lights';
-import { cycleHour, fogRangeNode, setSunHour } from './world/sun';
+import { cycleHour, fogRangeNode, lighting, setSunHour } from './world/sun';
 import { buildWorld, worldEvents, type World, type WorldProgress } from './world';
 
 /** 動的解像度スケーリングの段階 */
@@ -63,12 +65,21 @@ async function start(): Promise<void> {
     let quality: QualitySettings = initialQuality();
     // ?webgl を付けると WebGL2 バックエンドを強制する（E5-b のフォールバック確認用）
     const params = new URLSearchParams(location.search);
-    // 時刻は既定で壁時計から 5分/周 で回る（契約15）。全クライアントが同じ式で
-    // 導くので同期メッセージは要らない。?hour と ?shot は時刻を固定してサイクルを
-    // 止める — 定点スクショの再現性を保つため（E105）。
+    // 時刻の決め方（ユーザー裁定 2026-08-13 で既定が「昼固定」になった）:
+    //   ?hour=       その時刻に固定
+    //   ?shot=       その定点の時刻（無指定の定点は契約07 基準の 15時）
+    //   ?daynight    壁時計から 5分/周 で回す（全クライアントが同じ式なので同期不要・契約15）
+    //   何も無ければ 昼下がり固定（マッチ中も昼のまま）
     // 太陽光の色・強さは環境の構築時に読むので、ここで確定させておく
     const shot = shotIndex();
-    const fixedHour = params.has('hour') ? sunHour() : shot > 0 ? (shotHour(shot) ?? sunHour()) : null;
+    const cycling = dayNightEnabled();
+    const fixedHour = params.has('hour')
+        ? sunHour()
+        : shot > 0
+          ? (shotHour(shot) ?? sunHour())
+          : cycling
+            ? null
+            : DEFAULT_PLAY_HOUR;
     const dayLength = dayLengthSeconds();
     /** サイクルが動いているときだけ毎フレーム時刻を進める */
     const advanceClock = (): void => {
@@ -151,8 +162,13 @@ async function start(): Promise<void> {
     fogRangeNode.value.set(quality.fogNear, quality.fogFar);
     // 夜間照明（契約15）。ポイントライトのプールはここで作りきる — シーンのライト構成が
     // 変わるとノードマテリアルが総再コンパイルになるので、ワールド構築・プリウォームより
-    // 前に確定させ、以後は増減させない
-    const nightLights = createNightLights(scene, quality);
+    // 前に確定させ、以後は増減させない。
+    //
+    // 夜が来ないと分かっている場合（昼固定）は**1灯も作らない**: プールは点いていなくても
+    // 全マテリアルのシェーダーに乗るので、既定の昼だけの遊びでは丸ごと無駄になる
+    // （実測 desktop で 8灯 = 約 +3.9ms/frame）
+    const nightPossible = fixedHour === null || lighting.lamp > 0;
+    const nightLights = createNightLights(scene, quality, nightPossible);
     // 出典・操作・設定は右下の「ℹ️」に畳む（常時表示をやめる・契約13-5）
     createInfoPanel();
 

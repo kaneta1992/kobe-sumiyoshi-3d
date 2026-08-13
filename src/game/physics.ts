@@ -15,6 +15,7 @@
  *   小物（電柱・樹木・ガードレール）は省略（契約04: すり抜け許容）
  */
 import * as RAPIER from '@dimforge/rapier3d-compat';
+import { ShapeUtils } from 'three/webgpu';
 import { AREA_HALF } from '../config';
 import type { BuildingCollision } from '../world/buildings';
 import { PARAPET_HEIGHT, PARAPET_WIDTH, type BridgeSpan } from '../world/bridges';
@@ -137,6 +138,46 @@ function addBuildingWalls(map: Map<number, MeshBuffer>, building: BuildingCollis
         const q = ring[i];
         if (Math.hypot(q.x - p.x, q.z - p.z) < 0.05) continue;
         pushQuad(buf, p.x, base, p.z, q.x, base, q.z, q.x, top, q.z, p.x, top, p.z);
+    }
+}
+
+/**
+ * 建物: 天面（屋根）を塞ぐ。
+ *
+ * 壁はもともと base→top（棟の高さ）まで伸びているので、ここを塞ぐと建物が
+ * **閉じた箱**になる。上から降ってきても突き抜けず、屋根に着地して歩ける。
+ * 塞いでいなかったせいで、降下・マント・ジャンプで落ちると建物の中へ入り込み、
+ * 壁コライダーに囲まれて出られなくなっていた（ユーザー報告 2026-08-13）。
+ *
+ * skydive.ts が「屋根の上に降りられるよう足場高さを使う」と書いているとおり、
+ * 建物の上面は元から足場のつもりだった — コライダーだけが欠けていた（E66）。
+ * 勾配屋根も棟の高さで水平に塞ぐ: 壁がすでにその高さまであるので、
+ * 壁だけのときより不自然になることはない。
+ */
+function addBuildingRoof(map: Map<number, MeshBuffer>, building: BuildingCollision): void {
+    const ring = building.outer;
+    if (ring.length < 3) return;
+    const buf = cellOf(map, building.center.x, building.center.z);
+    // 三角形分割は描画側（buildings.ts の陸屋根）と同じ手順。穴（中庭）は入れない
+    let faces: number[][] = [];
+    try {
+        faces = ShapeUtils.triangulateShape(
+            ring.map((p) => ({ x: p.x, y: p.z })),
+            [],
+        );
+    } catch {
+        faces = [];
+    }
+    const y = building.top;
+    for (const face of faces) {
+        const a = ring[face[0]];
+        const b = ring[face[1]];
+        const c = ring[face[2]];
+        if (!a || !b || !c) continue;
+        // trimesh は両面で当たるので巻き方向は問わない
+        const base = buf.positions.length / 3;
+        buf.positions.push(a.x, y, a.z, b.x, y, b.z, c.x, y, c.z);
+        buf.indices.push(base, base + 1, base + 2);
     }
 }
 
@@ -269,7 +310,10 @@ export function createPhysics(input: PhysicsInput): Physics {
     }
     for (const span of input.bridges) addBridgeDeck(roadCells, span);
     const buildingCells = new Map<number, MeshBuffer>();
-    for (const building of input.buildings) addBuildingWalls(buildingCells, building);
+    for (const building of input.buildings) {
+        addBuildingWalls(buildingCells, building);
+        addBuildingRoof(buildingCells, building);
+    }
 
     const addTrimeshes = (cells: Map<number, MeshBuffer>, friction: number): void => {
         for (const buf of cells.values()) {

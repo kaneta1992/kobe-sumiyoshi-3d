@@ -21,7 +21,7 @@ import { worldStats } from '../ui/stats';
 import { buildBridgeSpans, createBridges, type BridgeSpan } from './bridges';
 import { createBuildings, type BuildingCollision } from './buildings';
 import { setPlaces, type Landmark } from './landmarks';
-import { buildOccupancy } from './occupancy';
+import { buildOccupancy, type Occupancy } from './occupancy';
 import { createProps, type LampAnchor } from './props';
 import { createRoads } from './roads';
 import { createTerrain, type Terrain } from './terrain';
@@ -67,6 +67,11 @@ export interface World {
      * ポイントライトプールとハローの割り当てに使う。品質段階で電柱を切ったときは空
      */
     lamps: readonly LampAnchor[];
+    /**
+     * 道路・建物フットプリントの占有図（2m格子）。
+     * テレポートの着地補正が「建物の中へ降ろさない」判定に使う（ユーザー報告 2026-08-13）
+     */
+    occupancy: Occupancy;
     /** 地表標高[m]。エリア外は端の値にクランプされる */
     getElevationAt(x: number, z: number): number;
     /** 毎フレーム呼ぶ。HLOD 選択・距離/フラスタムカリング・樹木の詰め直し */
@@ -318,6 +323,7 @@ export async function buildWorld(
             trees: treePoints ?? [],
         },
         lamps: props?.lamps ?? NO_LAMPS,
+        occupancy,
         getElevationAt: terrain.getElevationAt,
         update(camera, q, force = false) {
             camera.updateMatrixWorld();
