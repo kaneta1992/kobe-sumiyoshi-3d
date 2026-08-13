@@ -116,10 +116,26 @@ export interface Game {
      * 止める理由ごとに数えるので、マップとマッチのパネルが同時に開いても取り合わない
      */
     setInputSuspended(suspended: boolean, reason?: string): void;
-    /** 徒歩の移動速度倍率（安置の外での減速・契約10） */
+    /** 徒歩の移動速度倍率（安置の外での減速・契約10 / アイテムの加速・契約11） */
     setSpeedScale(scale: number): void;
     /** 体当たりで押し飛ばされる（契約10） */
     knockback(dirX: number, dirZ: number, distance: number): void;
+    /**
+     * 空中での補助（契約11 のマント・傘）。sink = 落下速度の上限[m/s]、
+     * speed = 水平の目標速度[m/s]。どちらも 0 で通常の落下に戻る
+     */
+    setAirAssist(sink: number, speed: number): void;
+    /** 韋駄天の地下足袋（契約11）。急坂でも登れる・滑り落ちない */
+    setSlopePower(on: boolean): void;
+    /**
+     * 指定座標の地表へ立たせる（契約11 のどこでもドア）。warpTo と違い
+     * R の戻り先は変えない（通常フローのリスポーンは spawn のまま）
+     */
+    teleportTo(x: number, z: number, yaw: number): void;
+    /** カメラの向き[rad]（HUD の方角矢印を画面基準へ直すのに使う・契約11） */
+    readonly viewYaw: number;
+    /** ジャンプを押しっぱなしか（マントの滑空・契約11） */
+    readonly jumpHeld: boolean;
     /**
      * デバッグ用の瞬間移動（契約10 追記の ?matchgoto）。指定座標の地表へ立たせ、
      * 以後は R の位置リセットもここへ戻す（＝目標の手前へ何度でも戻れる）。
@@ -625,6 +641,21 @@ export function createGame(options: GameOptions): Game {
         },
         knockback(dirX, dirZ, distance) {
             if (mode === 'walk') character.knockback(dirX, dirZ, distance);
+        },
+        setAirAssist(sink, speed) {
+            character.setAirAssist(sink, speed);
+        },
+        setSlopePower(on) {
+            character.setSlopePower(on);
+        },
+        teleportTo(x, z, yaw) {
+            placeAt(x, z, yaw);
+        },
+        get viewYaw() {
+            return follow.yaw;
+        },
+        get jumpHeld() {
+            return input.state.jumpHeld;
         },
         warpTo(x, z, yaw) {
             warped = true;

@@ -1,0 +1,788 @@
+/**
+ * アイテムの実行時状態と「退屈ゼロ」ディレクター（契約11）。
+ *
+ * 受け持ち:
+ *   拾得       接触で申告 → ホスト裁定（鍵・宝箱と同経路。先着が正・E73）
+ *   所持       2枠 + 収集品（地図の切れ端はスロットを使わない）
+ *   効果       どこでもドア / ステッキ / マント / 足袋 / 傘 / 霧玉
+ *   ディレクター ルートビーコン・コイン誘導・補給機・宝箱の花火・リード監視
+ *
+ * 決定性: 配置も補給機の時刻も **シード + マッチ時計** から決まる（実行時乱数は使わない）。
+ * リード監視の前倒しも「全員が同じように知っている情報」（残りビーコン数・クレート・鍵・
+ * 宝箱の開示段階）だけで判定するので、各クライアントで同じタイミングに発火する。
+ *
+ * 効果時間は**実時間**で数える（?matchspeed で早送りしてもアイテムの体感は変えない）。
+ */
+import type { Game } from '../game';
+import type { MapDraw } from '../ui/map';
+import type { World } from '../world';
+import { placeName } from '../world/landmarks';
+import type { MatchHud } from './hud';
+import type { MatchItemObjects } from './item-objects';
+import {
+    ITEMS,
+    LEAD_MIN,
+    MATCH_DEBUG,
+    buildItemLayout,
+    debugItems,
+    type ItemId,
+    type ItemLayout,
+} from './items';
+import type { MatchObjects } from './objects';
+import { PLANE_CLEARANCE, STAGES, type MatchLayout } from './rules';
+
+const TAU = Math.PI * 2;
+
+/** アイテムを拾える距離[m] と 高さの差[m] */
+const PICK_REACH = 2.4;
+const PICK_HEIGHT = 4.5;
+/** コインを拾える距離[m] */
+const COIN_REACH = 2.2;
+/** コインのダッシュ微強化（倍率と持続[s]） */
+const COIN_BOOST = 1.12;
+const COIN_BOOST_TIME = 10;
+/** 韋駄天の地下足袋の移動倍率 */
+const TABI_SPEED = 1.3;
+/** マント滑空: 落下速度の上限[m/s] と 水平速度[m/s] */
+const CAPE_SINK = 2.2;
+const CAPE_GLIDE = 12;
+/** 傘: 落下速度の上限[m/s] と 水平速度[m/s]。傘が開くのはこの高さ以上[m] */
+const UMBRELLA_SINK = 4.2;
+const UMBRELLA_GLIDE = 6.5;
+const UMBRELLA_ALTITUDE = 3;
+/** 地図の切れ端が揃う枚数 */
+const MAP_PIECES = 3;
+/** 補給機がエリアを横切る時間[s]（マッチ時計）と、投下するまでの時間[s] */
+const SUPPLY_FLIGHT = 18;
+const SUPPLY_RELEASE = 8;
+/** クレートの降下速度[m/s]（マッチ時計） */
+const CRATE_SINK = 26;
+/** 宝箱の花火: 第2収縮以降この間隔[s]で上げる */
+const CHEST_FIREWORK_PERIOD = 60;
+/** リードが2未満のときに前倒しした補給機が飛ぶまで[s] */
+const EARLY_LEAD_DELAY = 6;
+/** 補給機も残っていないときの追い花火の間隔[s] */
+const EARLY_FIREWORK_PERIOD = 20;
+/**
+ * ビーコンを消す距離[m]。加算合成の柱の中に入ると画面が真っ白になるうえ、
+ * そこまで来た人にはもう案内は要らない
+ */
+const BEACON_HIDE = 10;
+/** 遠隔プレイヤーの効果表示が切れるまでの猶予[ms]（送信は1.2秒ごと） */
+const FX_REFRESH = 1.2;
+const FX_HOLD = 2.2;
+
+/** どこでもドアの着地点を探す同心円（半径[m]と分割数） */
+const LAND_RINGS = [0, 5, 10, 17, 26, 38] as const;
+/** 立てるとみなす傾き（2m 離れた地点との高低差[m]） */
+const LAND_SLOPE = 1.7;
+
+export interface DirectorOptions {
+    world: World;
+    game: Game;
+    hud: MatchHud;
+    /** 花火の打ち上げ・輸送機の使い回し（契約10 のオブジェクト） */
+    objects: MatchObjects;
+    items: MatchItemObjects;
+    selfId: string;
+    /** マッチ時計の倍率（補給機の飛行に使う） */
+    speed: number;
+    /** アイテム index を取ったと申告する（ホスト裁定へ流す） */
+    claimItem(index: number): void;
+    /** 効果を全員へ配る（fx パケット） */
+    sendFx(effect: string, seconds: number): void;
+    announce(text: string): void;
+    nameOf(id: string): string;
+    /** 遠隔プレイヤーの巡回（未接続なら1人も来ない） */
+    eachPeer(visit: (id: string, x: number, y: number, z: number) => void): void;
+}
+
+/** 毎フレーム渡す進行状況 */
+export interface DirectorFrame {
+    /** マッチ時計[s] */
+    t: number;
+    /** 実時間の経過[s]（効果時間はこちらで数える） */
+    dt: number;
+    /** 宝箱の開示段階（時間による 0..3。地図3枚は director 側で上乗せする） */
+    reveal: number;
+    keyLive: boolean;
+    chestX: number;
+    chestY: number;
+    chestZ: number;
+    /** 拾得・使用ができる状態か（降下中・観戦・決着後は false） */
+    active: boolean;
+}
+
+export interface Director {
+    /**
+     * 全体マップの「1点を指す」入力を差し込む（どこでもドア）。
+     * マップはマッチより後に作られるので、main.ts が後から渡す。
+     * 開けたら true を返すこと（開けなければドアは消費されない）
+     */
+    attachMap(
+        pick: (onPick: (x: number, z: number) => void, onCancel: () => void) => boolean,
+    ): void;
+    /** マッチ開始。配置を作り直す（リマッチでも同じ経路・E76） */
+    start(layout: MatchLayout, seed: number): void;
+    /** ロビーへ戻す（全部消す） */
+    reset(): void;
+    update(frame: DirectorFrame): void;
+    drawMap(draw: MapDraw): void;
+    /** スロットを使う（HUD のボタン / 1・2キー） */
+    useSlot(index: number): void;
+    /** ホストの裁定を反映する */
+    applyTake(index: number, who: string): void;
+    /** 遠隔プレイヤーの効果表示（E77） */
+    applyFx(peerId: string, effect: string, seconds: number): void;
+    /** ステッキ・マップの探知から消えているか（霧玉・E77） */
+    isFogged(id: string): boolean;
+    /** アイテム由来の移動倍率（安置の減速と掛け合わせる） */
+    readonly speedScale: number;
+    /** 宝の地図の切れ端が3枚そろったか（宝箱の正確な位置を前倒しで開く） */
+    readonly mapReveal: boolean;
+    /** ?matchgoto=item 用: いちばん近い未取得アイテムの位置 */
+    nearestDrop(x: number, z: number): { x: number; z: number } | null;
+    dispose(): void;
+}
+
+export function createDirector(options: DirectorOptions): Director {
+    const { world, game, hud, objects, items, selfId, speed } = options;
+    const planeY = world.stats.maxElevation + PLANE_CLEARANCE;
+
+    let layout: ItemLayout | null = null;
+    /** 全体マップの1点指し（main.ts が attachMap で差す。未接続なら false を返すだけ） */
+    let pickOnMap: (
+        onPick: (x: number, z: number) => void,
+        onCancel: () => void,
+    ) => boolean = () => false;
+    /** 補給クレートの着地面の高さ[m]（配置ごとに1回だけ測る） */
+    const supplyGround = new Float32Array(8);
+    /** 0 = 場にある / 1 = 取られた / 2 = 自分が申告中（先行表示・E73） */
+    let taken = new Uint8Array(0);
+    let dropY = new Float32Array(0);
+    let coinTaken = new Uint8Array(0);
+    let coinY = new Float32Array(0);
+    let spotY = new Float32Array(0);
+    /** 補給機の飛来時刻[s]（前倒しで早まることがある）と、着地したか */
+    let supplyAt = new Float32Array(0);
+    let supplyLanded = new Uint8Array(0);
+    let supplyTold = new Uint8Array(0);
+
+    // --- 自分の所持と効果 ---
+    const slots: (ItemId | null)[] = [null, null];
+    /** 申告中のアイテム index → 入れたスロット（-1 = 地図の切れ端） */
+    const pending = new Map<number, number>();
+    let mapPieces = 0;
+    let stickLeft = 0;
+    let fogLeft = 0;
+    let boostLeft = 0;
+    let picking = false;
+    let canUse = false;
+    /** 遠隔へ配っている自分の空中状態 */
+    let airState = '';
+    let airSent = 0;
+    /** 遠隔プレイヤーの効果（id → 効果名と失効するローカル時刻[ms]） */
+    const peerFx = new Map<string, { effect: string; until: number }>();
+
+    // --- ディレクターの進行 ---
+    let fireworkTimer = 0;
+    let fireworkPeriod = CHEST_FIREWORK_PERIOD;
+    let leadWarned = false;
+    /** 直近にログへ出したリード数（?matchdebug のときだけ使う） */
+    let leadShown = -1;
+    let spin = 0;
+    let bob = 0;
+
+    // 巡回コールバックは使い回す（フレーム内で関数を作らない）
+    let scanX = 0;
+    let scanZ = 0;
+    let nearestPeer = '';
+    let nearestPeerDistance = 0;
+    let nearestPeerX = 0;
+    let nearestPeerZ = 0;
+    let peerNow = 0;
+    const findNearestPeer = (id: string, x: number, _y: number, z: number): void => {
+        if (isFoggedAt(id, peerNow)) return;
+        const d = Math.hypot(x - scanX, z - scanZ);
+        if (nearestPeer !== '' && d >= nearestPeerDistance) return;
+        nearestPeer = id;
+        nearestPeerDistance = d;
+        nearestPeerX = x;
+        nearestPeerZ = z;
+    };
+    const drawPeerFx = (id: string, x: number, y: number, z: number): void => {
+        const fx = peerFx.get(id);
+        if (!fx || fx.until < peerNow) return;
+        if (fx.effect === 'canopy') items.canopies.push(x, y + 2.9, z, 0, 1);
+        else if (fx.effect === 'glide') items.wings.push(x, y + 1.5, z, 0, 1);
+    };
+
+    function isFoggedAt(id: string, now: number): boolean {
+        if (id === selfId) return fogLeft > 0;
+        const fx = peerFx.get(id);
+        return !!fx && fx.effect === 'fog' && fx.until >= now;
+    }
+
+    /** 立てる地点へ寄せる（建物の中・急斜面へ落とさない・E74） */
+    const findStandable = (x: number, z: number): { x: number; z: number } => {
+        const surface = game.physics.surfaceHeight;
+        for (const radius of LAND_RINGS) {
+            const steps = radius === 0 ? 1 : 8;
+            for (let i = 0; i < steps; i++) {
+                const angle = (i / steps) * TAU;
+                const cx = x + Math.cos(angle) * radius;
+                const cz = z + Math.sin(angle) * radius;
+                const h = surface(cx, cz);
+                const slope = Math.max(
+                    Math.abs(h - surface(cx + 2, cz)),
+                    Math.abs(h - surface(cx - 2, cz)),
+                    Math.abs(h - surface(cx, cz + 2)),
+                    Math.abs(h - surface(cx, cz - 2)),
+                );
+                if (slope < LAND_SLOPE) return { x: cx, z: cz };
+            }
+        }
+        return { x, z };
+    };
+
+    /** 拾えたら true。同種2個目・枠が埋まっているときは拾わない（E75） */
+    const takeIntoBag = (index: number, id: ItemId): boolean => {
+        if (ITEMS[id].kind === 'collect') {
+            mapPieces++;
+            pending.set(index, -1);
+            return true;
+        }
+        if (slots[0] === id || slots[1] === id) return false;
+        const slot = slots[0] === null ? 0 : slots[1] === null ? 1 : -1;
+        if (slot < 0) return false;
+        slots[slot] = id;
+        pending.set(index, slot);
+        return true;
+    };
+
+    const dropFromBag = (index: number): void => {
+        const slot = pending.get(index);
+        if (slot === undefined) return;
+        pending.delete(index);
+        if (slot < 0) mapPieces = Math.max(0, mapPieces - 1);
+        else slots[slot] = null;
+    };
+
+    /** 場のアイテムの数え上げ（ビーコンの点灯・リード監視に使う） */
+    const spotAlive = (spot: number): boolean => {
+        if (!layout) return false;
+        const drops = layout.drops;
+        for (let i = 0; i < drops.length; i++) {
+            if (drops[i].spot === spot && taken[i] !== 1) return true;
+        }
+        return false;
+    };
+
+    // --- 使用 ---------------------------------------------------------------
+
+    const useDoor = (slot: number): void => {
+        if (picking) return;
+        picking = true;
+        const opened = pickOnMap(
+            (x, z) => {
+                picking = false;
+                // 使い切りなので、行き先が決まった瞬間にスロットを空ける
+                if (slots[slot] !== 'door') return;
+                slots[slot] = null;
+                const point = findStandable(x, z);
+                const dx = point.x - game.state.x;
+                const dz = point.z - game.state.z;
+                game.teleportTo(point.x, point.z, Math.atan2(-dx, -dz));
+                options.announce(`どこでもドアで${placeName(point.x, point.z)}へ移動した`);
+            },
+            () => {
+                // 指さずに閉じたらドアは減らない（次にまた使える）
+                picking = false;
+            },
+        );
+        if (!opened) {
+            picking = false;
+            options.announce('マップを開けないため、どこでもドアは使えなかった');
+        }
+    };
+
+    const useSlot = (index: number): void => {
+        if (!canUse || index < 0 || index > 1) return;
+        const id = slots[index];
+        if (!id) return;
+        const spec = ITEMS[id];
+        if (spec.kind === 'hold') {
+            options.announce(`${spec.name}は所持しているだけで効いている（${spec.hint}）`);
+            return;
+        }
+        if (id === 'door') {
+            useDoor(index);
+            return;
+        }
+        if (id === 'stick') {
+            slots[index] = null;
+            stickLeft = spec.seconds;
+            options.announce('尋ね人ステッキ — 方角が見えるようになった');
+            return;
+        }
+        if (id === 'fog') {
+            slots[index] = null;
+            fogLeft = spec.seconds;
+            options.sendFx('fog', spec.seconds);
+            objects.burst(game.state.x, game.state.y + 1.2, game.state.z, 0.56);
+            options.announce('住吉川の霧玉 — 45秒、探知から消える');
+        }
+    };
+
+    const onKeyDown = (e: KeyboardEvent): void => {
+        if (e.repeat || !canUse) return;
+        if (e.code === 'Digit1' || e.code === 'Numpad1') {
+            useSlot(0);
+            e.preventDefault();
+        } else if (e.code === 'Digit2' || e.code === 'Numpad2') {
+            useSlot(1);
+            e.preventDefault();
+        }
+    };
+    window.addEventListener('keydown', onKeyDown);
+
+    // --- 更新 ---------------------------------------------------------------
+
+    const updateSupplies = (frame: DirectorFrame): number => {
+        if (!layout) return 0;
+        let active = 0;
+        for (let i = 0; i < layout.supplies.length; i++) {
+            const supply = layout.supplies[i];
+            const at = supplyAt[i];
+            const t = frame.t;
+            if (t < at) continue;
+            const since = t - at;
+            if (!supplyTold[i]) {
+                supplyTold[i] = 1;
+                options.announce(`補給機が飛来！${placeName(supply.x, supply.z)}へ物資投下`);
+            }
+            // 機体（契約10 の輸送機を使い回す。降下フェーズが終わってから飛ぶ）
+            const angle = i * 2.3 + 0.7;
+            const dirX = Math.cos(angle);
+            const dirZ = Math.sin(angle);
+            if (since < SUPPLY_FLIGHT) {
+                const u = since / SUPPLY_FLIGHT - SUPPLY_RELEASE / SUPPLY_FLIGHT;
+                objects.setTransport(
+                    supply.x + dirX * u * 1500,
+                    planeY,
+                    supply.z + dirZ * u * 1500,
+                    Math.atan2(-dirX, -dirZ),
+                    true,
+                );
+            }
+            const ground = supplyGround[i];
+            const fall = since - SUPPLY_RELEASE;
+            if (fall < 0) {
+                active++;
+                continue;
+            }
+            const y = Math.max(ground, planeY - fall * CRATE_SINK);
+            const landed = y <= ground + 0.01;
+            if (landed && !supplyLanded[i]) supplyLanded[i] = 1;
+            // クレートは中身を取り切るまで置いておく
+            const emptied = !spotAlive(-1 - i);
+            if (!emptied) {
+                items.crates.push(supply.x, y, supply.z, i * 0.6, 1);
+                if (!landed) items.canopies.push(supply.x, y + 4.4, supply.z, i, 1.6);
+                if (Math.hypot(game.state.x - supply.x, game.state.z - supply.z) > BEACON_HIDE) {
+                    items.beacons.push(supply.x, ground, supply.z, 0, 1, 0x8fe3ff);
+                }
+                active++;
+            }
+        }
+        return active;
+    };
+
+    /** 空中での補助（マント・傘）を決めて、遠隔へ配る状態も更新する */
+    const updateAir = (frame: DirectorFrame): void => {
+        const hasCape = slots[0] === 'cape' || slots[1] === 'cape';
+        const hasUmbrella = slots[0] === 'umbrella' || slots[1] === 'umbrella';
+        const airborne = frame.active && game.state.mode === 'walk' && !game.state.grounded;
+        const altitude = game.state.y - world.getElevationAt(game.state.x, game.state.z);
+        let next = '';
+        if (airborne && hasCape && game.jumpHeld) next = 'glide';
+        else if (airborne && hasUmbrella && altitude > UMBRELLA_ALTITUDE) next = 'canopy';
+
+        if (next === 'glide') game.setAirAssist(CAPE_SINK, CAPE_GLIDE);
+        else if (next === 'canopy') game.setAirAssist(UMBRELLA_SINK, UMBRELLA_GLIDE);
+        else game.setAirAssist(0, 0);
+
+        // 自分の見た目
+        if (next === 'glide') {
+            items.wings.push(game.state.x, game.state.y + 1.5, game.state.z, game.state.yaw, 1);
+        } else if (next === 'canopy') {
+            items.canopies.push(game.state.x, game.state.y + 2.9, game.state.z, game.state.yaw, 1);
+        }
+
+        // 遠隔への配信（状態が変わったときと、続いている間は1.2秒ごと）
+        airSent -= frame.dt;
+        if (next !== airState || (next !== '' && airSent <= 0)) {
+            if (MATCH_DEBUG && next !== airState) {
+                console.info(
+                    `[director] 空中補助 ${airState || 'なし'} → ${next || 'なし'}` +
+                        `　高度 ${altitude.toFixed(1)}m　時刻 ${(performance.now() * 0.001).toFixed(2)}s`,
+                );
+            }
+            airState = next;
+            airSent = FX_REFRESH;
+            options.sendFx(next === '' ? 'off' : next, FX_HOLD);
+        }
+    };
+
+    /** リードの数（全員が同じように知っている「行く理由」だけを数える） */
+    const countLeads = (frame: DirectorFrame, crates: number): number => {
+        if (!layout) return 0;
+        let leads = crates;
+        for (let s = 0; s < layout.spots.length; s++) {
+            if (spotAlive(s)) leads++;
+        }
+        if (frame.keyLive) leads++;
+        if (frame.reveal >= 1) leads++;
+        return leads;
+    };
+
+    const update = (frame: DirectorFrame): void => {
+        canUse = frame.active && !picking;
+        if (!layout) return;
+        const { t, dt } = frame;
+        spin = (spin + dt * 1.6) % TAU;
+        bob += dt * 2.4;
+        stickLeft = Math.max(0, stickLeft - dt);
+        fogLeft = Math.max(0, fogLeft - dt);
+        boostLeft = Math.max(0, boostLeft - dt);
+        peerNow = performance.now();
+
+        const px = game.state.x;
+        const pz = game.state.z;
+        const py = game.state.y;
+
+        items.pickups.begin();
+        items.beacons.begin();
+        items.coins.begin();
+        items.crates.begin();
+        items.canopies.begin();
+        items.wings.begin();
+
+        // --- 補給機・クレート ---
+        const crates = updateSupplies(frame);
+
+        // --- 場のアイテム ---
+        const drops = layout.drops;
+        for (let i = 0; i < drops.length; i++) {
+            if (taken[i] === 1) continue;
+            const drop = drops[i];
+            // クレートの中身はクレートが着地するまで出ない
+            if (drop.spot < 0 && !supplyLanded[-1 - drop.spot]) continue;
+            const y = dropY[i] + 0.85 + Math.sin(bob + i) * 0.14;
+            items.pickups.push(drop.x, y, drop.z, spin + i, 1, ITEMS[drop.id].color);
+            if (taken[i] === 2 || !frame.active) continue;
+            if (Math.abs(py - dropY[i]) > PICK_HEIGHT) continue;
+            if (Math.hypot(px - drop.x, pz - drop.z) > PICK_REACH) continue;
+            if (!takeIntoBag(i, drop.id)) continue;
+            taken[i] = 2;
+            options.claimItem(i);
+            const spec = ITEMS[drop.id];
+            options.announce(
+                spec.kind === 'collect'
+                    ? `${spec.name}を拾った（${Math.min(mapPieces, MAP_PIECES)}/${MAP_PIECES}）`
+                    : `${spec.name}を手に入れた — ${spec.hint}`,
+            );
+        }
+
+        // --- ルートビーコン（取り尽くすと消灯） ---
+        for (let s = 0; s < layout.spots.length; s++) {
+            if (!spotAlive(s)) continue;
+            const spot = layout.spots[s];
+            if (Math.hypot(px - spot.x, pz - spot.z) <= BEACON_HIDE) continue;
+            items.beacons.push(spot.x, spotY[s], spot.z, 0, 1, 0xffd257);
+        }
+
+        // --- コイン（拾うと10秒だけダッシュ微強化） ---
+        const coins = layout.coins;
+        for (let i = 0; i < coins.length; i++) {
+            if (coinTaken[i]) continue;
+            const coin = coins[i];
+            items.coins.push(coin.x, coinY[i] + 0.75, coin.z, spin * 2 + i, 1);
+            if (!frame.active) continue;
+            if (Math.abs(py - coinY[i]) > PICK_HEIGHT) continue;
+            if (Math.hypot(px - coin.x, pz - coin.z) > COIN_REACH) continue;
+            coinTaken[i] = 1;
+            boostLeft = COIN_BOOST_TIME;
+        }
+
+        // --- 所持効果 ---
+        const hasTabi = slots[0] === 'tabi' || slots[1] === 'tabi';
+        game.setSlopePower(hasTabi);
+        updateAir(frame);
+        options.eachPeer(drawPeerFx);
+
+        // --- 宝箱の花火（第2収縮以降・気配演出） ---
+        if (t >= STAGES[1].from) {
+            fireworkTimer -= dt * speed;
+            if (fireworkTimer <= 0) {
+                fireworkTimer = fireworkPeriod;
+                objects.burst(frame.chestX, frame.chestY + 7, frame.chestZ, ((t * 0.07) % 1 + 1) % 1);
+            }
+        }
+
+        // --- リード監視（2未満なら次のイベントを前倒し） ---
+        const leads = countLeads(frame, crates);
+        if (MATCH_DEBUG && leads !== leadShown) {
+            leadShown = leads;
+            console.info(`[director] リード ${leads}（下限 ${LEAD_MIN}）t=${t.toFixed(0)}s`);
+        }
+        if (leads < LEAD_MIN && t > 30) {
+            if (!leadWarned) {
+                leadWarned = true;
+                let pulled = -1;
+                for (let i = 0; i < supplyAt.length; i++) {
+                    if (frame.t < supplyAt[i]) {
+                        supplyAt[i] = t + EARLY_LEAD_DELAY;
+                        pulled = i;
+                        break;
+                    }
+                }
+                if (pulled >= 0) {
+                    console.info(
+                        `[director] リード ${leads} < ${LEAD_MIN} → 補給機 #${pulled + 1} を t=${t.toFixed(0)}s へ前倒し`,
+                    );
+                    options.announce('しばらく動きが無い… 補給機が予定を早めて飛来する');
+                } else {
+                    fireworkPeriod = EARLY_FIREWORK_PERIOD;
+                    fireworkTimer = Math.min(fireworkTimer, 1);
+                    console.info(
+                        `[director] リード ${leads} < ${LEAD_MIN} → 宝箱の花火を ${EARLY_FIREWORK_PERIOD}s 間隔へ前倒し`,
+                    );
+                    options.announce('宝箱から花火が上がり始めた！');
+                }
+            }
+        } else {
+            leadWarned = false;
+        }
+
+        items.pickups.end();
+        items.beacons.end();
+        items.coins.end();
+        items.crates.end();
+        items.canopies.end();
+        items.wings.end();
+
+        // --- HUD ---
+        hud.setSlots(slotView(0), slotView(1));
+        hud.setBadge(badgeText());
+        updateArrow(frame);
+    };
+
+    const slotView = (index: number): { mark: string; name: string; note: string } | null => {
+        const id = slots[index];
+        if (!id) return null;
+        const spec = ITEMS[id];
+        return { mark: spec.mark, name: spec.name, note: spec.kind === 'hold' ? '常時' : '使用' };
+    };
+
+    const badgeText = (): string => {
+        const parts: string[] = [];
+        if (mapPieces > 0) parts.push(`🗺 ${Math.min(mapPieces, MAP_PIECES)}/${MAP_PIECES}`);
+        if (slots[0] === 'tabi' || slots[1] === 'tabi') parts.push(`👟 ×${TABI_SPEED}`);
+        if (slots[0] === 'cape' || slots[1] === 'cape') parts.push('🦅 Space長押しで滑空');
+        if (stickLeft > 0) parts.push(`🔮 ${Math.ceil(stickLeft)}s`);
+        if (fogLeft > 0) parts.push(`🌫 ${Math.ceil(fogLeft)}s`);
+        if (boostLeft > 0) parts.push(`🪙 ${Math.ceil(boostLeft)}s`);
+        return parts.join('　');
+    };
+
+    /** 尋ね人ステッキの方角矢印（画面基準の角度に直して HUD へ渡す） */
+    const updateArrow = (frame: DirectorFrame): void => {
+        if (stickLeft <= 0) {
+            hud.setArrow(null, '');
+            return;
+        }
+        scanX = game.state.x;
+        scanZ = game.state.z;
+        nearestPeer = '';
+        nearestPeerDistance = 0;
+        options.eachPeer(findNearestPeer);
+        const targetX = nearestPeer ? nearestPeerX : frame.chestX;
+        const targetZ = nearestPeer ? nearestPeerZ : frame.chestZ;
+        const dx = targetX - game.state.x;
+        const dz = targetZ - game.state.z;
+        const distance = Math.hypot(dx, dz);
+        // カメラの向きを基準にした画面上の角度（0 = 画面上 = 正面）
+        const bearing = Math.atan2(dx, -dz);
+        const screen = bearing - game.viewYaw;
+        hud.setArrow(
+            screen,
+            `${nearestPeer ? options.nameOf(nearestPeer) : '宝箱'} ${Math.round(distance)}m`,
+        );
+    };
+
+    return {
+        attachMap(pick) {
+            pickOnMap = pick;
+        },
+        start(nextLayout, seed) {
+            layout = buildItemLayout(seed, nextLayout, world.mapFeatures.roads);
+            const surface = game.physics.surfaceHeight;
+            taken = new Uint8Array(layout.drops.length);
+            dropY = new Float32Array(layout.drops.length);
+            for (let i = 0; i < layout.drops.length; i++) {
+                dropY[i] = surface(layout.drops[i].x, layout.drops[i].z);
+            }
+            coinTaken = new Uint8Array(layout.coins.length);
+            coinY = new Float32Array(layout.coins.length);
+            for (let i = 0; i < layout.coins.length; i++) {
+                coinY[i] = surface(layout.coins[i].x, layout.coins[i].z);
+            }
+            spotY = new Float32Array(layout.spots.length);
+            for (let i = 0; i < layout.spots.length; i++) {
+                spotY[i] = surface(layout.spots[i].x, layout.spots[i].z);
+            }
+            supplyAt = new Float32Array(layout.supplies.length);
+            supplyLanded = new Uint8Array(layout.supplies.length);
+            supplyTold = new Uint8Array(layout.supplies.length);
+            for (let i = 0; i < layout.supplies.length; i++) {
+                supplyAt[i] = layout.supplies[i].at;
+                supplyGround[i] = surface(layout.supplies[i].x, layout.supplies[i].z);
+            }
+            // デバッグ: ?matchitem= で最初から持たせる
+            for (const id of debugItems()) {
+                if (ITEMS[id].kind === 'collect') mapPieces = MAP_PIECES;
+                else if (slots[0] === null) slots[0] = id;
+                else if (slots[1] === null) slots[1] = id;
+            }
+            console.info(
+                `[director] アイテム ${layout.drops.length}（POI ${layout.spots.length}）` +
+                    `　コイン ${layout.coins.length}　補給機 ${layout.supplies.map((s) => `${s.at}s`).join('/')}`,
+            );
+        },
+        reset() {
+            layout = null;
+            slots[0] = null;
+            slots[1] = null;
+            pending.clear();
+            peerFx.clear();
+            mapPieces = 0;
+            stickLeft = 0;
+            fogLeft = 0;
+            boostLeft = 0;
+            picking = false;
+            canUse = false;
+            airState = '';
+            fireworkTimer = 0;
+            fireworkPeriod = CHEST_FIREWORK_PERIOD;
+            leadWarned = false;
+            leadShown = -1;
+            items.reset();
+            game.setAirAssist(0, 0);
+            game.setSlopePower(false);
+            hud.setSlots(null, null);
+            hud.setBadge('');
+            hud.setArrow(null, '');
+        },
+        update,
+        drawMap(draw) {
+            if (!layout) return;
+            const { ctx, screenX, screenY, scale, full } = draw;
+            // コインは全体マップでだけ薄く出す（ミニマップでは道路と喧嘩する）
+            if (full) {
+                ctx.fillStyle = 'rgba(255, 200, 60, 0.7)';
+                for (let i = 0; i < layout.coins.length; i++) {
+                    if (coinTaken[i]) continue;
+                    const coin = layout.coins[i];
+                    ctx.fillRect(screenX(coin.x) - 1.2, screenY(coin.z) - 1.2, 2.4, 2.4);
+                }
+            }
+            // 未取得のアイテムPOI
+            for (let s = 0; s < layout.spots.length; s++) {
+                if (!spotAlive(s)) continue;
+                const spot = layout.spots[s];
+                ctx.fillStyle = '#ffd257';
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 2 * scale;
+                ctx.beginPath();
+                ctx.arc(screenX(spot.x), screenY(spot.z), 5 * scale, 0, TAU);
+                ctx.fill();
+                ctx.stroke();
+            }
+            // 補給クレート
+            for (let i = 0; i < layout.supplies.length; i++) {
+                if (!supplyLanded[i] || !spotAlive(-1 - i)) continue;
+                const supply = layout.supplies[i];
+                ctx.fillStyle = '#8fe3ff';
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 2 * scale;
+                const size = 5 * scale;
+                ctx.beginPath();
+                ctx.rect(screenX(supply.x) - size, screenY(supply.z) - size, size * 2, size * 2);
+                ctx.fill();
+                ctx.stroke();
+            }
+        },
+        useSlot,
+        applyTake(index, who) {
+            if (!layout || index < 0 || index >= taken.length) return;
+            const mine = pending.has(index);
+            if (taken[index] === 1) {
+                if (mine) dropFromBag(index);
+                return;
+            }
+            taken[index] = 1;
+            if (who === selfId) {
+                pending.delete(index);
+                return;
+            }
+            if (mine) {
+                // 先を越された。先行表示していたぶんを取り消す（E73）
+                dropFromBag(index);
+                options.announce(`${options.nameOf(who)}が先にアイテムを拾った`);
+            }
+        },
+        applyFx(peerId, effect, seconds) {
+            if (effect === 'off') {
+                peerFx.delete(peerId);
+                return;
+            }
+            if (effect !== 'glide' && effect !== 'canopy' && effect !== 'fog') return;
+            const hold = Math.max(0, Math.min(120, seconds));
+            peerFx.set(peerId, { effect, until: performance.now() + hold * 1000 });
+            if (effect === 'fog') {
+                options.announce(`${options.nameOf(peerId)}が霧に紛れて消えた`);
+            }
+        },
+        isFogged(id) {
+            return isFoggedAt(id, performance.now());
+        },
+        get speedScale() {
+            const tabi = slots[0] === 'tabi' || slots[1] === 'tabi' ? TABI_SPEED : 1;
+            return tabi * (boostLeft > 0 ? COIN_BOOST : 1);
+        },
+        get mapReveal() {
+            return mapPieces >= MAP_PIECES;
+        },
+        nearestDrop(x, z) {
+            if (!layout) return null;
+            let best: { x: number; z: number } | null = null;
+            let bestDistance = Infinity;
+            for (let i = 0; i < layout.drops.length; i++) {
+                if (taken[i] === 1) continue;
+                if (layout.drops[i].spot < 0 && !supplyLanded[-1 - layout.drops[i].spot]) continue;
+                const d = Math.hypot(layout.drops[i].x - x, layout.drops[i].z - z);
+                if (d >= bestDistance) continue;
+                bestDistance = d;
+                best = { x: layout.drops[i].x, z: layout.drops[i].z };
+            }
+            return best;
+        },
+        dispose() {
+            window.removeEventListener('keydown', onKeyDown);
+            items.dispose();
+            game.setAirAssist(0, 0);
+            game.setSlopePower(false);
+        },
+    };
+}

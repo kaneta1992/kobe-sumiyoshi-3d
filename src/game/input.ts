@@ -20,6 +20,8 @@ export interface InputState {
     down: boolean;
     /** ジャンプの押下（フレーム末に消費する） */
     jump: boolean;
+    /** ジャンプを押しっぱなしか（マントの滑空・契約11。フレーム末に消さない） */
+    jumpHeld: boolean;
     /** スーパーマンモードの切り替え押下（?superman のときだけ使う・フレーム末に消費） */
     toggleFly: boolean;
     /** 視点の相対移動[px]。フレーム末に消費する */
@@ -72,6 +74,7 @@ export function createInput(element: HTMLElement): Input {
         brake: false,
         down: false,
         jump: false,
+        jumpHeld: false,
         toggleFly: false,
         lookX: 0,
         lookY: 0,
@@ -161,6 +164,7 @@ export function createInput(element: HTMLElement): Input {
                 // タッチUIの押下が溜まっていても、閉じた瞬間に暴発させない
                 touch?.consumeInteract();
                 touch?.consumeJump();
+                state.jumpHeld = false;
                 return;
             }
             let x = 0;
@@ -176,6 +180,8 @@ export function createInput(element: HTMLElement): Input {
             state.run = keyRun;
             state.brake = keyBrake;
             state.down = keyDown;
+            // 徒歩では Space の押しっぱなしが「ジャンプ長押し」（運転中はブレーキ）
+            state.jumpHeld = keyBrake;
             if (!touch) return;
             // タッチはキーボードに重ねる（両方ある端末でどちらも効く・E20）
             if (touch.stickX !== 0) state.moveX = touch.stickX;
@@ -184,6 +190,7 @@ export function createInput(element: HTMLElement): Input {
             if (touch.brake) state.brake = true;
             if (touch.consumeInteract()) state.interact = true;
             if (touch.consumeJump()) state.jump = true;
+            if (touch.jumpHeld) state.jumpHeld = true;
         },
         endFrame() {
             state.lookX = 0;
@@ -206,6 +213,7 @@ export function createInput(element: HTMLElement): Input {
             state.brake = false;
             state.down = false;
             state.jump = false;
+            state.jumpHeld = false;
             state.toggleFly = false;
             state.lookX = 0;
             state.lookY = 0;

@@ -44,17 +44,32 @@ export interface MapOverlayOptions {
     state: GameState;
     /** 遠隔プレイヤーの巡回。未接続なら何も渡さなければよい（E52） */
     eachRemote(
-        visit: (x: number, z: number, yaw: number, driving: boolean, color: number) => void,
+        visit: (
+            x: number,
+            z: number,
+            yaw: number,
+            driving: boolean,
+            color: number,
+            id: string,
+        ) => void,
     ): void;
     /** 全体マップの開閉通知。ゲーム入力の遮断に使う（E49） */
     onToggle(open: boolean): void;
     /** マッチの安置円・目標マーカー（契約10）。?match でないときは null */
     drawMatch?: ((draw: MapDraw) => void) | null;
+    /** 探知から消えている相手はマーカーを出さない（霧玉・契約11） */
+    hiddenPeer?: ((id: string) => boolean) | null;
 }
 
 export interface MapOverlay {
     /** 毎フレーム呼ぶ。中で 10Hz に間引く */
     update(dt: number): void;
+    /**
+     * 全体マップを開いて、次にタップ/クリックした地点をワールド座標で返す
+     * （どこでもドア・契約11）。閉じられたら onPick の代わりに onCancel が呼ばれる。
+     * すでに1点指しの最中なら false を返す
+     */
+    pickPoint(onPick: (x: number, z: number) => void, onCancel: () => void): boolean;
     dispose(): void;
 }
 
@@ -269,7 +284,15 @@ function buildBaseMap(world: World, size: number): HTMLCanvasElement {
 // --- 表示 -----------------------------------------------------------------
 
 export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
-    const { world, quality, state, eachRemote, onToggle, drawMatch = null } = options;
+    const {
+        world,
+        quality,
+        state,
+        eachRemote,
+        onToggle,
+        drawMatch = null,
+        hiddenPeer = null,
+    } = options;
     const base = buildBaseMap(world, quality.preset === 'mobile' ? BASE_PX_MOBILE : BASE_PX_DESKTOP);
     const basePerMeter = base.width / (AREA_HALF * 2);
 
@@ -522,8 +545,12 @@ export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
         yaw: number,
         driving: boolean,
         color: number,
+        id: string,
     ): void => {
-        if (markerCtx) drawPlayer(markerCtx, x, z, yaw, driving, cssColor(color), markerScale);
+        if (!markerCtx) return;
+        // 霧玉で探知から消えている相手は出さない（契約11・E77）
+        if (hiddenPeer?.(id)) return;
+        drawPlayer(markerCtx, x, z, yaw, driving, cssColor(color), markerScale);
     };
 
     const drawMini = (): void => {
@@ -567,8 +594,22 @@ export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
     };
 
     // --- 開閉 ---
+    /** 1点指しの受け取り先（どこでもドア・契約11）。閉じたら取り消す */
+    let pickHandler: ((x: number, z: number) => void) | null = null;
+    let pickCancel: (() => void) | null = null;
+    const HINT_MOVE = 'ドラッグ: 移動　ホイール/ピンチ: 拡大縮小　Esc: 閉じる';
+    const HINT_PICK = '🚪 飛びたい場所をタップ／クリック　Esc: やめる';
+
     const setOpen = (value: boolean): void => {
         if (open === value) return;
+        if (!value) {
+            // 指さずに閉じた = 取り消し。呼び側がアイテムを消費しないで済むよう必ず知らせる
+            const cancel = pickHandler ? pickCancel : null;
+            pickHandler = null;
+            pickCancel = null;
+            hint.textContent = HINT_MOVE;
+            cancel?.();
+        }
         open = value;
         full.classList.toggle('hidden', !open);
         mini.classList.toggle('dimmed', open);
@@ -615,11 +656,19 @@ export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
         view.cz = worldZ - (py - view.h / 2) / view.ppm;
     };
 
+    /** タップ判定（1点指しのときだけ使う）: 押した位置と時刻 */
+    let downX = 0;
+    let downY = 0;
+    let downAt = 0;
+
     const onCanvasDown = (e: PointerEvent): void => {
         if (idA < 0) {
             idA = e.pointerId;
             apx = e.clientX;
             apy = e.clientY;
+            downX = e.clientX;
+            downY = e.clientY;
+            downAt = performance.now();
         } else if (idB < 0) {
             idB = e.pointerId;
             bpx = e.clientX;
@@ -670,8 +719,20 @@ export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
 
     // 指が1本離れても、残った指は次の move から取り直すので飛ばない（E54）
     const onCanvasUp = (e: PointerEvent): void => {
-        if (e.pointerId === idA) idA = -1;
+        const wasA = e.pointerId === idA;
+        if (wasA) idA = -1;
         else if (e.pointerId === idB) idB = -1;
+        // 1点指し（どこでもドア）: 引きずっていない単発のタップだけを拾う
+        if (!pickHandler || !wasA || idB >= 0) return;
+        if (performance.now() - downAt > TAP_TIME) return;
+        if (Math.hypot(e.clientX - downX, e.clientY - downY) > TAP_SLOP) return;
+        const handler = pickHandler;
+        const worldX = view.cx + (e.clientX - view.w / 2) / view.ppm;
+        const worldZ = view.cz + (e.clientY - view.h / 2) / view.ppm;
+        pickHandler = null;
+        pickCancel = null;
+        setOpen(false);
+        handler(clamp(worldX, -AREA_HALF, AREA_HALF), clamp(worldZ, -AREA_HALF, AREA_HALF));
     };
 
     const onWheel = (e: WheelEvent): void => {
@@ -751,6 +812,15 @@ export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
             timer = 0;
             if (open) drawFull();
             else drawMini();
+        },
+        pickPoint(onPick, onCancel) {
+            if (pickHandler) return false;
+            // すでに開いていると setOpen が何もしないので、先に開けてから受け取り先を立てる
+            setOpen(true);
+            pickHandler = onPick;
+            pickCancel = onCancel;
+            hint.textContent = HINT_PICK;
+            return true;
         },
         dispose() {
             window.removeEventListener('keydown', onKeyDown);

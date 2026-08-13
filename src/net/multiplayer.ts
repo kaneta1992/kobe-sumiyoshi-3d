@@ -88,9 +88,15 @@ type Snapshot = {
  *   open   宝箱のチャンネリング開始（実況用）
  *   bump   体当たり（相手のチャンネリングを中断させる）
  *   vote   リマッチ投票
+ *   iclaim アイテム取得の申告（契約11。鍵・宝箱と同じ経路）
+ *   iaward アイテム取得の裁定（ホストが出す。これが正・E73）
+ *   fx     使用したアイテムの効果（滑空・傘・霧玉の遠隔表示・E77）
+ *
+ * 契約11 で増えたのは種別3つとフィールド3つだけで、既存の種別は形も意味も変えていない。
+ * 知らない種別は受け手の switch がそのまま素通りさせるので、後方互換は保たれる
  */
 export type MatchPacket = {
-    k: 'start' | 'claim' | 'award' | 'open' | 'bump' | 'vote';
+    k: 'start' | 'claim' | 'award' | 'open' | 'bump' | 'vote' | 'iclaim' | 'iaward' | 'fx';
     /** マッチ通番。前のマッチのパケットを取り違えないための世代（E67） */
     n: number;
     /** start: マッチシード */
@@ -108,6 +114,12 @@ export type MatchPacket = {
     /** bump: 押し出す水平方向 */
     dx?: number;
     dz?: number;
+    /** iclaim / iaward: 場のアイテムの番号（配置の添字・契約11） */
+    i?: number;
+    /** fx: 効果名（glide / canopy / fog / off） */
+    e?: string;
+    /** fx: 効果が続く秒数 */
+    d?: number;
 };
 
 /** ピアごとの受信バッファ。配列は参加時に確保し、以後は書き換えるだけ */
@@ -132,8 +144,9 @@ interface Peer {
     driving: boolean;
     /** マーカーの色（ピアIDのハッシュ由来。3Dのゴーストと同じ色） */
     color: number;
-    /** 直近に描いた補間位置。2Dマップ（契約09）が読む */
+    /** 直近に描いた補間位置。2Dマップ（契約09）とマッチ（契約10/11）が読む */
     drawX: number;
+    drawY: number;
     drawZ: number;
     drawYaw: number;
     /** このフレームに描かれたか（未受信・スロット無しのピアはマップにも出さない） */
@@ -148,10 +161,20 @@ export interface Multiplayer {
      * 配列を作らずコールバックで渡す（フレーム内アロケーションを増やさない）
      */
     eachPlayer(
-        visit: (x: number, z: number, yaw: number, driving: boolean, color: number) => void,
+        visit: (
+            x: number,
+            z: number,
+            yaw: number,
+            driving: boolean,
+            color: number,
+            id: string,
+        ) => void,
     ): void;
-    /** 描かれている遠隔プレイヤーを ID つきで巡回する（体当たりの相手探し・契約10） */
-    eachPeerPosition(visit: (id: string, x: number, z: number) => void): void;
+    /**
+     * 描かれている遠隔プレイヤーを ID つきで巡回する（体当たりの相手探し・契約10 /
+     * ステッキの探知・効果表示・契約11）
+     */
+    eachPeerPosition(visit: (id: string, x: number, y: number, z: number) => void): void;
     /** 自分のピアID（ホスト選出に使う・契約10） */
     readonly selfId: string;
     /** 自分を含む全ピアIDの昇順リスト。毎回同じ配列を詰め直して返す */
@@ -259,6 +282,7 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
             driving: false,
             color,
             drawX: 0,
+            drawY: 0,
             drawZ: 0,
             drawYaw: 0,
             drawn: false,
@@ -358,6 +382,7 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
         const speed = peer.s[ai] + (peer.s[bi] - peer.s[ai]) * k;
         remote.show(peer.slot, peer.driving, x, y, z, yaw, speed, dt);
         peer.drawX = x;
+        peer.drawY = y;
         peer.drawZ = z;
         peer.drawYaw = yaw;
         peer.drawn = true;
@@ -477,13 +502,13 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
         eachPlayer(visit) {
             for (const peer of peers) {
                 if (!peer.drawn) continue;
-                visit(peer.drawX, peer.drawZ, peer.drawYaw, peer.driving, peer.color);
+                visit(peer.drawX, peer.drawZ, peer.drawYaw, peer.driving, peer.color, peer.id);
             }
         },
         eachPeerPosition(visit) {
             for (const peer of peers) {
                 if (!peer.drawn) continue;
-                visit(peer.id, peer.drawX, peer.drawZ);
+                visit(peer.id, peer.drawX, peer.drawY, peer.drawZ);
             }
         },
         selfId,

@@ -79,12 +79,14 @@ export function autoStart(): boolean {
 export const GOTO_STANDOFF = 3;
 
 /**
- * ?matchgoto=key|chest 目標の手前へテレポートする（デバッグ限定・鍵→宝箱の通し検証用）。
+ * ?matchgoto=key|chest|item 目標の手前へテレポートする（デバッグ限定）。
+ * key/chest は鍵→宝箱の通し検証用、item は「いちばん近い未取得アイテム」へ次々に飛ぶ
+ * （拾うたびに次のアイテムへ自動で移る・契約11の検証用）。
  * 無指定と不正値は null なので、通常フローには何も出ない
  */
-export function matchGoto(): 'key' | 'chest' | null {
+export function matchGoto(): 'key' | 'chest' | 'item' | null {
     const value = new URLSearchParams(location.search).get('matchgoto');
-    return value === 'key' || value === 'chest' ? value : null;
+    return value === 'key' || value === 'chest' || value === 'item' ? value : null;
 }
 
 // --- 決定的乱数 -------------------------------------------------------------

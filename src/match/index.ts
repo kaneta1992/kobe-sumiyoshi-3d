@@ -23,10 +23,12 @@ import { AREA_HALF } from '../config';
 import type { Game } from '../game';
 import type { MatchPacket, Multiplayer } from '../net/multiplayer';
 import type { QualitySettings } from '../quality';
-import type { MapDraw } from '../ui/map';
+import type { MapDraw, MapOverlay } from '../ui/map';
 import type { World } from '../world';
 import { placeName } from '../world/landmarks';
+import { createDirector, type Director, type DirectorFrame } from './director';
 import { createMatchHud } from './hud';
+import { createMatchItemObjects } from './item-objects';
 import { createMatchObjects, type MatchObjects } from './objects';
 import {
     BUMP_COOLDOWN,
@@ -88,6 +90,10 @@ export interface Match {
     update(dt: number): void;
     /** 2Dマップのオーバーレイ層（契約09 の drawMatch）へ渡す */
     drawMap(draw: MapDraw): void;
+    /** 全体マップを後から渡す（どこでもドアの行き先指定・契約11） */
+    attachMap(map: MapOverlay): void;
+    /** 霧玉で探知から消えている相手か（マップのマーカー抑止・契約11） */
+    isFogged(id: string): boolean;
     dispose(): void;
 }
 
@@ -109,13 +115,28 @@ function validPacket(packet: MatchPacket): boolean {
             Number.isFinite(packet.dz)
         );
     }
+    if (packet.k === 'iclaim') return Number.isInteger(packet.i) && (packet.i as number) >= 0;
+    if (packet.k === 'iaward') {
+        return (
+            Number.isInteger(packet.i) &&
+            (packet.i as number) >= 0 &&
+            typeof packet.who === 'string' &&
+            packet.who.length <= 128
+        );
+    }
+    if (packet.k === 'fx') {
+        return typeof packet.e === 'string' && packet.e.length <= 16 && Number.isFinite(packet.d);
+    }
     return true;
 }
 
 export function createMatch(options: MatchOptions): Match {
     const { scene, world, quality, game, net } = options;
-    const hud = createMatchHud();
+    /** アイテムとディレクター（契約11）。下の裁定ヘルパーが揃ってから作る */
+    let director: Director | null = null;
+    const hud = createMatchHud((index) => director?.useSlot(index));
     const objects: MatchObjects = createMatchObjects(scene, quality);
+    const itemObjects = createMatchItemObjects(scene, quality);
     const speed = matchSpeed();
     /** デバッグテレポートの指定（?matchgoto）。null = 無効（通常フロー） */
     const gotoParam = matchGoto();
@@ -145,8 +166,24 @@ export function createMatch(options: MatchOptions): Match {
     let resultAt = 0;
     /** デバッグテレポートで最後に送った先（同じ目標へ何度も飛ばさない） */
     let gotoSent: Prize | null = null;
+    /** ?matchgoto=item で最後に向かったアイテムの位置 */
+    let gotoItemX = NaN;
+    let gotoItemZ = NaN;
+    /** ディレクターへ毎フレーム渡す進行状況（使い回して new を作らない） */
+    const frame: DirectorFrame = {
+        t: 0,
+        dt: 0,
+        reveal: 0,
+        keyLive: false,
+        chestX: 0,
+        chestY: 0,
+        chestZ: 0,
+        active: false,
+    };
     const votes = new Set<string>();
     const claimed = new Map<Prize, number>();
+    /** 申告済みのアイテム番号 → 申告時刻[ms]（裁定が返らないときの再申告用・契約11） */
+    const itemClaimed = new Map<number, number>();
     /** 一度きりの実況・演出を出したかどうか */
     const told = new Set<string>();
 
@@ -189,8 +226,10 @@ export function createMatch(options: MatchOptions): Match {
         gotoSent = null;
         votes.clear();
         claimed.clear();
+        itemClaimed.clear();
         told.clear();
         objects.reset();
+        director?.reset();
         hud.setChannel(-1);
         hud.setVignette(0);
         game.sky.cancel();
@@ -247,6 +286,8 @@ export function createMatch(options: MatchOptions): Match {
         phase = 'live';
         hud.showPanel(null);
         game.setInputSuspended(false, 'match');
+        // アイテム・コイン・補給機の配置（同じシードから全員が同じものを作る・契約11）
+        director?.start(layout, seed);
         // 検証時にどこへ行けばよいかを追えるようにしておく（配置は全員同じはず）
         console.info(
             `[match] 開始 seed=${seed} 最終安置=${layout.finalPlace} 速度x${speed}` +
@@ -295,6 +336,42 @@ export function createMatch(options: MatchOptions): Match {
         if (isHost()) award(prize, selfId);
         else send({ k: 'claim', n: appliedGeneration, w: prize });
     };
+
+    // --- アイテムの裁定（契約11。鍵・宝箱とまったく同じ経路） ---
+
+    /** 裁定を確定させる（再申告の対象からも外す） */
+    const settleItem = (index: number, who: string): void => {
+        itemClaimed.delete(index);
+        director?.applyTake(index, who);
+    };
+
+    const awardItem = (index: number, who: string): void => {
+        send({ k: 'iaward', n: appliedGeneration, i: index, who });
+        settleItem(index, who);
+    };
+
+    const claimItem = (index: number): void => {
+        itemClaimed.set(index, performance.now());
+        if (isHost()) awardItem(index, selfId);
+        else send({ k: 'iclaim', n: appliedGeneration, i: index });
+    };
+
+    director = createDirector({
+        world,
+        game,
+        hud,
+        objects,
+        items: itemObjects,
+        selfId,
+        speed,
+        claimItem,
+        sendFx: (effect, seconds) => send({ k: 'fx', n: appliedGeneration, e: effect, d: seconds }),
+        announce: (text) => hud.announce(text),
+        nameOf,
+        eachPeer: (visit) => net?.eachPeerPosition(visit),
+    });
+    /** 上で作り終えたので、以降は null にならない */
+    const dir: Director = director;
 
     // --- リザルトとリマッチ --------------------------------------------------
 
@@ -353,6 +430,16 @@ export function createMatch(options: MatchOptions): Match {
                 channel = 0;
                 hud.setChannel(-1);
                 break;
+            case 'iclaim':
+                if (isHost() && packet.n === appliedGeneration) awardItem(packet.i as number, peerId);
+                break;
+            case 'iaward':
+                if (peerId !== net?.peerIds()[0]) return;
+                if (packet.n === appliedGeneration) settleItem(packet.i as number, packet.who as string);
+                break;
+            case 'fx':
+                if (packet.n === appliedGeneration) dir.applyFx(peerId, packet.e as string, packet.d as number);
+                break;
             case 'vote':
                 votes.add(peerId);
                 break;
@@ -366,7 +453,7 @@ export function createMatch(options: MatchOptions): Match {
     let bumpTarget: string | null = null;
     let bumpDirX = 0;
     let bumpDirZ = 0;
-    const findBumpTarget = (id: string, x: number, z: number): void => {
+    const findBumpTarget = (id: string, x: number, _y: number, z: number): void => {
         const dx = x - bumpFromX;
         const dz = z - bumpFromZ;
         const distance = Math.hypot(dx, dz);
@@ -445,7 +532,8 @@ export function createMatch(options: MatchOptions): Match {
         const pz = game.state.z;
         const fromCenter = Math.hypot(px - zone.x, pz - zone.z);
         const outside = fromCenter > zone.r;
-        game.setSpeedScale(outside ? OUTSIDE_SPEED : 1);
+        // 安置の外の減速と、アイテムの加速（足袋・コイン）を掛け合わせる（契約11）
+        game.setSpeedScale((outside ? OUTSIDE_SPEED : 1) * dir.speedScale);
         hud.setVignette(outside ? Math.min(0.85, 0.35 + (fromCenter - zone.r) / 600) : 0);
 
         if (zone.until > 0 && zone.until < 12 / speed + 8) {
@@ -457,7 +545,9 @@ export function createMatch(options: MatchOptions): Match {
         if (zone.shrinking) announceOnce(`shrink${zone.stage}`, '安置が縮み始めた！中へ入れ');
 
         // --- 段階開示（契約6: 四半区画 → 円 → 正確な位置） ---
-        const reveal = t >= REVEAL_AT[2] ? 3 : t >= REVEAL_AT[1] ? 2 : t >= REVEAL_AT[0] ? 1 : 0;
+        // 宝の地図の切れ端を3枚集めていれば、時間を待たずに正確な位置が出る（契約11）
+        const timeReveal = t >= REVEAL_AT[2] ? 3 : t >= REVEAL_AT[1] ? 2 : t >= REVEAL_AT[0] ? 1 : 0;
+        const reveal = dir.mapReveal ? 3 : timeReveal;
         if (reveal >= 1) {
             announceOnce(
                 'reveal1',
@@ -546,11 +636,37 @@ export function createMatch(options: MatchOptions): Match {
             if (isHost()) award(prize, selfId);
             else send({ k: 'claim', n: appliedGeneration, w: prize });
         }
+        for (const [index, at] of itemClaimed) {
+            if (now - at < CLAIM_RETRY * 1000) continue;
+            itemClaimed.set(index, now);
+            if (isHost()) awardItem(index, selfId);
+            else send({ k: 'iclaim', n: appliedGeneration, i: index });
+        }
 
         // --- デバッグテレポート（?matchgoto。指定が無ければ何も起きない） ---
         // 行き先は「いまの目標」: 鍵を持っていれば宝箱、まだなら鍵。目標が変わったときだけ飛ぶ。
         // 飛んだ先は R の戻り先にもなる（game.warpTo）ので、回収が中断されても手前へ戻れる
-        if (gotoParam && !spectator && !winner) {
+        // ?matchgoto=item は「いちばん近い未取得アイテム」を追いかける。拾うと次の
+        // アイテムが最寄りになるので、そのまま次々に飛べる（アイテムの通し確認用）
+        if (gotoParam === 'item' && !spectator && !winner) {
+            const near = dir.nearestDrop(px, pz);
+            if (near && (near.x !== gotoItemX || near.z !== gotoItemZ)) {
+                gotoItemX = near.x;
+                gotoItemZ = near.z;
+                board = 'landed';
+                const awayX = px - near.x;
+                const awayZ = pz - near.z;
+                const away = Math.hypot(awayX, awayZ);
+                const ux = away > 1e-3 ? awayX / away : 1;
+                const uz = away > 1e-3 ? awayZ / away : 0;
+                game.warpTo(
+                    near.x + ux * GOTO_STANDOFF,
+                    near.z + uz * GOTO_STANDOFF,
+                    Math.atan2(ux, uz),
+                );
+                hud.announce('デバッグ: 次のアイテムの手前へ移動（R で戻る）');
+            }
+        } else if (gotoParam && !spectator && !winner) {
             const target: Prize = gotoParam === 'chest' || keyOwner === selfId ? 'chest' : 'key';
             if (target !== gotoSent) {
                 gotoSent = target;
@@ -575,6 +691,17 @@ export function createMatch(options: MatchOptions): Match {
                 );
             }
         }
+
+        // --- アイテムとディレクター（契約11。輸送機の姿勢を上書きするので最後に回す） ---
+        frame.t = t;
+        frame.dt = dt;
+        frame.reveal = reveal;
+        frame.keyLive = keyLive;
+        frame.chestX = layout.chest.x;
+        frame.chestY = chestY;
+        frame.chestZ = layout.chest.z;
+        frame.active = !spectator && !winner && board === 'landed';
+        dir.update(frame);
 
         // --- 状態行 ---
         const goal = spectator
@@ -606,6 +733,10 @@ export function createMatch(options: MatchOptions): Match {
             // 回収者の頭上（＝宝箱の位置）で打ち上げる
             objects.burst(layout.chest.x, chestY + 9, layout.chest.z, ((now * 0.0004) % 1 + 1) % 1);
         }
+        // 決着後もビーコン・補給機は画に残す（拾得と使用だけ止める）
+        frame.dt = dt;
+        frame.active = false;
+        dir.update(frame);
         const elapsed = (now - resultAt) * 0.001;
         hud.setStatus(`リザルト　${nameOf(winner)}の勝利　${clock(winnerTime)}`);
         // 全員の投票がそろうか10秒でホストが次を始める
@@ -658,9 +789,19 @@ export function createMatch(options: MatchOptions): Match {
                 ctx.restore();
             }
 
-            // 宝箱のヒント（段階開示）
-            const reveal =
-                matchTime >= REVEAL_AT[2] ? 3 : matchTime >= REVEAL_AT[1] ? 2 : matchTime >= REVEAL_AT[0] ? 1 : 0;
+            // アイテムPOI・コイン・クレート（契約11）は安置円の下に敷く
+            dir.drawMap(draw);
+
+            // 宝箱のヒント（段階開示。地図3枚で正確な位置を前倒し・契約11）
+            const reveal = dir.mapReveal
+                ? 3
+                : matchTime >= REVEAL_AT[2]
+                  ? 3
+                  : matchTime >= REVEAL_AT[1]
+                    ? 2
+                    : matchTime >= REVEAL_AT[0]
+                      ? 1
+                      : 0;
             if (reveal === 1) {
                 const qx = chest.x < 0 ? -AREA_HALF : 0;
                 const qz = chest.z < 0 ? -AREA_HALF : 0;
@@ -720,10 +861,19 @@ export function createMatch(options: MatchOptions): Match {
             }
         },
 
+        attachMap(map) {
+            dir.attachMap((onPick, onCancel) => map.pickPoint(onPick, onCancel));
+        },
+
+        isFogged(id) {
+            return dir.isFogged(id);
+        },
+
         dispose() {
             net?.onMatch(null);
             hud.dispose();
             objects.dispose();
+            dir.dispose();
             game.setSpeedScale(1);
             game.setInputSuspended(false, 'match');
         },

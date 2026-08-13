@@ -188,7 +188,11 @@ async function start(): Promise<void> {
                     onToggle: (open) => active.setInputSuspended(open, 'map'),
                     // 安置円・目標マーカー（契約10）。?match でなければ描かない
                     drawMatch: overlay ? (draw) => overlay.drawMap(draw) : null,
+                    // 霧玉を使った相手はマップからも消える（契約11・E77）
+                    hiddenPeer: overlay ? (id) => overlay.isFogged(id) : null,
                 });
+                // どこでもドアの行き先指定に全体マップを使う（契約11）
+                overlay?.attachMap(map);
             } catch (err) {
                 // 物理を用意できなくても真っ白にはしない（E25）
                 console.error('[game] 物理の初期化に失敗しました', err);

@@ -276,6 +276,13 @@
                 inset: 0;
                 z-index: 18;
                 pointer-events: none;
+                /* アイテム枠の下端。タッチUIがある画面ではボタン群の上へ逃がす（E78） */
+                --match-bottom: 18px;
+            }
+            @media (pointer: coarse), (max-width: 760px) {
+                #match-ui {
+                    --match-bottom: 200px;
+                }
             }
             /* 安置の外にいる間の赤い縁。減速していることを画で伝える */
             #match-ui .match-vignette {
@@ -356,6 +363,97 @@
                 margin-top: 6px;
                 font-size: 12px;
                 text-shadow: 0 1px 3px rgba(0, 0, 0, 0.75);
+            }
+            /* 効いているアイテムの残り時間・地図の切れ端（契約11） */
+            #match-ui .match-badge {
+                padding: 3px 12px;
+                border-radius: 999px;
+                background: rgba(24, 58, 110, 0.6);
+                font-size: 12px;
+                letter-spacing: 0.06em;
+                font-variant-numeric: tabular-nums;
+            }
+            /* 尋ね人ステッキの方角矢印（契約11） */
+            #match-ui .match-arrow {
+                position: absolute;
+                left: 50%;
+                bottom: calc(env(safe-area-inset-bottom, 0px) + var(--match-bottom) + 92px);
+                transform: translateX(-50%);
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 2px;
+            }
+            #match-ui .match-arrow-dial {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                width: 54px;
+                height: 54px;
+                border-radius: 50%;
+                background: rgba(12, 16, 22, 0.6);
+                border: 2px solid rgba(155, 123, 255, 0.85);
+                color: #d8caff;
+                font-size: 24px;
+                line-height: 1;
+            }
+            #match-ui .match-arrow-label {
+                padding: 2px 8px;
+                border-radius: 999px;
+                background: rgba(12, 16, 22, 0.66);
+                font-size: 11px;
+                font-variant-numeric: tabular-nums;
+            }
+            /* 所持アイテム2枠。既存のタッチ操作系（左スティック・右ボタン）と
+               重ならないよう、画面下中央でモバイルだけ持ち上げる（E78） */
+            #match-ui .match-slots {
+                position: absolute;
+                left: 50%;
+                bottom: calc(env(safe-area-inset-bottom, 0px) + var(--match-bottom));
+                transform: translateX(-50%);
+                display: flex;
+                gap: 10px;
+                pointer-events: auto;
+            }
+            #match-ui .match-slot {
+                position: relative;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                width: 116px;
+                height: 68px;
+                padding: 0 6px;
+                border-radius: 12px;
+                border: 1px solid rgba(255, 255, 255, 0.28);
+                background: rgba(12, 16, 22, 0.66);
+                cursor: pointer;
+                touch-action: none;
+                text-align: center;
+            }
+            #match-ui .match-slot.empty {
+                opacity: 0.4;
+                cursor: default;
+            }
+            #match-ui .match-slot-key {
+                position: absolute;
+                top: 3px;
+                left: 6px;
+                font-size: 10px;
+                color: #93a1b2;
+            }
+            #match-ui .match-slot-mark {
+                font-size: 19px;
+                line-height: 1.1;
+            }
+            #match-ui .match-slot-name {
+                font-size: 11px;
+                font-weight: 600;
+                letter-spacing: 0.02em;
+            }
+            #match-ui .match-slot-note {
+                font-size: 10px;
+                color: #93a1b2;
             }
             #match-ui .match-panel {
                 position: absolute;

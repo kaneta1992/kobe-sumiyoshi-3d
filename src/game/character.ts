@@ -38,6 +38,12 @@ const GROUND_STICK = 2;
 const JUMP_SPEED = 4.6;
 /** 体当たりで押し飛ばす時間[s]（契約10）。この間だけ移動へ押し出しを上乗せする */
 const KNOCKBACK_TIME = 0.28;
+/** 通常の登坂限界[deg] と 自動スライドの開始角[deg] */
+const SLOPE_CLIMB = 52;
+const SLOPE_SLIDE = 54;
+/** 韋駄天の地下足袋を持っているときの登坂限界[deg]（急坂で止まらない・契約11） */
+const SLOPE_CLIMB_POWER = 72;
+const SLOPE_SLIDE_POWER = 74;
 
 export interface Character {
     collider: RAPIER.Collider;
@@ -63,6 +69,14 @@ export interface Character {
      * KNOCKBACK_TIME 秒かけて押し出す。壁があれば当然そこで止まる（移動は controller 経由）
      */
     knockback(dirX: number, dirZ: number, distance: number): void;
+    /**
+     * 空中での補助（契約11 のマント・傘）。接地していない間だけ効く。
+     * sink  = 落下速度の上限[m/s]（0 = 通常の重力のまま）
+     * speed = 水平の目標速度[m/s]（0 = 通常の歩き/走り）
+     */
+    setAirAssist(sink: number, speed: number): void;
+    /** 韋駄天の地下足袋（契約11）。急坂でも登れる・滑り落ちない */
+    setSlopePower(on: boolean): void;
     /** 物理上の現在位置（補間なし） */
     readonly current: Vector3;
 }
@@ -80,8 +94,8 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
     const controller = world.createCharacterController(0.02);
     controller.setUp({ x: 0, y: 1, z: 0 });
     controller.setSlideEnabled(true);
-    controller.setMaxSlopeClimbAngle((52 * Math.PI) / 180);
-    controller.setMinSlopeSlideAngle((54 * Math.PI) / 180);
+    controller.setMaxSlopeClimbAngle((SLOPE_CLIMB * Math.PI) / 180);
+    controller.setMinSlopeSlideAngle((SLOPE_SLIDE * Math.PI) / 180);
     controller.enableAutostep(0.45, 0.2, true);
     controller.enableSnapToGround(0.5);
     controller.setApplyImpulsesToDynamicBodies(false);
@@ -106,6 +120,10 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
     let pushX = 0;
     let pushZ = 0;
     let pushLeft = 0;
+    /** 空中補助（契約11）。落下速度の上限[m/s] と 水平の目標速度[m/s]。0 = 無効 */
+    let airSink = 0;
+    let airSpeed = 0;
+    let slopePower = false;
 
     return {
         collider,
@@ -138,7 +156,10 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
                 }
             }
 
-            const wanted = (run ? RUN_SPEED : WALK_SPEED) * speedScale;
+            // 空中補助（マント・傘）は接地していない間だけ効かせる
+            const gliding = !grounded && (airSink > 0 || airSpeed > 0);
+            const wanted =
+                gliding && airSpeed > 0 ? airSpeed : (run ? RUN_SPEED : WALK_SPEED) * speedScale;
             const length = Math.hypot(dirX, dirZ);
             const scale = length > 1 ? 1 / length : 1;
             const factor = 1 - Math.exp(-ACCEL * dt);
@@ -147,6 +168,8 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
 
             if (grounded && verticalVelocity <= 0) verticalVelocity = -GROUND_STICK;
             else verticalVelocity = Math.max(-MAX_FALL, verticalVelocity - GRAVITY * dt);
+            // 落下速度の頭打ち（上昇中は触らない = 踏み切りの高さは変えない）
+            if (gliding && airSink > 0 && verticalVelocity < -airSink) verticalVelocity = -airSink;
 
             next.x = velocity.x * dt;
             next.y = verticalVelocity * dt;
@@ -218,6 +241,16 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
         },
         setSpeedScale(scale) {
             speedScale = Math.max(0.05, Math.min(4, scale));
+        },
+        setAirAssist(sink, speed) {
+            airSink = Math.max(0, Math.min(60, sink));
+            airSpeed = Math.max(0, Math.min(40, speed));
+        },
+        setSlopePower(on) {
+            if (on === slopePower) return;
+            slopePower = on;
+            controller.setMaxSlopeClimbAngle(((on ? SLOPE_CLIMB_POWER : SLOPE_CLIMB) * Math.PI) / 180);
+            controller.setMinSlopeSlideAngle(((on ? SLOPE_SLIDE_POWER : SLOPE_SLIDE) * Math.PI) / 180);
         },
         knockback(dirX, dirZ, distance) {
             const length = Math.hypot(dirX, dirZ);

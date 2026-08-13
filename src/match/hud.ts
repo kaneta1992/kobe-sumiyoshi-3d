@@ -3,8 +3,11 @@
  *
  * 出すもの:
  *   状態行   画面上部。フェーズ・残り時間・いまの目標
+ *   効果行   状態行の下。地図の切れ端の枚数と、効いているアイテムの残り時間（契約11）
  *   実況     状態行の下に数秒だけ出るテキスト（降下開始・収縮予告・鍵出現・勝利）
  *   進捗     宝箱チャンネリングのバー（画面下中央）
+ *   矢印     尋ね人ステッキの指す方角（画面下中央・契約11）
+ *   アイテム 所持2枠。クリック/タップか 1・2 キーで使う（契約11・E78）
  *   ビネット 安置の外にいる間の赤い縁（減速していることを体で分かるように）
  *   パネル   ロビー / リザルト（ボタン付き）
  *
@@ -31,9 +34,27 @@ export interface PanelSpec {
     note?: string;
 }
 
+/** 所持スロット1枠の表示（契約11）。null = 空 */
+export interface SlotView {
+    /** 絵記号 */
+    mark: string;
+    name: string;
+    /** 「使用」/「常時」 */
+    note: string;
+}
+
 export interface MatchHud {
     /** 上部の状態行（毎フレーム呼んでよい。同じ文字列なら DOM を触らない） */
     setStatus(text: string): void;
+    /** 状態行の下の効果行（空文字で消える・契約11） */
+    setBadge(text: string): void;
+    /** 所持2枠（契約11）。毎フレーム呼んでよい。中身が変わったときだけ DOM を触る */
+    setSlots(first: SlotView | null, second: SlotView | null): void;
+    /**
+     * 尋ね人ステッキの方角（契約11）。angle は画面基準[rad]（0 = 画面上）。
+     * null で消える
+     */
+    setArrow(angle: number | null, label: string): void;
     /** 実況。同じ文なら出し直さない */
     announce(text: string): void;
     /** 宝箱チャンネリングの進捗（0..1）。0 未満で非表示 */
@@ -52,15 +73,55 @@ function div(className: string): HTMLDivElement {
     return el;
 }
 
-export function createMatchHud(): MatchHud {
+/**
+ * onSlot はアイテム枠を押したときに呼ばれる（0 か 1）。キーボードの 1・2 は
+ * director 側が拾うので、ここはクリック/タップだけを見る
+ */
+export function createMatchHud(onSlot?: (index: number) => void): MatchHud {
     const root = div('match-root');
     root.id = 'match-ui';
 
     const vignette = div('match-vignette');
     const top = div('match-top');
     const status = div('match-status');
+    const badge = div('match-badge');
+    badge.classList.add('hidden');
     const news = div('match-news');
-    top.append(status, news);
+    top.append(status, badge, news);
+
+    // --- 尋ね人ステッキの方角矢印 ---
+    const arrow = div('match-arrow');
+    const arrowDial = div('match-arrow-dial');
+    arrowDial.textContent = '➤';
+    const arrowLabel = div('match-arrow-label');
+    arrow.append(arrowDial, arrowLabel);
+    arrow.classList.add('hidden');
+
+    // --- 所持2枠（E78: 既存のタッチボタン群と重ならない画面下中央に置く） ---
+    const slotRow = div('match-slots');
+    const slotEls: HTMLDivElement[] = [];
+    const slotMarks: HTMLDivElement[] = [];
+    const slotNames: HTMLDivElement[] = [];
+    const slotNotes: HTMLDivElement[] = [];
+    for (let i = 0; i < 2; i++) {
+        const slot = div('match-slot empty');
+        const key = div('match-slot-key');
+        key.textContent = String(i + 1);
+        const mark = div('match-slot-mark');
+        const name = div('match-slot-name');
+        const note = div('match-slot-note');
+        slot.append(key, mark, name, note);
+        slot.addEventListener('pointerdown', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            onSlot?.(i);
+        });
+        slotRow.appendChild(slot);
+        slotEls.push(slot);
+        slotMarks.push(mark);
+        slotNames.push(name);
+        slotNotes.push(note);
+    }
 
     const channel = div('match-channel');
     const channelFill = div('match-channel-fill');
@@ -78,10 +139,15 @@ export function createMatchHud(): MatchHud {
     panel.append(panelTitle, panelBody, panelButton, panelNote);
     panel.classList.add('hidden');
 
-    root.append(vignette, top, channel, panel);
+    root.append(vignette, top, arrow, slotRow, channel, panel);
     document.body.appendChild(root);
 
     let statusText = '';
+    let badgeText = '';
+    /** スロットの中身のキャッシュ（毎フレーム DOM を組み直さない） */
+    const slotKeys = ['', ''];
+    let arrowShown = false;
+    let arrowLabelText = '';
     let newsText = '';
     let newsLeft = 0;
     let vignetteLevel = -1;
@@ -99,6 +165,38 @@ export function createMatchHud(): MatchHud {
             statusText = text;
             status.textContent = text;
             status.classList.toggle('hidden', text === '');
+        },
+        setBadge(text) {
+            if (text === badgeText) return;
+            badgeText = text;
+            badge.textContent = text;
+            badge.classList.toggle('hidden', text === '');
+        },
+        setSlots(first, second) {
+            const views = [first, second];
+            for (let i = 0; i < 2; i++) {
+                const view = views[i];
+                const key = view ? `${view.mark}${view.name}${view.note}` : '';
+                if (key === slotKeys[i]) continue;
+                slotKeys[i] = key;
+                slotEls[i].classList.toggle('empty', !view);
+                slotMarks[i].textContent = view ? view.mark : '';
+                slotNames[i].textContent = view ? view.name : '空き';
+                slotNotes[i].textContent = view ? view.note : '';
+            }
+        },
+        setArrow(angle, label) {
+            const show = angle !== null;
+            if (show !== arrowShown) {
+                arrowShown = show;
+                arrow.classList.toggle('hidden', !show);
+            }
+            if (!show) return;
+            // 矢印の絵文字は右向きなので、画面上を 0 にするため 90°戻す
+            arrowDial.style.transform = `rotate(${((angle as number) * 180) / Math.PI - 90}deg)`;
+            if (label === arrowLabelText) return;
+            arrowLabelText = label;
+            arrowLabel.textContent = label;
         },
         announce(text) {
             if (text === newsText && newsLeft > 0) return;

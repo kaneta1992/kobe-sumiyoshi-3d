@@ -22,6 +22,8 @@ export interface TouchControls {
     consumeInteract(): boolean;
     /** ジャンプボタンの押下を1回ぶん取り出す（徒歩のときだけ出る） */
     consumeJump(): boolean;
+    /** ジャンプボタンを押しっぱなしか（マントの滑空・契約11） */
+    readonly jumpHeld: boolean;
     setMode(mode: ControlMode): void;
     /** 乗降ボタンを押せる状態か（近くに車がある / 乗車中）を伝える */
     setInteractEnabled(enabled: boolean): void;
@@ -68,7 +70,7 @@ export function createTouchControls(): TouchControls | null {
     root.append(stickBase, buttons);
     document.body.appendChild(root);
 
-    const state = { stickX: 0, stickZ: 0, accel: false, brake: false };
+    const state = { stickX: 0, stickZ: 0, accel: false, brake: false, jumpHeld: false };
     let interactPressed = false;
     let jumpPressed = false;
     let stickPointer = -1;
@@ -145,16 +147,23 @@ export function createTouchControls(): TouchControls | null {
     const interactUp = (): void => interactButton.classList.remove('active');
     interactButton.addEventListener('pointerup', interactUp);
     interactButton.addEventListener('pointercancel', interactUp);
-    // ジャンプは押した瞬間に1回ぶんだけ出す（押しっぱなしで連続ジャンプしない）
+    // ジャンプは押した瞬間に1回ぶんだけ出す（押しっぱなしで連続ジャンプしない）。
+    // 押しっぱなしかどうかは別に持つ（マントの滑空・契約11）
     jumpButton.addEventListener('pointerdown', (e) => {
         jumpPressed = true;
+        state.jumpHeld = true;
+        jumpButton.setPointerCapture(e.pointerId);
         jumpButton.classList.add('active');
         e.preventDefault();
     });
-    const jumpUp = (): void => jumpButton.classList.remove('active');
+    const jumpUp = (): void => {
+        state.jumpHeld = false;
+        jumpButton.classList.remove('active');
+    };
     jumpButton.addEventListener('pointerup', jumpUp);
     jumpButton.addEventListener('pointercancel', jumpUp);
     jumpButton.addEventListener('pointerleave', jumpUp);
+    jumpButton.addEventListener('lostpointercapture', jumpUp);
 
     // マウス機でも最初にタッチしたら出す（E20）
     const onFirstTouch = (e: PointerEvent): void => {
@@ -168,6 +177,7 @@ export function createTouchControls(): TouchControls | null {
         releaseStick();
         state.accel = false;
         state.brake = false;
+        state.jumpHeld = false;
         accelButton.classList.remove('active');
         brakeButton.classList.remove('active');
         jumpButton.classList.remove('active');
@@ -186,6 +196,9 @@ export function createTouchControls(): TouchControls | null {
         },
         get brake() {
             return state.brake;
+        },
+        get jumpHeld() {
+            return state.jumpHeld;
         },
         consumeInteract() {
             const value = interactPressed;
