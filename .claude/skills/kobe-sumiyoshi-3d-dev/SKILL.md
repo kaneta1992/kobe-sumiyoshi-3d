@@ -67,3 +67,9 @@ description: 神戸・住吉山手3D街歩きアプリ（kobe-sumiyoshi-3d）の
 - 樹木・電柱にコライダーなし（すり抜ける）
 - 車はプレイヤーごとにローカル1台。降車中の遠隔者の車は非表示（共有車両は未実装）
 - 見た目の次の伸びしろ: 夜間窓明かり、KTX2圧縮、オクルージョンカリング、Blenderでの小物アセット（未インストール・ユーザー導入許可済み）
+
+## ゲーム完成状態（2026-08-13）
+
+- ?match = トレジャーロワイヤル完成形: 降下→安置3段収縮→アイテム（7種+イノシシ笛・千里眼=9種+切れ端）→鍵→宝箱→勝利→リマッチ。BOT最大8体（src/match/bots.ts・ホスト思考・別チャンネルbots配信）、ヘリ（src/game/helicopter.ts・アーケード積分）、イノシシ（src/match/wildlife.ts）、ディレクター（src/match/director.ts・リード<2で前倒し）
+- 検証チートシート: ?solo&match&matchauto&matchspeed=6&matchseed=N&stats + matchgoto=key|chest|item|mimic|lookout + matchitem=door,stick,cape,tabi,umbrella,map,fog,whistle,eye|all + matchdebug + matchherd + matchlead=99
+- 道路グラフ: src/world/road-graph.ts（A*・ノード2万）— BOTナビ以外にも流用可
