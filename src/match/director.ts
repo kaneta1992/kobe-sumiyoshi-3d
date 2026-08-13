@@ -25,11 +25,13 @@ import {
     MATCH_DEBUG,
     buildItemLayout,
     debugItems,
+    findLookouts,
     type ItemId,
     type ItemLayout,
 } from './items';
 import type { MatchObjects } from './objects';
-import { PLANE_CLEARANCE, STAGES, type MatchLayout } from './rules';
+import { PLANE_CLEARANCE, REACH, STAGES, type MatchLayout } from './rules';
+import type { Wildlife } from './wildlife';
 
 const TAU = Math.PI * 2;
 
@@ -72,6 +74,13 @@ const BEACON_HIDE = 10;
 const FX_REFRESH = 1.2;
 const FX_HOLD = 2.2;
 
+/** 千里眼が使える見晴らしスポットからの距離[m] と 先読みが続く時間[s] */
+const LOOKOUT_USE = 22;
+const FARSIGHT_TIME = 45;
+/** 偽宝箱（ミミック）が開く距離[m] と 開いたときに押し戻される距離[m] */
+const MIMIC_REACH = REACH;
+const MIMIC_PUSH = 2.4;
+
 /** どこでもドアの着地点を探す同心円（半径[m]と分割数） */
 const LAND_RINGS = [0, 5, 10, 17, 26, 38] as const;
 /** 立てるとみなす傾き（2m 離れた地点との高低差[m]） */
@@ -84,6 +93,8 @@ export interface DirectorOptions {
     /** 花火の打ち上げ・輸送機の使い回し（契約10 のオブジェクト） */
     objects: MatchObjects;
     items: MatchItemObjects;
+    /** イノシシ（群れ・笛・ミミック。契約12） */
+    wildlife: Wildlife;
     selfId: string;
     /** マッチ時計の倍率（補給機の飛行に使う） */
     speed: number;
@@ -140,14 +151,26 @@ export interface Director {
     readonly speedScale: number;
     /** 宝の地図の切れ端が3枚そろったか（宝箱の正確な位置を前倒しで開く） */
     readonly mapReveal: boolean;
+    /** 展望台の千里眼が効いているか（次の安置と宝箱の先読み・契約12） */
+    readonly farsight: boolean;
     /** ?matchgoto=item 用: いちばん近い未取得アイテムの位置 */
     nearestDrop(x: number, z: number): { x: number; z: number } | null;
+    /** 場に残っているアイテムを巡回する（BOT の目標選び・契約12） */
+    eachDrop(visit: (index: number, x: number, z: number) => void): void;
+    /** ?matchgoto=mimic / lookout 用: いちばん近い偽宝箱 / 見晴らしスポット（契約12） */
+    nearestMimic(x: number, z: number): { x: number; z: number } | null;
+    nearestLookoutSpot(x: number, z: number): { x: number; z: number } | null;
     dispose(): void;
 }
 
 export function createDirector(options: DirectorOptions): Director {
-    const { world, game, hud, objects, items, selfId, speed } = options;
+    const { world, game, hud, objects, items, wildlife, selfId, speed } = options;
     const planeY = world.stats.maxElevation + PLANE_CLEARANCE;
+    /**
+     * 見晴らしスポット（契約12）。地形は変わらないので最初のマッチで1回だけ測る。
+     * 標高の上位から離れた4か所（全員が同じ場所になる）
+     */
+    let lookouts: { x: number; z: number; y: number }[] | null = null;
 
     let layout: ItemLayout | null = null;
     /** 全体マップの1点指し（main.ts が attachMap で差す。未接続なら false を返すだけ） */
@@ -176,6 +199,11 @@ export function createDirector(options: DirectorOptions): Director {
     let stickLeft = 0;
     let fogLeft = 0;
     let boostLeft = 0;
+    /** 千里眼の残り[s]（実時間・契約12） */
+    let farsightLeft = 0;
+    /** 偽宝箱の開封済みフラグと足元の高さ（契約12） */
+    let mimicOpened = new Uint8Array(0);
+    let mimicY = new Float32Array(0);
     let picking = false;
     let canUse = false;
     /** 遠隔へ配っている自分の空中状態 */
@@ -192,6 +220,9 @@ export function createDirector(options: DirectorOptions): Director {
     let leadShown = -1;
     let spin = 0;
     let bob = 0;
+
+    /** イノシシへ毎フレーム渡す進行状況（使い回して new を作らない） */
+    const wildFrame = { t: 0, dt: 0 };
 
     // 巡回コールバックは使い回す（フレーム内で関数を作らない）
     let scanX = 0;
@@ -331,7 +362,38 @@ export function createDirector(options: DirectorOptions): Director {
             options.sendFx('fog', spec.seconds);
             objects.burst(game.state.x, game.state.y + 1.2, game.state.z, 0.56);
             options.announce('住吉川の霧玉 — 45秒、探知から消える');
+            return;
         }
+        if (id === 'whistle') {
+            // 空中・乗り物の上では吹けない（着地してから乗る・E85）
+            if (game.state.mode !== 'walk' || !game.state.grounded) {
+                options.announce('地面に降りてからでないとイノシシは呼べない');
+                return;
+            }
+            slots[index] = null;
+            wildlife.summon();
+            return;
+        }
+        if (id === 'eye') {
+            const spot = nearestLookout(game.state.x, game.state.z);
+            if (!spot) {
+                options.announce('展望台の千里眼は「見晴らしスポット」でしか使えない');
+                return;
+            }
+            slots[index] = null;
+            farsightLeft = FARSIGHT_TIME;
+            objects.burst(game.state.x, game.state.y + 2, game.state.z, 0.42);
+            options.announce('展望台の千里眼 — 次の安置と宝箱の方角が見えた！');
+        }
+    };
+
+    /** 使える距離にある見晴らしスポット（無ければ null・契約12） */
+    const nearestLookout = (x: number, z: number): { x: number; z: number; y: number } | null => {
+        if (!lookouts) return null;
+        for (const spot of lookouts) {
+            if (Math.hypot(spot.x - x, spot.z - z) <= LOOKOUT_USE) return spot;
+        }
+        return null;
     };
 
     const onKeyDown = (e: KeyboardEvent): void => {
@@ -455,6 +517,7 @@ export function createDirector(options: DirectorOptions): Director {
         stickLeft = Math.max(0, stickLeft - dt);
         fogLeft = Math.max(0, fogLeft - dt);
         boostLeft = Math.max(0, boostLeft - dt);
+        farsightLeft = Math.max(0, farsightLeft - dt);
         peerNow = performance.now();
 
         const px = game.state.x;
@@ -467,9 +530,45 @@ export function createDirector(options: DirectorOptions): Director {
         items.crates.begin();
         items.canopies.begin();
         items.wings.begin();
+        items.boars.begin();
+        items.mimics.begin();
+        items.lookouts.begin();
 
         // --- 補給機・クレート ---
         const crates = updateSupplies(frame);
+
+        // --- イノシシ（群れイベント・逃げる個体。契約12） ---
+        wildFrame.t = t;
+        wildFrame.dt = dt;
+        wildlife.update(wildFrame);
+
+        // --- 見晴らしスポット（千里眼が使える場所を目印で示す・契約12） ---
+        if (lookouts) {
+            for (const spot of lookouts) {
+                items.lookouts.push(spot.x, spot.y, spot.z, 0, 1);
+                if (Math.hypot(px - spot.x, pz - spot.z) > BEACON_HIDE) {
+                    items.beacons.push(spot.x, spot.y + 3, spot.z, 0, 0.32, 0x64f0c8);
+                }
+            }
+        }
+
+        // --- 偽宝箱（ミミック・契約12。触れると開いてイノシシが飛び出す） ---
+        for (let i = 0; i < layout.mimics.length; i++) {
+            if (mimicOpened[i]) continue;
+            const mimic = layout.mimics[i];
+            items.mimics.push(mimic.x, mimicY[i], mimic.z, i * 1.7, 1);
+            if (!frame.active) continue;
+            if (Math.abs(py - mimicY[i]) > PICK_HEIGHT) continue;
+            if (Math.hypot(px - mimic.x, pz - mimic.z) > MIMIC_REACH) continue;
+            mimicOpened[i] = 1;
+            wildlife.spook(mimic.x, mimic.z);
+            objects.burst(mimic.x, mimicY[i] + 1, mimic.z, 0.05);
+            const awayX = px - mimic.x;
+            const awayZ = pz - mimic.z;
+            const away = Math.hypot(awayX, awayZ) || 1;
+            game.knockback(awayX / away, awayZ / away, MIMIC_PUSH);
+            options.announce('ミミックだ！ 中からイノシシが飛び出して逃げていった');
+        }
 
         // --- 場のアイテム ---
         const drops = layout.drops;
@@ -571,6 +670,9 @@ export function createDirector(options: DirectorOptions): Director {
         items.crates.end();
         items.canopies.end();
         items.wings.end();
+        items.boars.end();
+        items.mimics.end();
+        items.lookouts.end();
 
         // --- HUD ---
         hud.setSlots(slotView(0), slotView(1));
@@ -593,11 +695,25 @@ export function createDirector(options: DirectorOptions): Director {
         if (stickLeft > 0) parts.push(`🔮 ${Math.ceil(stickLeft)}s`);
         if (fogLeft > 0) parts.push(`🌫 ${Math.ceil(fogLeft)}s`);
         if (boostLeft > 0) parts.push(`🪙 ${Math.ceil(boostLeft)}s`);
+        if (farsightLeft > 0) parts.push(`👁 ${Math.ceil(farsightLeft)}s`);
+        if (game.boarSeconds > 0) parts.push(`🐗 ${Math.ceil(game.boarSeconds)}s`);
         return parts.join('　');
     };
 
-    /** 尋ね人ステッキの方角矢印（画面基準の角度に直して HUD へ渡す） */
+    /**
+     * 方角矢印（画面基準の角度に直して HUD へ渡す）。
+     * 尋ね人ステッキは最寄りプレイヤー、千里眼（契約12）は宝箱を指す
+     */
     const updateArrow = (frame: DirectorFrame): void => {
+        if (stickLeft <= 0 && farsightLeft > 0) {
+            const dx = frame.chestX - game.state.x;
+            const dz = frame.chestZ - game.state.z;
+            hud.setArrow(
+                Math.atan2(dx, -dz) - game.viewYaw,
+                `宝箱 ${Math.round(Math.hypot(dx, dz))}m`,
+            );
+            return;
+        }
         if (stickLeft <= 0) {
             hud.setArrow(null, '');
             return;
@@ -628,6 +744,22 @@ export function createDirector(options: DirectorOptions): Director {
         start(nextLayout, seed) {
             layout = buildItemLayout(seed, nextLayout, world.mapFeatures.roads);
             const surface = game.physics.surfaceHeight;
+            // 見晴らしスポットは地形だけで決まるので1回測れば使い回せる（契約12）
+            if (!lookouts) {
+                lookouts = findLookouts(world.getElevationAt);
+                for (const spot of lookouts) spot.y = surface(spot.x, spot.z);
+                console.info(
+                    `[director] 見晴らしスポット ${lookouts
+                        .map((s) => `${s.x.toFixed(0)},${s.z.toFixed(0)}(${s.y.toFixed(0)}m)`)
+                        .join(' / ')}`,
+                );
+            }
+            mimicOpened = new Uint8Array(layout.mimics.length);
+            mimicY = new Float32Array(layout.mimics.length);
+            for (let i = 0; i < layout.mimics.length; i++) {
+                mimicY[i] = surface(layout.mimics[i].x, layout.mimics[i].z);
+            }
+            wildlife.start(nextLayout, seed);
             taken = new Uint8Array(layout.drops.length);
             dropY = new Float32Array(layout.drops.length);
             for (let i = 0; i < layout.drops.length; i++) {
@@ -657,7 +789,8 @@ export function createDirector(options: DirectorOptions): Director {
             }
             console.info(
                 `[director] アイテム ${layout.drops.length}（POI ${layout.spots.length}）` +
-                    `　コイン ${layout.coins.length}　補給機 ${layout.supplies.map((s) => `${s.at}s`).join('/')}`,
+                    `　コイン ${layout.coins.length}　補給機 ${layout.supplies.map((s) => `${s.at}s`).join('/')}` +
+                    `　ミミック ${layout.mimics.map((m) => `${m.x.toFixed(0)},${m.z.toFixed(0)}`).join(' / ')}`,
             );
         },
         reset() {
@@ -670,6 +803,9 @@ export function createDirector(options: DirectorOptions): Director {
             stickLeft = 0;
             fogLeft = 0;
             boostLeft = 0;
+            farsightLeft = 0;
+            mimicOpened = new Uint8Array(0);
+            wildlife.reset();
             picking = false;
             canUse = false;
             airState = '';
@@ -708,6 +844,36 @@ export function createDirector(options: DirectorOptions): Director {
                 ctx.arc(screenX(spot.x), screenY(spot.z), 5 * scale, 0, TAU);
                 ctx.fill();
                 ctx.stroke();
+            }
+            // 走っているイノシシ（乗れる個体だけ。契約12の「群れ通過」を見つけられるように）
+            wildlife.eachBoar((bx, bz, tame) => {
+                if (!tame) return;
+                ctx.fillStyle = '#6b5442';
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 1.2 * scale;
+                ctx.beginPath();
+                ctx.arc(screenX(bx), screenY(bz), 3.6 * scale, 0, TAU);
+                ctx.fill();
+                ctx.stroke();
+            });
+
+            // 見晴らしスポット（千里眼が使える場所・契約12）
+            if (lookouts) {
+                ctx.fillStyle = '#64f0c8';
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 1.5 * scale;
+                for (const spot of lookouts) {
+                    const sx = screenX(spot.x);
+                    const sy = screenY(spot.z);
+                    const size = 5 * scale;
+                    ctx.beginPath();
+                    ctx.moveTo(sx, sy - size);
+                    ctx.lineTo(sx + size, sy + size * 0.8);
+                    ctx.lineTo(sx - size, sy + size * 0.8);
+                    ctx.closePath();
+                    ctx.fill();
+                    ctx.stroke();
+                }
             }
             // 補給クレート
             for (let i = 0; i < layout.supplies.length; i++) {
@@ -763,6 +929,44 @@ export function createDirector(options: DirectorOptions): Director {
         },
         get mapReveal() {
             return mapPieces >= MAP_PIECES;
+        },
+        get farsight() {
+            return farsightLeft > 0;
+        },
+        eachDrop(visit) {
+            if (!layout) return;
+            for (let i = 0; i < layout.drops.length; i++) {
+                if (taken[i] === 1) continue;
+                const drop = layout.drops[i];
+                // クレートの中身は着地するまで場に出ていない
+                if (drop.spot < 0 && !supplyLanded[-1 - drop.spot]) continue;
+                visit(i, drop.x, drop.z);
+            }
+        },
+        nearestMimic(x, z) {
+            if (!layout) return null;
+            let best: { x: number; z: number } | null = null;
+            let bestDistance = Infinity;
+            for (let i = 0; i < layout.mimics.length; i++) {
+                if (mimicOpened[i]) continue;
+                const d = Math.hypot(layout.mimics[i].x - x, layout.mimics[i].z - z);
+                if (d >= bestDistance) continue;
+                bestDistance = d;
+                best = layout.mimics[i];
+            }
+            return best;
+        },
+        nearestLookoutSpot(x, z) {
+            if (!lookouts) return null;
+            let best: { x: number; z: number } | null = null;
+            let bestDistance = Infinity;
+            for (const spot of lookouts) {
+                const d = Math.hypot(spot.x - x, spot.z - z);
+                if (d >= bestDistance) continue;
+                bestDistance = d;
+                best = spot;
+            }
+            return best;
         },
         nearestDrop(x, z) {
             if (!layout) return null;

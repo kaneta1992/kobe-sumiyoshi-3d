@@ -529,8 +529,8 @@ export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
         // 遠隔プレイヤー（未接続なら1人も来ない・E52）
         eachRemote(remoteVisitor);
 
-        // 自分
-        const driving = state.mode === 'drive';
+        // 自分（乗り物に乗っていればその座標・契約12）
+        const driving = state.vehicle.occupied;
         const self = driving ? state.vehicle : state;
         drawPlayer(ctx, self.x, self.z, self.yaw, driving, C.self, scale);
         markerCtx = null;
@@ -555,7 +555,7 @@ export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
 
     const drawMini = (): void => {
         if (!miniCtx || miniSize <= 0) return;
-        const driving = state.mode === 'drive';
+        const driving = state.vehicle.occupied;
         const self = driving ? state.vehicle : state;
         view.w = miniSize;
         view.h = miniSize;
@@ -798,9 +798,9 @@ export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
 
     return {
         update(dt) {
-            // 車で走っている間は少し引く（先が見えるように）
+            // 車・ヘリで走っている間は少し引く（先が見えるように）
             const target =
-                state.mode === 'drive'
+                state.mode === 'drive' || state.mode === 'heli'
                     ? MINI_RADIUS_WALK +
                       (MINI_RADIUS_DRIVE - MINI_RADIUS_WALK) *
                           Math.min(1, Math.abs(state.vehicle.speed) / 16)

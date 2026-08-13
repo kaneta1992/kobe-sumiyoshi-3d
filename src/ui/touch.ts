@@ -9,7 +9,8 @@
  * ここで受けたポインタは視点ドラッグ（canvas 側のハンドラ）へは流れない。
  */
 
-export type ControlMode = 'walk' | 'drive';
+/** 'heli' はヘリ操縦中、'boar' はイノシシ騎乗中（契約12） */
+export type ControlMode = 'walk' | 'drive' | 'heli' | 'boar';
 
 export interface TouchControls {
     /** スティックの倒し量（-1..1）。x = 右 / z = 前 */
@@ -211,11 +212,16 @@ export function createTouchControls(): TouchControls | null {
             return value;
         },
         setMode(mode) {
-            const driving = mode === 'drive';
-            interactButton.textContent = driving ? '降りる' : '乗る';
-            accelButton.textContent = driving ? 'アクセル' : '走る';
-            brakeButton.classList.toggle('hidden', !driving);
-            jumpButton.classList.toggle('hidden', driving);
+            const heli = mode === 'heli';
+            const onBoard = mode !== 'walk';
+            interactButton.textContent = onBoard ? '降りる' : '乗る';
+            accelButton.textContent =
+                mode === 'drive' ? 'アクセル' : heli ? 'ブースト' : '走る';
+            // ヘリはコレクティブ（上昇/下降）を Space・C と同じボタンへ割り当てる
+            brakeButton.textContent = heli ? '上昇' : 'ブレーキ';
+            jumpButton.textContent = heli ? '下降' : 'ジャンプ';
+            brakeButton.classList.toggle('hidden', mode !== 'drive' && !heli);
+            jumpButton.classList.toggle('hidden', mode === 'drive' || mode === 'boar');
         },
         setInteractEnabled(enabled) {
             interactButton.classList.toggle('disabled', !enabled);

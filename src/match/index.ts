@@ -22,14 +22,18 @@ import type { Scene } from 'three/webgpu';
 import { AREA_HALF } from '../config';
 import type { Game } from '../game';
 import type { MatchPacket, Multiplayer } from '../net/multiplayer';
+import { isBotId, peerColor } from '../net/peers';
+import { createRemotePlayers, type RemotePlayers } from '../net/remote-players';
 import type { QualitySettings } from '../quality';
 import type { MapDraw, MapOverlay } from '../ui/map';
 import type { World } from '../world';
-import { placeName } from '../world/landmarks';
+import { LANDMARKS, placeName } from '../world/landmarks';
+import { createBots, type BotFrame, type Bots } from './bots';
 import { createDirector, type Director, type DirectorFrame } from './director';
 import { createMatchHud } from './hud';
 import { createMatchItemObjects } from './item-objects';
 import { createMatchObjects, type MatchObjects } from './objects';
+import { createWildlife } from './wildlife';
 import {
     BUMP_COOLDOWN,
     BUMP_PUSH,
@@ -49,6 +53,7 @@ import {
     autoStart,
     buildLayout,
     clock,
+    createRandom,
     createZoneNow,
     hashString,
     makeSeed,
@@ -70,6 +75,17 @@ const WIN_FIREWORK = 1.3;
 const CLAIM_RETRY = 2.5;
 /** 輸送機の後部ハッチ（機体中心からの後ろ向きの距離[m]） */
 const RAMP_BACK = 10.5;
+/** マッチの想定人数（BOT で埋める上限。BOT は remote スロット数まで・契約12） */
+const ROSTER = 9;
+/** ヘリコプターの配置数（契約12） */
+const HELI_COUNT = 2;
+/** ヘリの発着地点として認める平坦さ（半径[m] と 許容する高低差[m]） */
+const PAD_RADIUS = 9;
+const PAD_FLAT = 2.2;
+/** ソロ表示の BOT を描く距離[m] と、関節つきフル表示にする距離[m]・体数（予算・E92） */
+const SOLO_DRAW_DISTANCE = 700;
+const SOLO_DETAIL_DISTANCE = 45;
+const SOLO_DETAIL_LIMIT = 2;
 
 type Phase = 'lobby' | 'live' | 'result';
 /** 降下の進み方 */
@@ -134,6 +150,13 @@ export function createMatch(options: MatchOptions): Match {
     const { scene, world, quality, game, net } = options;
     /** アイテムとディレクター（契約11）。下の裁定ヘルパーが揃ってから作る */
     let director: Director | null = null;
+    /** BOT（契約12）。ホストだけが思考を回す */
+    let bots: Bots | null = null;
+    /**
+     * ソロ（?solo・未接続）用のゴースト表示。マルチプレイがあるときは
+     * multiplayer 側のスロットを人間と共用するので、ここは作らない（契約12）
+     */
+    let soloGhosts: RemotePlayers | null = null;
     const hud = createMatchHud((index) => director?.useSlot(index));
     const objects: MatchObjects = createMatchObjects(scene, quality);
     const itemObjects = createMatchItemObjects(scene, quality);
@@ -196,9 +219,12 @@ export function createMatch(options: MatchOptions): Match {
     };
     const playerCount = (): number => (net ? net.peerIds().length : 1);
 
-    const nameOf = (id: string): string => (id === selfId ? 'あなた' : `プレイヤー ${id.slice(0, 4)}`);
+    const nameOf = (id: string): string =>
+        id === selfId
+            ? 'あなた'
+            : (bots?.nameOf(id) ?? (isBotId(id) ? `BOT ${Number(id.slice(3)) + 1}` : `プレイヤー ${id.slice(0, 4)}`));
     const colorOf = (id: string): string => {
-        const color = net?.colorOf(id) ?? 0xff6b3a;
+        const color = net?.colorOf(id) ?? peerColor(id);
         return `#${color.toString(16).padStart(6, '0')}`;
     };
 
@@ -230,6 +256,15 @@ export function createMatch(options: MatchOptions): Match {
         told.clear();
         objects.reset();
         director?.reset();
+        // BOT・ヘリ・イノシシも前のマッチを持ち越さない（E87）
+        bots?.reset();
+        net?.publishBots(null);
+        if (soloGhosts) {
+            for (const slot of botSlots) if (slot >= 0) soloGhosts.release(slot);
+            botSlots.length = 0;
+        }
+        game.dismountAll();
+        game.setHelipads([]);
         hud.setChannel(-1);
         hud.setVignette(0);
         game.sky.cancel();
@@ -288,6 +323,11 @@ export function createMatch(options: MatchOptions): Match {
         game.setInputSuspended(false, 'match');
         // アイテム・コイン・補給機の配置（同じシードから全員が同じものを作る・契約11）
         director?.start(layout, seed);
+        // ヘリコプター2機（シードから決まる開けた場所へ・契約12）
+        game.setHelipads(findHelipads(layout, seed));
+        // BOT は「10人枠 - 人間」ぶん。ホストだけが動かす（配信は state と同じ形・契約12）
+        if (isHost()) bots?.start(layout, seed, Math.max(0, ROSTER - playerCount()));
+        else bots?.reset();
         // 検証時にどこへ行けばよいかを追えるようにしておく（配置は全員同じはず）
         console.info(
             `[match] 開始 seed=${seed} 最終安置=${layout.finalPlace} 速度x${speed}` +
@@ -295,6 +335,70 @@ export function createMatch(options: MatchOptions): Match {
                 `　宝箱 ${layout.chest.x.toFixed(0)},${layout.chest.z.toFixed(0)}` +
                 `　鍵 ${layout.key.x.toFixed(0)},${layout.key.z.toFixed(0)}`,
         );
+    };
+
+    // --- ヘリコプターの配置（契約12） --------------------------------------
+
+    /** その場所が機体を置ける平坦さか（校庭・公園のような開けた場所を選ぶ） */
+    const isFlat = (x: number, z: number): boolean => {
+        const base = world.getElevationAt(x, z);
+        for (let i = 0; i < 8; i++) {
+            const angle = (i / 8) * TAU;
+            const h = world.getElevationAt(
+                x + Math.cos(angle) * PAD_RADIUS,
+                z + Math.sin(angle) * PAD_RADIUS,
+            );
+            if (Math.abs(h - base) > PAD_FLAT) return false;
+            // 建物・道路の上（足場が地形より高い）は避ける
+            if (
+                Math.abs(
+                    game.physics.surfaceHeight(
+                        x + Math.cos(angle) * PAD_RADIUS,
+                        z + Math.sin(angle) * PAD_RADIUS,
+                    ) - h,
+                ) > 1.5
+            ) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    /**
+     * 発着地点を2か所選ぶ。実在ランドマーク（渦が森小の校庭など）を第一候補にして、
+     * 見つからなければシードから散らした点で平坦な場所を探す
+     */
+    const findHelipads = (
+        matchLayout: MatchLayout,
+        seed: number,
+    ): { x: number; z: number; yaw: number }[] => {
+        const pads: { x: number; z: number; yaw: number }[] = [];
+        const rnd = createRandom((seed ^ 0x6ad91f07) >>> 0);
+        const push = (x: number, z: number): boolean => {
+            if (!isFlat(x, z)) return false;
+            for (const pad of pads) {
+                if (Math.hypot(pad.x - x, pad.z - z) < 300) return false;
+            }
+            pads.push({ x, z, yaw: rnd() * TAU });
+            return true;
+        };
+        for (const landmark of LANDMARKS) {
+            if (pads.length >= HELI_COUNT) break;
+            push(landmark.x, landmark.z);
+        }
+        // 足りないぶんは初期の安置の中から探す（人が通る場所に置く）
+        for (let guard = 0; guard < 200 && pads.length < HELI_COUNT; guard++) {
+            const angle = rnd() * TAU;
+            const distance = Math.sqrt(rnd()) * matchLayout.radii[1];
+            push(
+                matchLayout.centers[1].x + Math.cos(angle) * distance,
+                matchLayout.centers[1].z + Math.sin(angle) * distance,
+            );
+        }
+        console.info(
+            `[match] ヘリ ${pads.length}機 ${pads.map((p) => `${p.x.toFixed(0)},${p.z.toFixed(0)}`).join(' / ')}`,
+        );
+        return pads;
     };
 
     // --- 裁定 ---------------------------------------------------------------
@@ -356,12 +460,23 @@ export function createMatch(options: MatchOptions): Match {
         else send({ k: 'iclaim', n: appliedGeneration, i: index });
     };
 
+    // --- イノシシ（群れ・笛・ミミック。契約12） ---
+    const wildlife = createWildlife({
+        world,
+        game,
+        items: itemObjects,
+        announce: (text) => hud.announce(text),
+    });
+    // 徒歩で F を押して、車もヘリも無ければ野生のイノシシに乗る
+    game.setMountHook((x, z) => wildlife.tryMount(x, z));
+
     director = createDirector({
         world,
         game,
         hud,
         objects,
         items: itemObjects,
+        wildlife,
         selfId,
         speed,
         claimItem,
@@ -372,6 +487,48 @@ export function createMatch(options: MatchOptions): Match {
     });
     /** 上で作り終えたので、以降は null にならない */
     const dir: Director = director;
+
+    // --- BOT（契約12。思考はホストだけ、配信は state と同じ形） ---
+    bots = createBots({
+        world,
+        physics: game.physics,
+        speed,
+        // 裁定はホスト（= BOT を動かしている自分）が出す。人間の申告とまったく同じ経路
+        claimPrize: (prize, botId) => award(prize, botId),
+        claimItem: (index, botId) => awardItem(index, botId),
+        eachDrop: (visit) => dir.eachDrop(visit),
+        eachHuman: (visit) => {
+            visit(selfId, game.state.x, game.state.y, game.state.z);
+            net?.eachPeerPosition((id, x, y, z) => {
+                if (!isBotId(id)) visit(id, x, y, z);
+            });
+        },
+        bump: (targetId, dirX, dirZ) => {
+            if (targetId === selfId) {
+                game.knockback(dirX, dirZ, BUMP_PUSH);
+                if (channel > 0) hud.announce('BOT の体当たりで回収が中断された！');
+                channel = 0;
+                hud.setChannel(-1);
+                return;
+            }
+            send({ k: 'bump', n: appliedGeneration, to: targetId, dx: dirX, dz: dirZ });
+        },
+        announce: (text) => hud.announce(text),
+    });
+    const botBrain: Bots = bots;
+    /** BOT へ毎フレーム渡す進行状況（使い回して new を作らない） */
+    const botFrame: BotFrame = {
+        t: 0,
+        dt: 0,
+        zone,
+        keyLive: false,
+        keyOwner: null,
+        winner: null,
+        reveal: 0,
+        chestX: 0,
+        chestY: 0,
+        chestZ: 0,
+    };
 
     // --- リザルトとリマッチ --------------------------------------------------
 
@@ -424,7 +581,13 @@ export function createMatch(options: MatchOptions): Match {
                 if (packet.n === appliedGeneration) hud.announce('誰かが宝箱を開け始めた！');
                 break;
             case 'bump':
-                if (packet.to !== selfId || packet.n !== appliedGeneration) return;
+                if (packet.n !== appliedGeneration) return;
+                // BOT への体当たりはホストが受けて BOT 側の状態へ反映する（E83）
+                if (packet.to && isBotId(packet.to)) {
+                    if (isHost()) botBrain.knock(packet.to, packet.dx as number, packet.dz as number);
+                    return;
+                }
+                if (packet.to !== selfId) return;
                 game.knockback(packet.dx as number, packet.dz as number, BUMP_PUSH);
                 if (channel > 0) hud.announce('体当たりを食らって回収が中断された！');
                 channel = 0;
@@ -462,6 +625,72 @@ export function createMatch(options: MatchOptions): Match {
         bumpDirX = dx / distance;
         bumpDirZ = dz / distance;
     };
+
+    // --- BOT の配信 -----------------------------------------------------------
+
+    /**
+     * BOT の状態を配る。マルチプレイがあるときは multiplayer が人間と同じ経路へ
+     * 流し込む（スロットも共用）。ソロのときは遠隔表示そのものが無いので、
+     * ここで同じアバターを直接描く（契約12）
+     */
+    const publishBots = (): void => {
+        if (net) {
+            net.publishBots(botBrain.states);
+            return;
+        }
+        if (!soloGhosts) soloGhosts = createRemotePlayers(scene, quality, ROSTER - 1);
+        // フル表示は近い順に SOLO_DETAIL_LIMIT 体まで（描画コール予算・E92）
+        let detailCut = SOLO_DETAIL_DISTANCE;
+        let ranked = 0;
+        for (const state of botBrain.states) {
+            const d = Math.hypot(
+                state.x - game.state.x,
+                state.y - game.state.y,
+                state.z - game.state.z,
+            );
+            if (d > SOLO_DETAIL_DISTANCE) continue;
+            let at = Math.min(ranked, SOLO_DETAIL_LIMIT - 1);
+            while (at > 0 && soloNearest[at - 1] > d) {
+                soloNearest[at] = soloNearest[at - 1];
+                at--;
+            }
+            if (at < SOLO_DETAIL_LIMIT) soloNearest[at] = d;
+            ranked = Math.min(ranked + 1, SOLO_DETAIL_LIMIT);
+        }
+        if (ranked >= SOLO_DETAIL_LIMIT) detailCut = soloNearest[SOLO_DETAIL_LIMIT - 1];
+        for (const state of botBrain.states) {
+            if (botSlots[state.index] === undefined) {
+                botSlots[state.index] = soloGhosts.acquire(peerColor(`bot${state.index}`));
+            }
+            const slot = botSlots[state.index];
+            if (slot < 0) continue;
+            const distance = Math.hypot(
+                state.x - game.state.x,
+                state.y - game.state.y,
+                state.z - game.state.z,
+            );
+            if (distance > SOLO_DRAW_DISTANCE) {
+                soloGhosts.hide(slot);
+                continue;
+            }
+            soloGhosts.show(
+                slot,
+                state.mode,
+                state.x,
+                state.y,
+                state.z,
+                state.yaw,
+                state.speed,
+                lastDt,
+                distance <= detailCut,
+            );
+        }
+    };
+    /** ソロ表示のスロット（BOT 番号 → スロット番号） */
+    const botSlots: number[] = [];
+    /** フル表示の絞り込みに使う「近い順の距離」（使い回し） */
+    const soloNearest = new Float64Array(SOLO_DETAIL_LIMIT);
+    let lastDt = 0;
 
     // --- フェーズごとの更新 --------------------------------------------------
 
@@ -606,10 +835,10 @@ export function createMatch(options: MatchOptions): Match {
             hud.setChannel(-1);
         }
 
-        // --- 体当たり（走って接触した相手のチャンネリングを潰す） ---
+        // --- 体当たり（走って接触した相手のチャンネリングを潰す。BOT にも当たる・E83） ---
         bumpCooldown -= dt;
         if (
-            net &&
+            (net || botBrain.count > 0) &&
             !spectator &&
             bumpCooldown <= 0 &&
             game.state.mode === 'walk' &&
@@ -619,9 +848,13 @@ export function createMatch(options: MatchOptions): Match {
             bumpFromX = px;
             bumpFromZ = pz;
             bumpTarget = null;
-            net.eachPeerPosition(findBumpTarget);
+            // マルチプレイのゴースト（人間・BOT 兼用）と、ソロの BOT の両方を見る
+            if (net) net.eachPeerPosition(findBumpTarget);
+            else for (const state of botBrain.states) findBumpTarget(`bot${state.index}`, state.x, state.y, state.z);
             if (bumpTarget) {
-                send({ k: 'bump', n: appliedGeneration, to: bumpTarget, dx: bumpDirX, dz: bumpDirZ });
+                // 相手が BOT で自分がホストなら、その場で BOT へ効かせる（往復しない）
+                if (isBotId(bumpTarget) && isHost()) botBrain.knock(bumpTarget, bumpDirX, bumpDirZ);
+                else send({ k: 'bump', n: appliedGeneration, to: bumpTarget, dx: bumpDirX, dz: bumpDirZ });
                 bumpCooldown = BUMP_COOLDOWN;
                 hud.announce('体当たり！');
             }
@@ -647,9 +880,15 @@ export function createMatch(options: MatchOptions): Match {
         // 行き先は「いまの目標」: 鍵を持っていれば宝箱、まだなら鍵。目標が変わったときだけ飛ぶ。
         // 飛んだ先は R の戻り先にもなる（game.warpTo）ので、回収が中断されても手前へ戻れる
         // ?matchgoto=item は「いちばん近い未取得アイテム」を追いかける。拾うと次の
-        // アイテムが最寄りになるので、そのまま次々に飛べる（アイテムの通し確認用）
-        if (gotoParam === 'item' && !spectator && !winner) {
-            const near = dir.nearestDrop(px, pz);
+        // アイテムが最寄りになるので、そのまま次々に飛べる（アイテムの通し確認用）。
+        // mimic / lookout も同じ仕組みで偽宝箱・見晴らしスポットの手前へ飛ぶ（契約12）
+        if ((gotoParam === 'item' || gotoParam === 'mimic' || gotoParam === 'lookout') && !spectator && !winner) {
+            const near =
+                gotoParam === 'item'
+                    ? dir.nearestDrop(px, pz)
+                    : gotoParam === 'mimic'
+                      ? dir.nearestMimic(px, pz)
+                      : dir.nearestLookoutSpot(px, pz);
             if (near && (near.x !== gotoItemX || near.z !== gotoItemZ)) {
                 gotoItemX = near.x;
                 gotoItemZ = near.z;
@@ -664,7 +903,13 @@ export function createMatch(options: MatchOptions): Match {
                     near.z + uz * GOTO_STANDOFF,
                     Math.atan2(ux, uz),
                 );
-                hud.announce('デバッグ: 次のアイテムの手前へ移動（R で戻る）');
+                hud.announce(
+                    gotoParam === 'item'
+                        ? 'デバッグ: 次のアイテムの手前へ移動（R で戻る）'
+                        : gotoParam === 'mimic'
+                          ? 'デバッグ: 偽宝箱の手前へ移動（R で戻る）'
+                          : 'デバッグ: 見晴らしスポットへ移動（R で戻る）',
+                );
             }
         } else if (gotoParam && !spectator && !winner) {
             const target: Prize = gotoParam === 'chest' || keyOwner === selfId ? 'chest' : 'key';
@@ -703,6 +948,21 @@ export function createMatch(options: MatchOptions): Match {
         frame.active = !spectator && !winner && board === 'landed';
         dir.update(frame);
 
+        // --- BOT（契約12。ホストだけが思考を回し、state と同じ形で配る） ---
+        if (isHost() && botBrain.count > 0) {
+            botFrame.t = t;
+            botFrame.dt = dt;
+            botFrame.keyLive = keyLive;
+            botFrame.keyOwner = keyOwner;
+            botFrame.winner = winner;
+            botFrame.reveal = reveal;
+            botFrame.chestX = layout.chest.x;
+            botFrame.chestY = chestY;
+            botFrame.chestZ = layout.chest.z;
+            botBrain.update(botFrame);
+            publishBots();
+        }
+
         // --- 状態行 ---
         const goal = spectator
             ? '観戦中（次のマッチから参加できます）'
@@ -737,6 +997,8 @@ export function createMatch(options: MatchOptions): Match {
         frame.dt = dt;
         frame.active = false;
         dir.update(frame);
+        // BOT も画に残す（思考は止め、最後の姿勢のまま立たせておく）
+        if (isHost() && botBrain.count > 0) publishBots();
         const elapsed = (now - resultAt) * 0.001;
         hud.setStatus(`リザルト　${nameOf(winner)}の勝利　${clock(winnerTime)}`);
         // 全員の投票がそろうか10秒でホストが次を始める
@@ -746,6 +1008,7 @@ export function createMatch(options: MatchOptions): Match {
     return {
         update(dt) {
             const now = performance.now();
+            lastDt = dt;
             hud.update(dt);
             objects.update(dt);
 
@@ -759,6 +1022,8 @@ export function createMatch(options: MatchOptions): Match {
                     at: startAt,
                     now,
                 });
+                // 人間が増えたぶんだけ BOT を引退させて枠を空ける（E86）
+                for (let i = knownPeers; i < count; i++) botBrain.retire();
             }
             knownPeers = count;
 
@@ -844,6 +1109,68 @@ export function createMatch(options: MatchOptions): Match {
                 ctx.stroke();
             }
 
+            // ヘリコプター（契約12）。乗り物がどこにあるか分からないと乗りに行けない
+            game.eachHeli((hx, hz, hyaw, occupied) => {
+                const sx = screenX(hx);
+                const sy = screenY(hz);
+                ctx.save();
+                ctx.translate(sx, sy);
+                ctx.rotate(hyaw);
+                ctx.strokeStyle = occupied ? '#ffd257' : '#3f7ad6';
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+                ctx.lineWidth = 2 * scale;
+                const r = 6 * scale;
+                ctx.beginPath();
+                ctx.arc(0, 0, r * 0.55, 0, TAU);
+                ctx.fill();
+                ctx.stroke();
+                // ローターの十字
+                ctx.beginPath();
+                ctx.moveTo(-r, -r);
+                ctx.lineTo(r, r);
+                ctx.moveTo(r, -r);
+                ctx.lineTo(-r, r);
+                ctx.stroke();
+                ctx.restore();
+            });
+
+            // 展望台の千里眼: 最終安置の円と宝箱の位置を先読みで出す（契約12）
+            if (dir.farsight) {
+                const last = layout.centers[layout.centers.length - 1];
+                ctx.save();
+                ctx.strokeStyle = 'rgba(100, 240, 200, 0.95)';
+                ctx.lineWidth = 2.5 * scale;
+                ctx.setLineDash([5 * scale, 5 * scale]);
+                ctx.beginPath();
+                ctx.arc(
+                    screenX(last.x),
+                    screenY(last.z),
+                    Math.max(2, layout.radii[layout.radii.length - 1] * ppm),
+                    0,
+                    TAU,
+                );
+                ctx.stroke();
+                ctx.setLineDash([]);
+                ctx.strokeStyle = 'rgba(100, 240, 200, 0.95)';
+                ctx.beginPath();
+                ctx.arc(screenX(chest.x), screenY(chest.z), 9 * scale, 0, TAU);
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            // ソロの BOT（マルチプレイがあるときは遠隔プレイヤーとして描かれている）
+            if (!net) {
+                for (const state of botBrain.states) {
+                    ctx.fillStyle = `#${peerColor(`bot${state.index}`).toString(16).padStart(6, '0')}`;
+                    ctx.strokeStyle = '#ffffff';
+                    ctx.lineWidth = 1.5 * scale;
+                    ctx.beginPath();
+                    ctx.arc(screenX(state.x), screenY(state.z), 4.5 * scale, 0, TAU);
+                    ctx.fill();
+                    ctx.stroke();
+                }
+            }
+
             // 安置（現在の円 = 実線 / 次の円 = 破線）
             ctx.strokeStyle = 'rgba(46, 132, 235, 0.95)';
             ctx.lineWidth = 3 * scale;
@@ -871,9 +1198,13 @@ export function createMatch(options: MatchOptions): Match {
 
         dispose() {
             net?.onMatch(null);
+            net?.publishBots(null);
             hud.dispose();
             objects.dispose();
             dir.dispose();
+            soloGhosts?.dispose();
+            game.setMountHook(null);
+            game.setHelipads([]);
             game.setSpeedScale(1);
             game.setInputSuspended(false, 'match');
         },

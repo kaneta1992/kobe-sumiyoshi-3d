@@ -83,6 +83,8 @@ export function createInput(element: HTMLElement): Input {
     };
     const pressed = new Set<string>();
     const touch = createTouchControls();
+    /** タッチボタンの意味づけを切り替えるための現在の操作モード（契約12） */
+    let controlMode: ControlMode = 'walk';
     let dragPointer = -1;
     let keyRun = false;
     let keyBrake = false;
@@ -191,6 +193,8 @@ export function createInput(element: HTMLElement): Input {
             if (touch.consumeInteract()) state.interact = true;
             if (touch.consumeJump()) state.jump = true;
             if (touch.jumpHeld) state.jumpHeld = true;
+            // ヘリではジャンプボタンが「下降」（C キーと同じ意味）になる
+            if (controlMode === 'heli' && touch.jumpHeld) state.down = true;
         },
         endFrame() {
             state.lookX = 0;
@@ -222,6 +226,7 @@ export function createInput(element: HTMLElement): Input {
             if (locked()) document.exitPointerLock();
         },
         setMode(mode) {
+            controlMode = mode;
             touch?.setMode(mode);
         },
         setInteractEnabled(enabled) {

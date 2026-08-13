@@ -1,5 +1,6 @@
 /**
- * プレイヤーと車の見た目（契約06）。すべてプロシージャル生成で、外部アセットは読まない。
+ * プレイヤー・車・ヘリコプター・イノシシの見た目（契約06 / 契約12）。
+ * すべてプロシージャル生成で、外部アセットは読まない。
  *
  * スタイルは「2.7頭身のチビキャラ」。球・カプセル・角丸ボックスだけで作り、
  * 大きな頭と大きな目で表情を出す。アニメーションはボーン相当の Object3D 階層を
@@ -787,6 +788,243 @@ export function createCarAvatar(quality: QualitySettings): CarAvatar {
         },
         setColor(color) {
             paint.color.setHex(color);
+        },
+    };
+}
+
+// ---------------------------------------------------------------------------
+// ヘリコプター（契約12）
+// ---------------------------------------------------------------------------
+
+/** merge() へ渡すパーツの形（world/geom の GeometryPart と同じ） */
+type Part = Parameters<typeof merge>[0][number];
+
+/** 機体ローカルの操縦席（キャラクターは足元が原点なので、座面から腰の高さぶん下げる） */
+export const HELI_SEAT = new Vector3(-0.34, 0.62, 0.42);
+/** スキッド接地面からローターまでの高さ[m]（カメラ・着陸判定の目安） */
+export const HELI_HEIGHT = 2.5;
+
+export interface HeliAvatar {
+    group: Group;
+    /** ローターを回す。lift = 0..1（エンジンの掛かり具合） */
+    update(lift: number, dt: number): void;
+    setColor(color: number): void;
+}
+
+/**
+ * ヘリコプター。原点はスキッドの接地面、+z が機首方向（車と同じ向きの定義）。
+ * 描画コールは「胴体（ピア色）」と「メインローター」の2つに収める。
+ */
+export function createHeliAvatar(quality: QualitySettings): HeliAvatar {
+    const s = shared();
+    const paint = material(0x3f7ad6, 0.42, 0.25);
+    const dark = 0x272b33;
+    const glassBlue = 0x9fd0e8;
+
+    const group = new Group();
+    group.name = 'heli';
+    // yaw → pitch → roll の順で受ける（ロールが機首方向を回さない）
+    group.rotation.order = 'YXZ';
+
+    group.add(
+        meshOf(
+            merge([
+                { geometry: new SphereGeometry(1, 18, 14), matrix: place(0, 1.15, 0.15, 0.95, 0.82, 1.55) },
+                { geometry: new SphereGeometry(1, 16, 12), matrix: place(0, 1.22, 0.72, 0.82, 0.66, 0.95), color: glassBlue },
+                { geometry: new CylinderGeometry(0.19, 0.13, 3.5, 10), matrix: place(0, 1.32, -2.5, 1, 1, 1, Math.PI / 2, 0, 0), color: dark },
+                { geometry: roundedBox(0.12, 1, 0.62, 0.06, 10, 8), matrix: place(0, 1.75, -4), color: dark },
+                { geometry: roundedBox(1.5, 0.1, 0.42, 0.05, 10, 8), matrix: place(0, 1.42, -3.85), color: dark },
+                { geometry: new CylinderGeometry(0.62, 0.62, 0.05, 12), matrix: place(0.2, 1.78, -4.05, 1, 1, 1, 0, 0, Math.PI / 2), color: 0x3a3f4a },
+                { geometry: new CylinderGeometry(0.11, 0.13, 0.5, 8), matrix: place(0, 2.02, 0.1), color: dark },
+                { geometry: new CylinderGeometry(0.075, 0.075, 3.4, 8), matrix: place(0.95, 0.08, 0.1, 1, 1, 1, Math.PI / 2, 0, 0), color: dark },
+                { geometry: new CylinderGeometry(0.075, 0.075, 3.4, 8), matrix: place(-0.95, 0.08, 0.1, 1, 1, 1, Math.PI / 2, 0, 0), color: dark },
+                { geometry: new CylinderGeometry(0.06, 0.06, 0.72, 6), matrix: place(0.72, 0.42, 0.85, 1, 1, 1, 0, 0, 0.35), color: dark },
+                { geometry: new CylinderGeometry(0.06, 0.06, 0.72, 6), matrix: place(-0.72, 0.42, 0.85, 1, 1, 1, 0, 0, -0.35), color: dark },
+                { geometry: new CylinderGeometry(0.06, 0.06, 0.72, 6), matrix: place(0.72, 0.42, -0.7, 1, 1, 1, 0, 0, 0.35), color: dark },
+                { geometry: new CylinderGeometry(0.06, 0.06, 0.72, 6), matrix: place(-0.72, 0.42, -0.7, 1, 1, 1, 0, 0, -0.35), color: dark },
+            ]),
+            paint,
+            quality,
+        ),
+    );
+
+    // メインローター（ハブ + 4枚羽）。回転は Object3D 側で行う
+    const rotor = new Object3D();
+    rotor.position.set(0, 2.3, 0.1);
+    const blades: Part[] = [
+        { geometry: new CylinderGeometry(0.2, 0.2, 0.18, 8), matrix: place(0, 0, 0), color: dark },
+    ];
+    for (let i = 0; i < 4; i++) {
+        const angle = (i / 4) * TAU;
+        blades.push({
+            geometry: roundedBox(0.28, 0.05, 4.2, 0.03, 8, 6),
+            matrix: place(Math.sin(angle) * 2.1, 0, Math.cos(angle) * 2.1, 1, 1, 1, 0, angle, 0),
+            color: 0x2f343d,
+        });
+    }
+    rotor.add(meshOf(merge(blades), s.vc, quality, false));
+    group.add(rotor);
+
+    let spin = 0;
+
+    return {
+        group,
+        update(lift, dt) {
+            const step = Math.min(0.05, Math.max(0.0001, dt));
+            spin = (spin + (6 + Math.max(0, Math.min(1, lift)) * 26) * step) % TAU;
+            rotor.rotation.y = spin;
+        },
+        setColor(color) {
+            paint.color.setHex(color);
+        },
+    };
+}
+
+// ---------------------------------------------------------------------------
+// イノシシ（契約12）
+// ---------------------------------------------------------------------------
+
+/** 騎乗中のライダーの足元位置（イノシシローカル。原点は接地面） */
+export const BOAR_SEAT = new Vector3(0, 0.72, -0.05);
+
+/**
+ * 六甲のイノシシ。yaw=0 で -z を向く（キャラクターと同じ定義なので、
+ * 騎乗中は乗り手の向きをそのまま渡せる）。頂点色で1メッシュ。
+ */
+export function createBoarGeometry(): BufferGeometry {
+    const fur = 0x6b5442;
+    const back = 0x4a3a2d;
+    const nose = 0x3a2f28;
+    const tusk = 0xf1ead6;
+    const parts: Part[] = [
+        { geometry: new SphereGeometry(1, 16, 12), matrix: place(0, 0.62, 0.05, 0.34, 0.34, 0.6), color: fur },
+        { geometry: new SphereGeometry(1, 12, 8), matrix: place(0, 0.92, 0.05, 0.1, 0.12, 0.5), color: back },
+        { geometry: new SphereGeometry(1, 14, 12), matrix: place(0, 0.66, -0.52, 0.26, 0.26, 0.28), color: back },
+        { geometry: new CylinderGeometry(0.14, 0.19, 0.34, 10), matrix: place(0, 0.56, -0.76, 1, 1, 1, -Math.PI / 2, 0, 0), color: fur },
+        { geometry: new SphereGeometry(0.15, 10, 8), matrix: place(0, 0.55, -0.92, 1, 0.85, 0.6), color: nose },
+        { geometry: new CylinderGeometry(0.02, 0.045, 0.24, 6), matrix: place(0.13, 0.5, -0.86, 1, 1, 1, -0.5, 0, 0.3), color: tusk },
+        { geometry: new CylinderGeometry(0.02, 0.045, 0.24, 6), matrix: place(-0.13, 0.5, -0.86, 1, 1, 1, -0.5, 0, -0.3), color: tusk },
+        { geometry: new SphereGeometry(1, 8, 6), matrix: place(0.17, 0.86, -0.46, 0.07, 0.11, 0.03), color: back },
+        { geometry: new SphereGeometry(1, 8, 6), matrix: place(-0.17, 0.86, -0.46, 0.07, 0.11, 0.03), color: back },
+        { geometry: new CylinderGeometry(0.03, 0.02, 0.3, 6), matrix: place(0, 0.78, 0.62, 1, 1, 1, 0.7, 0, 0), color: back },
+    ];
+    for (const sx of [-1, 1]) {
+        for (const sz of [-1, 1]) {
+            parts.push({
+                geometry: new CapsuleGeometry(0.075, 0.28, 4, 8),
+                matrix: place(sx * 0.2, 0.26, sz * 0.32),
+                color: back,
+            });
+            parts.push({
+                geometry: new SphereGeometry(0.085, 8, 6),
+                matrix: place(sx * 0.2, 0.07, sz * 0.32, 1, 0.7, 1.1),
+                color: nose,
+            });
+        }
+    }
+    return merge(parts);
+}
+
+export interface BoarAvatar {
+    group: Group;
+    /** 走りの上下動。speed は水平速度[m/s] */
+    update(speed: number, dt: number): void;
+}
+
+/** 1体ぶんのイノシシ（騎乗表示用）。描画コールは1 */
+export function createBoarAvatar(quality: QualitySettings): BoarAvatar {
+    const group = new Group();
+    group.name = 'boar';
+    const body = new Object3D();
+    group.add(body);
+    const skin = new MeshStandardNodeMaterial({ vertexColors: true, roughness: 0.85 });
+    body.add(meshOf(createBoarGeometry(), skin, quality));
+
+    let phase = 0;
+
+    return {
+        group,
+        update(speed, dt) {
+            const step = Math.min(0.05, Math.max(0.0001, dt));
+            phase = (phase + (1.2 + Math.min(Math.abs(speed), 10) * 0.55) * TAU * step) % TAU;
+            const gait = Math.min(1, Math.abs(speed) / 5);
+            body.position.y = Math.abs(Math.sin(phase)) * 0.09 * gait;
+            body.rotation.x = Math.sin(phase * 2) * 0.06 * gait;
+            body.rotation.z = Math.sin(phase) * 0.045 * gait;
+        },
+    };
+}
+
+// ---------------------------------------------------------------------------
+// 簡易アバター（契約12: 遠くの遠隔プレイヤー・BOT 用）
+// ---------------------------------------------------------------------------
+
+export interface SimpleAvatar {
+    group: Group;
+    setColor(color: number): void;
+}
+
+/**
+ * 立ちポーズのまま動かない1メッシュの人型。BOT8体が同時に見えても描画コールが
+ * 増えないよう、遠くのゴーストはこちらで描く（E92）。服と帽子の色はピアごとに
+ * 変わるので、頂点色のその範囲だけを書き換える。
+ */
+export function createSimpleAvatar(quality: QualitySettings): SimpleAvatar {
+    const skinColor = 0xffcfa8;
+    const parts: Part[] = [
+        // 先頭3つ = 服・帽子（setColor で塗り替える範囲）
+        { geometry: new SphereGeometry(1, 12, 10), matrix: place(0, 0.775, 0, 0.25, 0.245, 0.212), color: 0xffffff },
+        {
+            geometry: new SphereGeometry(HEAD_R + 0.022, 12, 8, 0, TAU, 0, Math.PI * 0.42),
+            matrix: place(0, HEAD_Y, 0, 1, 1.04, 1),
+            color: 0xffffff,
+        },
+        { geometry: new SphereGeometry(1, 12, 8), matrix: place(0, HEAD_Y + 0.075, -0.24, 0.185, 0.026, 0.14, 0.16), color: 0xffffff },
+        { geometry: new SphereGeometry(HEAD_R, 14, 12), matrix: place(0, HEAD_Y, 0, 1, 0.98, 0.97), color: skinColor },
+        { geometry: new SphereGeometry(1, 12, 8), matrix: place(0, 0.56, 0, 0.215, 0.15, 0.19), color: PANTS_NAVY },
+        { geometry: new SphereGeometry(1, 10, 8), matrix: place(0.12, HEAD_Y - 0.03, -0.25, 0.055, 0.075, 0.04), color: EYE_DARK },
+        { geometry: new SphereGeometry(1, 10, 8), matrix: place(-0.12, HEAD_Y - 0.03, -0.25, 0.055, 0.075, 0.04), color: EYE_DARK },
+    ];
+    for (const side of [-1, 1]) {
+        parts.push({
+            geometry: new CapsuleGeometry(0.082, 0.2, 4, 8),
+            matrix: place(side * (SHOULDER_X + 0.03), SHOULDER_Y - 0.16, 0, 1, 1, 1, 0, 0, side * -0.12),
+            color: skinColor,
+        });
+        parts.push({
+            geometry: new CapsuleGeometry(0.098, 0.16, 4, 8),
+            matrix: place(side * HIP_X, 0.32, 0),
+            color: PANTS_NAVY,
+        });
+        parts.push({
+            geometry: new SphereGeometry(1, 8, 6),
+            matrix: place(side * HIP_X, 0.06, -0.04, 0.095, 0.06, 0.14),
+            color: SHOE_DARK,
+        });
+    }
+    // 服・帽子の頂点数を、束ねる前に数えておく
+    let clothVerts = 0;
+    for (let i = 0; i < 3; i++) {
+        const part = parts[i].geometry;
+        clothVerts += part.index ? part.index.count : part.attributes.position.count;
+    }
+    const geometry = merge(parts);
+    const mesh = new Mesh(geometry, new MeshStandardNodeMaterial({ vertexColors: true, roughness: 0.8 }));
+    mesh.castShadow = false;
+    mesh.receiveShadow = quality.shadows;
+
+    const group = new Group();
+    group.name = 'peer-simple';
+    group.add(mesh);
+    const colorAttribute = geometry.getAttribute('color') as BufferAttribute;
+    const tint = new Color();
+
+    return {
+        group,
+        setColor(color) {
+            tint.setHex(color);
+            for (let i = 0; i < clothVerts; i++) colorAttribute.setXYZ(i, tint.r, tint.g, tint.b);
+            colorAttribute.needsUpdate = true;
         },
     };
 }

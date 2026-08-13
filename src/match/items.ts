@@ -17,7 +17,16 @@ import { createRandom, createZoneNow, zoneAt, type MatchLayout } from './rules';
 
 const TAU = Math.PI * 2;
 
-export type ItemId = 'door' | 'stick' | 'cape' | 'tabi' | 'umbrella' | 'map' | 'fog';
+export type ItemId =
+    | 'door'
+    | 'stick'
+    | 'cape'
+    | 'tabi'
+    | 'umbrella'
+    | 'map'
+    | 'fog'
+    | 'whistle'
+    | 'eye';
 
 export interface ItemSpec {
     id: ItemId;
@@ -102,6 +111,24 @@ export const ITEMS: Readonly<Record<ItemId, ItemSpec>> = {
         hint: '45秒、ステッキ等の探知とマップから消える',
         seconds: 45,
     },
+    whistle: {
+        id: 'whistle',
+        name: 'イノシシ呼び笛',
+        kind: 'use',
+        color: 0x8d6b4b,
+        mark: '🐗',
+        hint: '使うとイノシシに乗れる（90秒・坂に強い）',
+        seconds: 90,
+    },
+    eye: {
+        id: 'eye',
+        name: '展望台の千里眼',
+        kind: 'use',
+        color: 0x64f0c8,
+        mark: '👁',
+        hint: '見晴らしスポットで使うと次の安置と宝箱を先読みできる',
+        seconds: 45,
+    },
 };
 
 /** 湧きPOI の数（実在ランドマーク優先 → 残りは道路上へ散らす） */
@@ -118,6 +145,12 @@ const COIN_PER_SIDE = 10;
 /** コイン列を敷くのに十分な道路の長さ[m] と、その道を探しに行く範囲[m] */
 const COIN_ROAD_LENGTH = 120;
 const COIN_ROAD_SEARCH = 90;
+/** 偽宝箱（ミミック・契約12）の数と、本物からの距離の範囲[m] */
+const MIMIC_COUNT = 3;
+const MIMIC_MIN = 45;
+const MIMIC_RADIUS = 220;
+/** 見晴らしスポット（千里眼・契約12）: 標高を測る格子の分割数 */
+const LOOKOUT_GRID = 41;
 /** 補給機の飛来時刻[s]（マッチ時計。ディレクターが前倒しすることがある） */
 const SUPPLY_AT = [165, 300] as const;
 /** クレートに入る良アイテムの候補（2つ1組） */
@@ -162,6 +195,8 @@ export interface ItemLayout {
     supplies: readonly Supply[];
     /** drops のうち POI ぶんの個数（これ以降はクレートが着地するまで場に出ない） */
     poiDrops: number;
+    /** 偽宝箱（ミミック・契約12）。宝箱のヒント円の中に紛れ込ませる */
+    mimics: readonly { x: number; z: number }[];
 }
 
 function clampToArea(value: number, margin: number): number {
@@ -281,7 +316,7 @@ export function buildItemLayout(
 
     // アイテムの内訳。地図の切れ端は必ず3枚以上出す（4枚入れて1枚は取り損ねてもよくする）
     const pool: ItemId[] = ['map', 'map', 'map', 'map'];
-    for (const id of ['door', 'stick', 'cape', 'tabi', 'umbrella', 'fog'] as const) {
+    for (const id of ['door', 'stick', 'cape', 'tabi', 'umbrella', 'fog', 'whistle', 'eye'] as const) {
         pool.push(id, id);
     }
     // 種類の偏りを均すシャッフル（Fisher-Yates・シード由来）
@@ -327,7 +362,44 @@ export function buildItemLayout(
         }
     }
 
-    return { spots, drops, coins, supplies, poiDrops };
+    // 偽宝箱（ミミック・契約12）: 宝箱のヒント円の中に、本物と同じ見た目で紛れ込ませる。
+    // 道路上へ寄せるので「探しに来た人が必ず通る場所」に立つ
+    const mimics: { x: number; z: number }[] = [];
+    for (let i = 0; i < MIMIC_COUNT; i++) {
+        const angle = rnd() * TAU;
+        const distance = MIMIC_MIN + Math.sqrt(rnd()) * (MIMIC_RADIUS - MIMIC_MIN);
+        const mx = clampToArea(layout.chest.x + Math.cos(angle) * distance, 20);
+        const mz = clampToArea(layout.chest.z + Math.sin(angle) * distance, 20);
+        const near = nearestRoadVertex(roads, mx, mz);
+        mimics.push(near ? { x: near.path.points[near.index].x, z: near.path.points[near.index].z } : { x: mx, z: mz });
+    }
+
+    return { spots, drops, coins, supplies, poiDrops, mimics };
+}
+
+/**
+ * 見晴らしスポット（契約12の千里眼）。**四象限それぞれの最高地点**を1か所ずつ選ぶ。
+ * 全体の標高上位から選ぶと山側（北西）に4つとも固まって、街側で使えなくなる。
+ * 地形は全員同じなので**シードを使わなくても全員一致**する（実行時乱数も使わない）。
+ */
+export function findLookouts(
+    getElevationAt: (x: number, z: number) => number,
+): { x: number; z: number; y: number }[] {
+    const best: ({ x: number; z: number; y: number } | null)[] = [null, null, null, null];
+    const span = AREA_HALF - 120;
+    for (let ix = 0; ix < LOOKOUT_GRID; ix++) {
+        for (let iz = 0; iz < LOOKOUT_GRID; iz++) {
+            const x = -span + (2 * span * ix) / (LOOKOUT_GRID - 1);
+            const z = -span + (2 * span * iz) / (LOOKOUT_GRID - 1);
+            const quadrant = (x < 0 ? 0 : 1) + (z < 0 ? 0 : 2);
+            const y = getElevationAt(x, z);
+            const current = best[quadrant];
+            if (!current || y > current.y) best[quadrant] = { x, z, y };
+        }
+    }
+    const picked: { x: number; z: number; y: number }[] = [];
+    for (const spot of best) if (spot) picked.push(spot);
+    return picked;
 }
 
 /**
@@ -354,7 +426,9 @@ export const LEAD_MIN = (() => {
 export function debugItems(): ItemId[] {
     const value = new URLSearchParams(location.search).get('matchitem');
     if (!value) return [];
-    if (value === 'all') return ['door', 'stick', 'cape', 'tabi', 'umbrella', 'map', 'fog'];
+    if (value === 'all') {
+        return ['door', 'stick', 'cape', 'tabi', 'umbrella', 'map', 'fog', 'whistle', 'eye'];
+    }
     const out: ItemId[] = [];
     for (const part of value.split(',')) {
         const id = part.trim() as ItemId;

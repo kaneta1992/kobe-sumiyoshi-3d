@@ -18,13 +18,14 @@
  *   ?room=名前   ルームを分ける（既定は kobe-sumiyoshi-3d-v1）
  *   ?solo        マルチプレイを使わない
  */
-import { Color, type Scene } from 'three/webgpu';
+import { type Scene } from 'three/webgpu';
 import { joinRoom, getRelaySockets, selfId } from 'trystero';
 import type { Room } from 'trystero';
 import { AREA_HALF } from '../config';
 import type { GameState } from '../game';
 import type { QualitySettings } from '../quality';
 import { setNetStatus } from '../ui/loading';
+import { botPeerId, peerColor, type BotState } from './peers';
 import { createRemotePlayers } from './remote-players';
 
 /** 同じアプリ同士だけが出会うための名前空間 */
@@ -45,8 +46,21 @@ const SNAP_GAP = 600;
 const SNAP_DISTANCE = 30;
 /** ピアごとのリングバッファ段数（12Hz で約1.3秒ぶん） */
 const CAPACITY = 16;
-/** 同時に描く遠隔プレイヤーの上限（想定同時数〜8人） */
+/** 同時に描く遠隔プレイヤーの上限（想定同時数〜8人。BOT と共用・契約12） */
 const MAX_REMOTE = 8;
+/** これより遠いゴーストは描かない[m]（点にしかならないので描画コールの無駄・E92） */
+const DRAW_DISTANCE = 700;
+/** これより近いゴーストだけ関節つきのフル表示にする[m]（それ以外は1メッシュ・E92） */
+const DETAIL_DISTANCE = 45;
+/**
+ * フル表示にする人数の上限（E92）。人型はパーツで10メッシュあるので、最終安置に
+ * 8体が集まっても描画コール予算（mobile draw ≤ 100）を割らないよう頭数で抑える
+ */
+const DETAIL_LIMIT = 2;
+/** BOT 状態の送信間隔[ms]（8Hz。8体を1パケットにまとめるので帯域は state 1人ぶん強） */
+const BOT_SEND_INTERVAL = 1000 / 8;
+/** BOT の上限（remote スロットと同数） */
+const MAX_BOTS = MAX_REMOTE;
 /** 受け入れる座標の範囲[m]。エリア外の値は壊れたピアとみなして捨てる（E27） */
 const LIMIT_XZ = AREA_HALF + 200;
 const LIMIT_Y_MIN = -500;
@@ -65,7 +79,11 @@ const TAU = Math.PI * 2;
  * 1回ぶんのスナップショット（JSON。キーは短く）。
  * m=0（徒歩）なら x,y,z は足元・a は体の向き・s は歩行速度、
  * m=1（運転）なら x,y,z は車体・a は車体の向き・s は車速。
- * 徒歩中の相手の車は描かないので、車と人を1組の座標で送れば足りる。
+ * m=2（ヘリ）・m=3（イノシシ騎乗）も同じ並びで、乗り物の座標と向きを送る（契約12）。
+ * 乗っていない相手の乗り物は描かないので、乗り物と人を1組の座標で送れば足りる。
+ *
+ * m は元から number なので、2・3 が増えても形は変わらない（後方互換）。
+ * 知らない値を受け取った側は「徒歩ではない何か」として車と同じ経路で描くだけになる。
  */
 type Snapshot = {
     t: number;
@@ -76,6 +94,23 @@ type Snapshot = {
     a: number;
     s: number;
 };
+
+/**
+ * BOT の状態（契約12）。ホストだけが送る。**state と同じ形**の値を、
+ * 1パケットにまとめて別チャンネル（'bots'）で配る:
+ *   - 人間のスナップショットと混ざらないので、このチャンネルを知らない
+ *     クライアントは BOT が見えないだけで従来どおり動く（後方互換）
+ *   - 受け手はこれを仮想ピア（bot0…）として**人間と同じ補間・同じスロット**で描く
+ * n = このホストが動かしている BOT の数（これ以上の番号のゴーストは消す・E88）
+ */
+type BotPacket = {
+    t: number;
+    n: number;
+    /** [番号, m, x, y, z, yaw, speed] の並び */
+    b: number[][];
+};
+
+export type { BotState } from './peers';
 
 /**
  * マッチ同期（契約10）。state とは**別のチャンネル**なので、このチャンネルを知らない
@@ -140,8 +175,12 @@ interface Peer {
     z: Float32Array;
     a: Float32Array;
     s: Float32Array;
-    /** 現在の状態（乗降のたびにバッファを捨てるので、段ごとには持たない） */
-    driving: boolean;
+    /** 現在の移動状態（乗降のたびにバッファを捨てるので、段ごとには持たない） */
+    mode: number;
+    /** BOT の仮想ピアか（ホスト選出・人数表示から外す・E91） */
+    bot: boolean;
+    /** この BOT を配っているホストのピアID（ホスト交代で時計が変わる・E88） */
+    sender: string;
     /** マーカーの色（ピアIDのハッシュ由来。3Dのゴーストと同じ色） */
     color: number;
     /** 直近に描いた補間位置。2Dマップ（契約09）とマッチ（契約10/11）が読む */
@@ -181,6 +220,12 @@ export interface Multiplayer {
     peerIds(): readonly string[];
     /** ピアIDに対応する色（3Dゴースト・マップのマーカーと同じ） */
     colorOf(id: string): number;
+    /**
+     * ホストが動かす BOT の状態を配る（契約12）。呼ぶたびにローカルへも同じものを
+     * 流し込むので、ホスト自身も**遠隔プレイヤーとまったく同じ経路**で BOT を描く。
+     * null / 空配列で BOT のゴーストを片付ける（E88）
+     */
+    publishBots(states: readonly BotState[] | null): void;
     /** マッチチャンネルへ送る（契約10） */
     sendMatch(packet: MatchPacket): void;
     /** マッチチャンネルの受信ハンドラ（1つだけ。後から差し替えられる） */
@@ -203,16 +248,9 @@ function angleDelta(from: number, to: number): number {
     return d;
 }
 
-/** ピアIDのハッシュで決まる色。乱数は使わないので、同じ相手はどのタブでも同じ色になる */
-const hsl = new Color();
-function peerColor(id: string): number {
-    let hash = 0x811c9dc5;
-    for (let i = 0; i < id.length; i++) {
-        hash ^= id.charCodeAt(i);
-        hash = Math.imul(hash, 0x01000193);
-    }
-    const hue = ((hash >>> 0) % 360) / 360;
-    return hsl.setHSL(hue, 0.58, 0.5).getHex();
+/** 移動状態 → 同期の m（徒歩と降下は同じ 0。空にいることは座標が語る） */
+function modeOf(mode: GameState['mode']): number {
+    return mode === 'drive' ? 1 : mode === 'heli' ? 2 : mode === 'boar' ? 3 : 0;
 }
 
 /** 受信値の検証（E27）。1つでも怪しければパケットごと捨てる */
@@ -251,10 +289,17 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
     let hud = '';
     let relayLive = true;
     let relayChecked = false;
+    /** 人間のピア数（BOT は数えない・E91） */
+    const humanCount = (): number => {
+        let count = 0;
+        for (const peer of peers) if (!peer.bot) count++;
+        return count;
+    };
     const showCount = (): void => {
+        const humans = humanCount();
         const text =
-            peers.length > 0
-                ? `マルチプレイ: ${peers.length + 1}人（自分を含む）`
+            humans > 0
+                ? `マルチプレイ: ${humans + 1}人（自分を含む）`
                 : relayChecked && !relayLive
                   ? 'マルチプレイ: 未接続（単独プレイ）'
                   : 'マルチプレイ: 自分のみ';
@@ -264,7 +309,7 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
     };
     showCount();
 
-    const add = (id: string): Peer => {
+    const add = (id: string, bot = false, sender = ''): Peer => {
         const color = peerColor(id);
         const peer: Peer = {
             id,
@@ -279,7 +324,9 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
             z: new Float32Array(CAPACITY),
             a: new Float32Array(CAPACITY),
             s: new Float32Array(CAPACITY),
-            driving: false,
+            mode: 0,
+            bot,
+            sender,
             color,
             drawX: 0,
             drawY: 0,
@@ -306,11 +353,16 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
         if (index >= 0) removeAt(index);
     };
 
-    /** 受信したスナップショットをバッファへ積む */
-    const receive = (packet: Snapshot, id: string): void => {
+    /** 受信したスナップショットをバッファへ積む（BOT も同じ経路を通る・契約12） */
+    const receive = (packet: Snapshot, id: string, bot = false, sender = ''): void => {
         if (!isValid(packet)) return;
         const now = performance.now();
-        const peer = byId.get(id) ?? add(id);
+        const peer = byId.get(id) ?? add(id, bot, sender);
+        // ホストが替わると BOT の時計の起点も替わる。積んであるものは捨てて測り直す（E88）
+        if (bot && peer.sender !== sender) {
+            peer.sender = sender;
+            peer.count = 0;
+        }
         // 相手の performance.now() は起点が違う。最も遅延の小さかった受信を基準に写す。
         // 少しずつ緩める（0.5%）ことで、一度たまたま小さく出た値に張り付かないようにする
         const sample = now - packet.t;
@@ -325,15 +377,15 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
         // 順不同・重複は捨てる（E3）
         if (peer.count > 0 && time <= peer.time[newest]) return;
 
-        const driving = packet.m === 1;
+        const mode = packet.m;
         // 乗降・リスポーン・長い中断のあとは補間せずに飛ばす（引き伸ばして走らせない）
         const jumped =
             peer.count > 0 &&
-            (driving !== peer.driving ||
+            (mode !== peer.mode ||
                 time - peer.time[newest] > SNAP_GAP ||
                 Math.hypot(packet.x - peer.x[newest], packet.z - peer.z[newest]) > SNAP_DISTANCE);
         if (jumped) peer.count = 0;
-        peer.driving = driving;
+        peer.mode = mode;
 
         const i = peer.count === 0 ? 0 : (newest + 1) % CAPACITY;
         peer.time[i] = time;
@@ -351,6 +403,7 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
     const draw = (peer: Peer, renderTime: number, dt: number): void => {
         if (peer.count === 0 || peer.slot < 0) {
             peer.drawn = false;
+            if (peer.slot >= 0) remote.hide(peer.slot);
             return;
         }
         const newest = peer.head;
@@ -380,11 +433,19 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
         const z = peer.z[ai] + (peer.z[bi] - peer.z[ai]) * k;
         const yaw = peer.a[ai] + angleDelta(peer.a[ai], peer.a[bi]) * k;
         const speed = peer.s[ai] + (peer.s[bi] - peer.s[ai]) * k;
-        remote.show(peer.slot, peer.driving, x, y, z, yaw, speed, dt);
         peer.drawX = x;
         peer.drawY = y;
         peer.drawZ = z;
         peer.drawYaw = yaw;
+        // 遠すぎるゴーストは描かない / 遠い・多いときは簡易アバターへ落とす（予算・E92）
+        const distance = Math.hypot(x - state.x, y - state.y, z - state.z);
+        if (distance > DRAW_DISTANCE) {
+            remote.hide(peer.slot);
+            // マップのマーカー（契約09）は距離に関わらず出す。drawn は「位置が分かる」の意味
+            peer.drawn = true;
+            return;
+        }
+        remote.show(peer.slot, peer.mode, x, y, z, yaw, speed, dt, distance <= detailCut);
         peer.drawn = true;
     };
 
@@ -401,6 +462,33 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
     // マッチ同期（契約10）は state と別チャンネルで、送れなくても本体は動き続ける
     let sendMatchPacket: ((packet: MatchPacket) => Promise<void>) | null = null;
     let matchHandler: ((packet: MatchPacket, peerId: string) => void) | null = null;
+    // BOT 配信（契約12）も別チャンネル。知らないクライアントには何も届かない
+    let sendBotPacket: ((packet: BotPacket) => Promise<void>) | null = null;
+
+    /** 受け取った BOT パケットを人間と同じ受信経路へ流す */
+    const receiveBots = (packet: BotPacket, from: string): void => {
+        if (!packet || !Array.isArray(packet.b) || !Number.isFinite(packet.t)) return;
+        const count = Number.isInteger(packet.n) ? Math.max(0, Math.min(MAX_BOTS, packet.n)) : 0;
+        for (const row of packet.b) {
+            if (!Array.isArray(row) || row.length < 7) continue;
+            const index = row[0];
+            if (!Number.isInteger(index) || index < 0 || index >= MAX_BOTS) continue;
+            incoming.t = packet.t;
+            incoming.m = row[1];
+            incoming.x = row[2];
+            incoming.y = row[3];
+            incoming.z = row[4];
+            incoming.a = row[5];
+            incoming.s = row[6];
+            receive(incoming, botPeerId(index), true, from);
+        }
+        // 引退した BOT（E86）・マッチ終了ぶんのゴーストはその場で消す（E88）
+        for (let i = peers.length - 1; i >= 0; i--) {
+            const peer = peers[i];
+            if (!peer.bot || peer.sender !== from) continue;
+            if (Number(peer.id.slice(3)) >= count) removeAt(i);
+        }
+    };
 
     try {
         session = joinRoom({ appId: APP_ID }, room, {
@@ -417,6 +505,12 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
             }
         };
         sendMatchPacket = (packet) => matchAction.send(packet);
+        const botAction = session.makeAction<BotPacket>('bots');
+        botAction.onMessage = (packet, context) => {
+            // 中身の検証は receiveBots が行う（E27 と同じく怪しい行は捨てる）
+            if (packet && typeof packet === 'object') receiveBots(packet, context.peerId);
+        };
+        sendBotPacket = (packet) => botAction.send(packet);
         session.onPeerJoin = (id) => {
             if (!byId.has(id)) add(id);
         };
@@ -440,12 +534,21 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
 
     // 送信用の使い回し。trystero は send の呼び出し時に同期でJSON化するので共有して安全
     const outgoing: Snapshot = { t: 0, m: 0, x: 0, y: 0, z: 0, a: 0, s: 0 };
+    /** BOT を受信経路へ流し込むときの使い回し（receive は値をコピーするので共有して安全） */
+    const incoming: Snapshot = { t: 0, m: 0, x: 0, y: 0, z: 0, a: 0, s: 0 };
+    const botOut: BotPacket = { t: 0, n: 0, b: [] };
     let lastSend = 0;
+    let lastBotSend = 0;
+    /** フル表示にする距離のしきい値[m]（毎フレーム決め直す・E92） */
+    let detailCut = DETAIL_DISTANCE;
+    /** 近い順の距離[m]（上位 DETAIL_LIMIT 件だけ持つ。使い回し） */
+    const nearest = new Float64Array(DETAIL_LIMIT);
     /** いまの自分の状態を送信バッファへ写す */
     const capture = (): void => {
-        const driving = state.mode === 'drive';
-        const source = driving ? state.vehicle : state;
-        outgoing.m = driving ? 1 : 0;
+        // 乗り物に乗っていれば乗り物の座標を送る（徒歩・降下中は自分の足元）
+        const mode = modeOf(state.mode);
+        const source = mode === 0 ? state : state.vehicle;
+        outgoing.m = mode;
         outgoing.x = source.x;
         outgoing.y = source.y;
         outgoing.z = source.z;
@@ -474,10 +577,10 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
 
             // --- 送信（12Hz。止まっている間は間引く） ---
             if (send && now - lastSend >= SEND_INTERVAL) {
-                const driving = state.mode === 'drive';
-                const source = driving ? state.vehicle : state;
+                const mode = modeOf(state.mode);
+                const source = mode === 0 ? state : state.vehicle;
                 const moved =
-                    driving !== (outgoing.m === 1) ||
+                    mode !== outgoing.m ||
                     Math.abs(source.x - outgoing.x) +
                         Math.abs(source.y - outgoing.y) +
                         Math.abs(source.z - outgoing.z) >
@@ -491,6 +594,25 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
                 }
             }
 
+            // フル表示にする距離のしきい値。近い順に DETAIL_LIMIT 人までに絞る（E92）。
+            // 直前フレームの描画位置で測る（1フレーム古いが、切り替えの判断には十分）
+            detailCut = DETAIL_DISTANCE;
+            let ranked = 0;
+            for (const peer of peers) {
+                if (peer.count === 0 || peer.slot < 0) continue;
+                const d = Math.hypot(peer.drawX - state.x, peer.drawY - state.y, peer.drawZ - state.z);
+                if (d > DETAIL_DISTANCE) continue;
+                // 上位 DETAIL_LIMIT 件だけを覚える（挿入ソート。最大でも8件）
+                let at = Math.min(ranked, DETAIL_LIMIT - 1);
+                while (at > 0 && nearest[at - 1] > d) {
+                    nearest[at] = nearest[at - 1];
+                    at--;
+                }
+                if (at < DETAIL_LIMIT) nearest[at] = d;
+                ranked = Math.min(ranked + 1, DETAIL_LIMIT);
+            }
+            if (ranked >= DETAIL_LIMIT) detailCut = nearest[DETAIL_LIMIT - 1];
+
             // --- 受信ぶんの描画。ついでにタイムアウトしたピアを外す（E26） ---
             const renderTime = now - INTERP_DELAY;
             for (let i = peers.length - 1; i >= 0; i--) {
@@ -502,7 +624,7 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
         eachPlayer(visit) {
             for (const peer of peers) {
                 if (!peer.drawn) continue;
-                visit(peer.drawX, peer.drawZ, peer.drawYaw, peer.driving, peer.color, peer.id);
+                visit(peer.drawX, peer.drawZ, peer.drawYaw, peer.mode !== 0, peer.color, peer.id);
             }
         },
         eachPeerPosition(visit) {
@@ -515,12 +637,53 @@ export function createMultiplayer(options: MultiplayerOptions): Multiplayer {
         peerIds() {
             idList.length = 0;
             idList.push(selfId);
-            for (const peer of peers) idList.push(peer.id);
+            // BOT は人間ではない。ホスト選出・人数表示から外す（E91）
+            for (const peer of peers) if (!peer.bot) idList.push(peer.id);
             idList.sort();
             return idList;
         },
         colorOf(id) {
             return byId.get(id)?.color ?? peerColor(id);
+        },
+        publishBots(states) {
+            const now = performance.now();
+            const count = states ? Math.min(states.length, MAX_BOTS) : 0;
+            // ローカルへは毎フレーム流し込む（ホスト自身の画面でも遠隔と同じ経路で描く）
+            for (let i = 0; i < count; i++) {
+                const bot = (states as readonly BotState[])[i];
+                incoming.t = now;
+                incoming.m = bot.mode;
+                incoming.x = bot.x;
+                incoming.y = bot.y;
+                incoming.z = bot.z;
+                incoming.a = bot.yaw;
+                incoming.s = bot.speed;
+                receive(incoming, botPeerId(bot.index), true, selfId);
+            }
+            for (let i = peers.length - 1; i >= 0; i--) {
+                const peer = peers[i];
+                if (!peer.bot || peer.sender !== selfId) continue;
+                if (Number(peer.id.slice(3)) >= count) removeAt(i);
+            }
+            if (!sendBotPacket || now - lastBotSend < BOT_SEND_INTERVAL) return;
+            lastBotSend = now;
+            botOut.t = now;
+            botOut.n = count;
+            botOut.b.length = 0;
+            for (let i = 0; i < count; i++) {
+                const bot = (states as readonly BotState[])[i];
+                // 座標は cm 単位へ丸めて桁を減らす（JSON の文字数がそのまま帯域になる）
+                botOut.b.push([
+                    bot.index,
+                    bot.mode,
+                    Math.round(bot.x * 100) / 100,
+                    Math.round(bot.y * 100) / 100,
+                    Math.round(bot.z * 100) / 100,
+                    Math.round(bot.yaw * 1000) / 1000,
+                    Math.round(bot.speed * 100) / 100,
+                ]);
+            }
+            void sendBotPacket(botOut).catch(() => undefined);
         },
         sendMatch(packet) {
             void sendMatchPacket?.(packet).catch(() => undefined);

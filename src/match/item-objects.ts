@@ -29,18 +29,25 @@ import {
     type Scene,
 } from 'three/webgpu';
 import { attribute, float, mix, uv, vec3 } from 'three/tsl';
+import { createBoarGeometry } from '../game/avatar';
 import type { QualitySettings } from '../quality';
 import { mergeParts, partMatrix, type GeometryPart } from '../world/geom';
+import { createChestGeometry } from './objects';
 
 const TAU = Math.PI * 2;
 
 /** インスタンス上限（超えたぶんは描かない。配置がこれを超えない設計にしてある） */
 const MAX_PICKUPS = 32;
-const MAX_BEACONS = 12;
+/** POI 8 + 補給2 + 見晴らしスポット4 ぶん（契約12） */
+const MAX_BEACONS = 16;
 const MAX_COINS = 192;
 const MAX_CRATES = 4;
 const MAX_CANOPIES = 10;
 const MAX_WINGS = 10;
+/** イノシシ（群れ・逃げる個体）・偽宝箱・見晴らしスポット（契約12） */
+const MAX_BOARS = 8;
+const MAX_MIMICS = 4;
+const MAX_LOOKOUTS = 4;
 
 /** ルートビーコン（光の柱）の高さ[m]・半径[m] */
 const BEACON_HEIGHT = 120;
@@ -69,6 +76,12 @@ export interface MatchItemObjects {
     canopies: InstancePool;
     /** 六甲おろしのマントの翼（自分と遠隔プレイヤーの滑空表示・E77） */
     wings: InstancePool;
+    /** 野生のイノシシ（群れ・ミミックから逃げる個体・契約12） */
+    boars: InstancePool;
+    /** 偽宝箱（ミミック）。本物と同じジオメトリ・契約12 */
+    mimics: InstancePool;
+    /** 見晴らしスポットの目印（展望デッキ・契約12） */
+    lookouts: InstancePool;
     /** 全部隠す（ロビー・リマッチ・E76） */
     reset(): void;
     dispose(): void;
@@ -157,6 +170,25 @@ function createWingGeometry(): BufferGeometry {
         });
     }
     parts.push({ geometry: new BoxGeometry(0.42, 0.1, 0.9), matrix: partMatrix(0, 0.06, 0.4), color: edge });
+    return mergeParts(parts);
+}
+
+/**
+ * 見晴らしスポットの目印（契約12）。展望デッキ風の柱＋手すり。
+ * 「ここで千里眼が使える」ことが遠くから分かればよいので小さく作る
+ */
+function createLookoutGeometry(): BufferGeometry {
+    const wood = 0x9a6b45;
+    const rail = 0xe3e8ee;
+    const parts: GeometryPart[] = [
+        { geometry: new CylinderGeometry(0.16, 0.2, 2.4, 8), matrix: partMatrix(0, 1.2, 0), color: wood },
+        { geometry: new CylinderGeometry(1.5, 1.5, 0.16, 14), matrix: partMatrix(0, 2.4, 0), color: wood },
+        { geometry: new TorusGeometry(1.45, 0.06, 6, 18), matrix: partMatrix(0, 3, 0, 1, 1, 1, Math.PI / 2, 0, 0), color: rail },
+        { geometry: new CylinderGeometry(0.05, 0.05, 0.62, 6), matrix: partMatrix(1.45, 2.7, 0), color: rail },
+        { geometry: new CylinderGeometry(0.05, 0.05, 0.62, 6), matrix: partMatrix(-1.45, 2.7, 0), color: rail },
+        { geometry: new CylinderGeometry(0.05, 0.05, 0.62, 6), matrix: partMatrix(0, 2.7, 1.45), color: rail },
+        { geometry: new CylinderGeometry(0.05, 0.05, 0.62, 6), matrix: partMatrix(0, 2.7, -1.45), color: rail },
+    ];
     return mergeParts(parts);
 }
 
@@ -283,6 +315,22 @@ export function createMatchItemObjects(scene: Scene, quality: QualitySettings): 
     });
     const wings = build(createWingGeometry(), wingMaterial, MAX_WINGS, false);
 
+    // --- 野生のイノシシ（契約12）---
+    const boarMaterial = new MeshStandardNodeMaterial({ vertexColors: true, roughness: 0.85 });
+    const boars = build(createBoarGeometry(), boarMaterial, MAX_BOARS, false, true);
+
+    // --- 偽宝箱（本物と同じ材質・同じ形。見分けはつかない・契約12）---
+    const mimicMaterial = new MeshStandardNodeMaterial({
+        vertexColors: true,
+        roughness: 0.62,
+        metalness: 0.12,
+    });
+    const mimics = build(createChestGeometry(), mimicMaterial, MAX_MIMICS, false, true);
+
+    // --- 見晴らしスポットの目印（契約12）---
+    const lookoutMaterial = new MeshStandardNodeMaterial({ vertexColors: true, roughness: 0.7 });
+    const lookouts = build(createLookoutGeometry(), lookoutMaterial, MAX_LOOKOUTS, false);
+
     scene.add(group);
 
     return {
@@ -292,8 +340,21 @@ export function createMatchItemObjects(scene: Scene, quality: QualitySettings): 
         crates,
         canopies,
         wings,
+        boars,
+        mimics,
+        lookouts,
         reset() {
-            for (const pool of [pickups, beacons, coins, crates, canopies, wings]) {
+            for (const pool of [
+                pickups,
+                beacons,
+                coins,
+                crates,
+                canopies,
+                wings,
+                boars,
+                mimics,
+                lookouts,
+            ]) {
                 pool.begin();
                 pool.end();
             }

@@ -123,8 +123,11 @@ function createBeam(color: number): Mesh {
     return mesh;
 }
 
-/** ポップな宝箱（木箱 + かまぼこ蓋 + 金具）。1メッシュ */
-function createChest(quality: QualitySettings): Mesh {
+/**
+ * ポップな宝箱の形（木箱 + かまぼこ蓋 + 金具）。
+ * 偽宝箱（ミミック・契約12）も**同じジオメトリ**を使う — 見た目で見分けられない
+ */
+export function createChestGeometry(): ReturnType<typeof mergeParts> {
     const wood = 0xb9743a;
     const dark = 0x7c4520;
     const gold = 0xf5c542;
@@ -141,8 +144,13 @@ function createChest(quality: QualitySettings): Mesh {
         { geometry: new BoxGeometry(0.16, 0.98, 1.12), matrix: partMatrix(0.45, 0.5, 0), color: gold },
         { geometry: new BoxGeometry(0.3, 0.26, 0.16), matrix: partMatrix(0, 0.74, 0.55), color: gold },
     ];
+    return mergeParts(parts);
+}
+
+/** 本物の宝箱（1メッシュ） */
+function createChest(quality: QualitySettings): Mesh {
     const material = new MeshStandardNodeMaterial({ vertexColors: true, roughness: 0.62, metalness: 0.12 });
-    const mesh = new Mesh(mergeParts(parts), material);
+    const mesh = new Mesh(createChestGeometry(), material);
     mesh.castShadow = quality.shadows;
     mesh.receiveShadow = true;
     mesh.visible = false;
