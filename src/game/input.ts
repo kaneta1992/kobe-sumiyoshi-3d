@@ -5,6 +5,7 @@
  * ロックできない場合とタッチではドラッグに落とす。どちらも movementX/Y を
  * 使うので下流は同じ扱いでよい。
  */
+import { showLookHint } from '../ui/info';
 import { getLookScale } from '../ui/settings';
 import { createTouchControls, type ControlMode, type TouchControls } from '../ui/touch';
 
@@ -25,7 +26,7 @@ export interface InputState {
     down: boolean;
     /** ジャンプの押下（フレーム末に消費する） */
     jump: boolean;
-    /** ジャンプを押しっぱなしか（マントの滑空・契約11。フレーム末に消さない） */
+    /** ジャンプ／上昇ボタンを押しっぱなしか（ヘリの上下。フレーム末に消さない） */
     jumpHeld: boolean;
     /** スーパーマンモードの切り替え押下（?superman のときだけ使う・フレーム末に消費） */
     toggleFly: boolean;
@@ -59,6 +60,14 @@ export interface Input {
 
 /** 視点の基準感度[rad/px]。実際に使う値は設定の倍率を掛けた lookSpeed() */
 const LOOK_SPEED = 0.0028;
+/**
+ * タッチのスワイプに掛ける倍率（契約15 追記9）。
+ *
+ * マウスはポインタロックで机の上を何度でも擦れるが、スワイプは画面の端で終わる。
+ * 同じ rad/px では「感度が悪すぎる」になるので、タッチだけ既定を持ち上げる。
+ * 設定スライダーはこの上にさらに掛かるので、遅くしたい人は下げられる
+ */
+const TOUCH_LOOK_BOOST = 2.6;
 
 /** いま効いている視点感度[rad/px]（設定で変えられる・契約13-1） */
 export function lookSpeed(): number {
@@ -142,8 +151,17 @@ export function createInput(element: HTMLElement): Input {
     const onPointerMove = (e: PointerEvent): void => {
         if (suspended) return;
         if (!locked() && e.pointerId !== dragPointer) return;
-        state.lookX += e.movementX ?? 0;
-        state.lookY += e.movementY ?? 0;
+        const dx = e.movementX ?? 0;
+        const dy = e.movementY ?? 0;
+        if (e.pointerType === 'mouse') {
+            state.lookX += dx;
+            state.lookY += dy;
+            return;
+        }
+        state.lookX += dx * TOUCH_LOOK_BOOST;
+        state.lookY += dy * TOUCH_LOOK_BOOST;
+        // 初めて指で視点を回したときだけ「感度は設定で変えられる」と知らせる（追記9）
+        if (Math.abs(dx) + Math.abs(dy) > 2) showLookHint();
     };
     const onPointerUp = (e: PointerEvent): void => {
         if (e.pointerId === dragPointer) dragPointer = -1;

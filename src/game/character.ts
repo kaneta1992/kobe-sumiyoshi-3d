@@ -90,12 +90,6 @@ export interface Character {
      * KNOCKBACK_TIME 秒かけて押し出す。壁があれば当然そこで止まる（移動は controller 経由）
      */
     knockback(dirX: number, dirZ: number, distance: number): void;
-    /**
-     * 空中での補助（契約11 のマント・傘）。接地していない間だけ効く。
-     * sink  = 落下速度の上限[m/s]（0 = 通常の重力のまま）
-     * speed = 水平の目標速度[m/s]（0 = 通常の歩き/走り）
-     */
-    setAirAssist(sink: number, speed: number): void;
     /** 韋駄天の地下足袋（契約11）。急坂でも登れる・滑り落ちない */
     setSlopePower(on: boolean): void;
     /** 物理上の現在位置（補間なし） */
@@ -141,9 +135,6 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
     let pushX = 0;
     let pushZ = 0;
     let pushLeft = 0;
-    /** 空中補助（契約11）。落下速度の上限[m/s] と 水平の目標速度[m/s]。0 = 無効 */
-    let airSink = 0;
-    let airSpeed = 0;
     let slopePower = false;
 
     return {
@@ -177,22 +168,16 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
                 }
             }
 
-            // 空中補助（マント・傘）は接地していない間だけ効かせる
-            const gliding = !grounded && (airSink > 0 || airSpeed > 0);
-            const wanted =
-                gliding && airSpeed > 0 ? airSpeed : (slow ? SLOW_SPEED : BASE_SPEED) * speedScale;
+            const wanted = (slow ? SLOW_SPEED : BASE_SPEED) * speedScale;
             const length = Math.hypot(dirX, dirZ);
             const scale = length > 1 ? 1 / length : 1;
-            // 滑空（マント・傘）は自前の速度で操るので従来どおりの効き。
-            // ただの滞空中は AIR_ACCEL で鈍らせ、助走の勢いを残す（契約13-13）
-            const factor = 1 - Math.exp(-(grounded || gliding ? ACCEL : AIR_ACCEL) * dt);
+            // 滞空中は AIR_ACCEL で鈍らせ、助走の勢いを残す（契約13-13）
+            const factor = 1 - Math.exp(-(grounded ? ACCEL : AIR_ACCEL) * dt);
             velocity.x += (dirX * scale * wanted - velocity.x) * factor;
             velocity.z += (dirZ * scale * wanted - velocity.z) * factor;
 
             if (grounded && verticalVelocity <= 0) verticalVelocity = -GROUND_STICK;
             else verticalVelocity = Math.max(-MAX_FALL, verticalVelocity - GRAVITY * dt);
-            // 落下速度の頭打ち（上昇中は触らない = 踏み切りの高さは変えない）
-            if (gliding && airSink > 0 && verticalVelocity < -airSink) verticalVelocity = -airSink;
 
             next.x = velocity.x * dt;
             next.y = verticalVelocity * dt;
@@ -264,10 +249,6 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
         },
         setSpeedScale(scale) {
             speedScale = Math.max(0.05, Math.min(4, scale));
-        },
-        setAirAssist(sink, speed) {
-            airSink = Math.max(0, Math.min(60, sink));
-            airSpeed = Math.max(0, Math.min(40, speed));
         },
         setSlopePower(on) {
             if (on === slopePower) return;

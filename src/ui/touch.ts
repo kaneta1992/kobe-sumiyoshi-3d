@@ -30,7 +30,7 @@ export interface TouchControls {
     consumeInteract(): boolean;
     /** ジャンプボタンの押下を1回ぶん取り出す（徒歩のときだけ出る） */
     consumeJump(): boolean;
-    /** ジャンプボタンを押しっぱなしか（マントの滑空・契約11） */
+    /** ジャンプボタンを押しっぱなしか（ヘリの上昇・契約12） */
     readonly jumpHeld: boolean;
     setMode(mode: ControlMode): void;
     /** 乗降ボタンを押せる状態か（近くに車がある / 乗車中）を伝える */
@@ -166,7 +166,7 @@ export function createTouchControls(): TouchControls | null {
     interactButton.addEventListener('pointerup', interactUp);
     interactButton.addEventListener('pointercancel', interactUp);
     // ジャンプは押した瞬間に1回ぶんだけ出す（押しっぱなしで連続ジャンプしない）。
-    // 押しっぱなしかどうかは別に持つ（マントの滑空・契約11）
+    // 押しっぱなしかどうかは別に持つ（ヘリの上昇・契約12）
     jumpButton.addEventListener('pointerdown', (e) => {
         jumpPressed = true;
         state.jumpHeld = true;

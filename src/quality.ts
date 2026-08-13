@@ -4,11 +4,13 @@
  *   ?quality=mobile | desktop      プリセット強制
  *   ?tier=0|1|2                    プリセット内の段階を強制（動的降格を止める）
  *   ?stats                         画面内 stats を表示
- *   ?hour=15.5                     太陽の時刻
+ *   ?hour=15.5                     太陽の時刻（指定すると昼夜サイクルが止まる）
+ *   ?daylen=60                     昼夜が一周する実時間[s]（既定300 = 5分）
  *
  * 動的解像度スケーリング（追記2-2）と自動降格はここが持つ数値に従う。
  * 「性能が足りないときは段階的に落として止まらない」ことを最優先にする。
  */
+import { DAY_CYCLE_SECONDS } from './world/sun';
 
 export type QualityPreset = 'mobile' | 'desktop';
 
@@ -206,4 +208,15 @@ export function sunHour(): number {
     if (value === null) return 15;
     const raw = Number(value);
     return Number.isFinite(raw) ? Math.max(0, Math.min(24, raw)) : 15;
+}
+
+/**
+ * 昼夜が一周する実時間[s]（?daylen=秒。既定は 5分・契約15）。
+ * 検証では ?daylen=60 のように短くして1周を早送りする
+ */
+export function dayLengthSeconds(): number {
+    const value = new URLSearchParams(location.search).get('daylen');
+    if (value === null) return DAY_CYCLE_SECONDS;
+    const raw = Number(value);
+    return Number.isFinite(raw) && raw >= 1 ? raw : DAY_CYCLE_SECONDS;
 }

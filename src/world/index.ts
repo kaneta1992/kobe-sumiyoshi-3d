@@ -22,7 +22,7 @@ import { buildBridgeSpans, createBridges, type BridgeSpan } from './bridges';
 import { createBuildings, type BuildingCollision } from './buildings';
 import { setPlaces, type Landmark } from './landmarks';
 import { buildOccupancy } from './occupancy';
-import { createProps } from './props';
+import { createProps, type LampAnchor } from './props';
 import { createRoads } from './roads';
 import { createTerrain, type Terrain } from './terrain';
 import { createVegetation, type Vegetation } from './vegetation';
@@ -62,6 +62,11 @@ export interface World {
         /** 前処理アセットが無い環境では空（緑地レイヤーが出ないだけ・E57） */
         trees: readonly TreeInstance[];
     };
+    /**
+     * 街灯の灯体位置（契約15）。夜間照明（src/world/night-lights.ts）が
+     * ポイントライトプールとハローの割り当てに使う。品質段階で電柱を切ったときは空
+     */
+    lamps: readonly LampAnchor[];
     /** 地表標高[m]。エリア外は端の値にクランプされる */
     getElevationAt(x: number, z: number): number;
     /** 毎フレーム呼ぶ。HLOD 選択・距離/フラスタムカリング・樹木の詰め直し */
@@ -107,6 +112,9 @@ const frustum = new Frustum();
 const projScreen = new Matrix4();
 const cameraPos = new Vector3();
 const cameraDir = new Vector3();
+
+/** 電柱を切った品質段階では街灯も無い（毎回空配列を作らない） */
+const NO_LAMPS: readonly LampAnchor[] = [];
 
 /** 大きな生成を挟むたびに1フレーム譲ってローディング表示を止めない */
 function nextFrame(): Promise<void> {
@@ -254,7 +262,7 @@ export async function buildWorld(
     const group = new Group();
     group.name = 'world';
     group.add(terrain.group, roads.hlod.group, bridges.group, buildings.hlod.group);
-    if (props) group.add(props.group);
+    if (props) group.add(props.hlod.group);
     if (vegetation) group.add(vegetation.group);
     scene.add(group);
 
@@ -266,7 +274,10 @@ export async function buildWorld(
     }
 
     const chunkTotal =
-        terrain.chunkCount + buildings.hlod.cellCount + roads.hlod.cellCount + (props?.cellCount ?? 0);
+        terrain.chunkCount +
+        buildings.hlod.cellCount +
+        roads.hlod.cellCount +
+        (props?.hlod.cellCount ?? 0);
 
     // 徒歩視点は道路上に立たせる（原点は斜面や建物の中に落ちることがある）。
     // ?spawn=x,z を付けるとその座標にいちばん近い道路上へ降りる（橋などの目視検証用）
@@ -306,6 +317,7 @@ export async function buildWorld(
             water: features.water,
             trees: treePoints ?? [],
         },
+        lamps: props?.lamps ?? NO_LAMPS,
         getElevationAt: terrain.getElevationAt,
         update(camera, q, force = false) {
             camera.updateMatrixWorld();
@@ -317,7 +329,13 @@ export async function buildWorld(
             terrain.update(cameraPos, frustum, q);
             buildings.hlod.update(cameraPos, frustum, q.hlodNear, q.hlodMid, q.viewDistance);
             roads.hlod.update(cameraPos, frustum, q.hlodNear, q.hlodMid, q.viewDistance);
-            props?.update(cameraPos, frustum, q.propDistance * 0.45, q.propDistance, q.propDistance);
+            props?.hlod.update(
+                cameraPos,
+                frustum,
+                q.propDistance * 0.45,
+                q.propDistance,
+                q.propDistance,
+            );
             vegetation?.update(cameraPos, cameraDir, frustum, q, force);
 
             worldStats.chunksTotal = chunkTotal;
@@ -329,19 +347,22 @@ export async function buildWorld(
                 roads.hlod.drawn[0] +
                 roads.hlod.drawn[1] +
                 roads.hlod.drawn[2] +
-                (props ? props.drawn[0] + props.drawn[1] + props.drawn[2] : 0);
-            worldStats.hlod0 = buildings.hlod.drawn[0] + roads.hlod.drawn[0] + (props?.drawn[0] ?? 0);
-            worldStats.hlod1 = buildings.hlod.drawn[1] + roads.hlod.drawn[1] + (props?.drawn[1] ?? 0);
-            worldStats.hlod2 = buildings.hlod.drawn[2] + roads.hlod.drawn[2] + (props?.drawn[2] ?? 0);
+                (props ? props.hlod.drawn[0] + props.hlod.drawn[1] + props.hlod.drawn[2] : 0);
+            const propDrawn = props?.hlod.drawn;
+            worldStats.hlod0 = buildings.hlod.drawn[0] + roads.hlod.drawn[0] + (propDrawn?.[0] ?? 0);
+            worldStats.hlod1 = buildings.hlod.drawn[1] + roads.hlod.drawn[1] + (propDrawn?.[1] ?? 0);
+            worldStats.hlod2 = buildings.hlod.drawn[2] + roads.hlod.drawn[2] + (propDrawn?.[2] ?? 0);
             worldStats.treeNear = vegetation?.drawn[0] ?? 0;
             worldStats.treeMid = vegetation?.drawn[1] ?? 0;
             worldStats.treeFar = vegetation?.drawn[2] ?? 0;
         },
         async prewarm(renderer, warmScene, camera) {
-            // 一時的に全段階を可視にして、全パイプラインをコンパイルさせる
+            // 一時的に全段階を可視にして、全パイプラインをコンパイルさせる。
+            // ワールド外（夜間照明のハローなど・契約15）もシーンに居るぶんは含める —
+            // 「そのフレームに隠れているだけで、いずれ描くもの」を取りこぼさない
             const hidden: { object: { visible: boolean }; was: boolean }[] = [];
             const counts: { mesh: { count: number }; was: number }[] = [];
-            group.traverse((obj) => {
+            warmScene.traverse((obj) => {
                 const mesh = obj as unknown as { isInstancedMesh?: boolean; count: number };
                 if (!obj.visible) {
                     hidden.push({ object: obj, was: obj.visible });

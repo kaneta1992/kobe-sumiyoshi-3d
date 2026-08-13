@@ -84,7 +84,7 @@ const HELP_NEAR_CAR = '　★ F で乗車';
 const HELP_NEAR_HELI = '　★ F でヘリに乗る';
 const HELP_RIDE = '★輸送機　Space: 飛び降りる　ドラッグ/マウス: 視点';
 const HELP_FALL =
-    '★降下中　WASD/スティック: 前傾で水平へ大きく滑る　ドラッグ/マウス: 見回し　高度 110m で自動的に傘が開く';
+    '★降下中　WASD/スティック: 前傾で水平へ大きく滑る　ドラッグ/マウス: 見回し';
 
 /** ヘリに乗れる距離[m]（機体中心から。全長8mのローターの下に立てば乗れる） */
 const HELI_ENTER_RADIUS = 7;
@@ -143,6 +143,11 @@ export interface GameSky {
     ride(x: number, y: number, z: number, yaw: number): void;
     /** 飛び降りる（搭乗中に Space を押しても同じことが起きる） */
     leave(): void;
+    /**
+     * いまの足元から height[m] 上空へ打ち上げて降下に入る（マント・契約15 追記10）。
+     * 輸送機からの降下と違い**傘は開かない**ので、着地点は滑空で決める
+     */
+    launch(height: number): void;
     /** 途中で打ち切って地上へ戻す（リマッチ・E67） */
     cancel(): void;
 }
@@ -161,11 +166,6 @@ export interface Game {
     setSpeedScale(scale: number): void;
     /** 体当たりで押し飛ばされる（契約10） */
     knockback(dirX: number, dirZ: number, distance: number): void;
-    /**
-     * 空中での補助（契約11 のマント・傘）。sink = 落下速度の上限[m/s]、
-     * speed = 水平の目標速度[m/s]。どちらも 0 で通常の落下に戻る
-     */
-    setAirAssist(sink: number, speed: number): void;
     /** 韋駄天の地下足袋（契約11）。急坂でも登れる・滑り落ちない */
     setSlopePower(on: boolean): void;
     /**
@@ -175,8 +175,6 @@ export interface Game {
     teleportTo(x: number, z: number, yaw: number): void;
     /** カメラの向き[rad]（HUD の方角矢印を画面基準へ直すのに使う・契約11） */
     readonly viewYaw: number;
-    /** ジャンプを押しっぱなしか（マントの滑空・契約11） */
-    readonly jumpHeld: boolean;
     /**
      * ヘリコプターの発着地点を置く（契約12）。マッチがシードから決めた座標を渡す。
      * 空配列で機体を片付ける（リマッチ・E87）
@@ -625,6 +623,16 @@ export function createGame(options: GameOptions): Game {
             leave() {
                 skydive.leave();
             },
+            launch(height) {
+                // 打ち上げ前の足元をそのまま真上へ持ち上げる。カメラは startSky が
+                // 見下ろしへ寄せるので、上がりきった瞬間に着地点を探せる
+                const x = state.x;
+                const z = state.z;
+                const yaw = state.yaw;
+                startSky();
+                follow.yaw = yaw;
+                skydive.launch(x, physics.surfaceHeight(x, z) + height, z, yaw);
+            },
             cancel() {
                 endSky();
             },
@@ -926,9 +934,6 @@ export function createGame(options: GameOptions): Game {
             // 騎乗中も押し出しは効く（体当たりでイノシシごとよろける）
             if (mode === 'walk' || mode === 'boar') character.knockback(dirX, dirZ, distance);
         },
-        setAirAssist(sink, speed) {
-            character.setAirAssist(sink, speed);
-        },
         setSlopePower(on) {
             slopePowerWanted = on;
             character.setSlopePower(on || mode === 'boar');
@@ -979,9 +984,6 @@ export function createGame(options: GameOptions): Game {
         },
         get viewYaw() {
             return follow.yaw;
-        },
-        get jumpHeld() {
-            return input.state.jumpHeld;
         },
         warpTo(x, z, yaw) {
             warped = true;

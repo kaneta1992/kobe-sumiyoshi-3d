@@ -1,7 +1,7 @@
 /**
  * 六甲のイノシシ（契約12）。3種類の出どころを1つの群れとして扱う:
  *   1. ディレクターの「群れ通過」イベント（数頭が走り抜ける。乗れる）
- *   2. イノシシ呼び笛で召喚した1頭（すぐ乗れる）
+ *   2. 群れの個体は歩いて近づいて F で飛び乗れる（契約12）
  *   3. ミミックから飛び出した1頭（乗れない。逃げるだけ）
  *
  * 決定性: 群れの時刻・湧き位置・向きはマッチシードから決まる。走る先は
@@ -76,7 +76,6 @@ export interface Wildlife {
     /** 毎フレーム（items.boars の begin と end の間で呼ぶ） */
     update(frame: WildlifeFrame): void;
     /** 笛で1頭呼ぶ（その場で乗せる） */
-    summon(): void;
     /** ミミックから1頭飛び出させる（逃げるだけ） */
     spook(x: number, z: number): void;
     /** 近くの乗れる個体に乗る。乗ったら true（F の処理から呼ばれる） */
@@ -209,11 +208,6 @@ export function createWildlife(options: WildlifeOptions): Wildlife {
                 boar.y = world.getElevationAt(boar.x, boar.z);
                 items.boars.push(boar.x, boar.y, boar.z, boar.yaw, 1);
             }
-        },
-        summon() {
-            // 呼んだらその場で乗る（乗り手の下のイノシシは game 側が描く）
-            options.announce('イノシシ呼び笛 — 一頭が飛び出してきて、背に乗った！');
-            game.mountBoar(RIDE_SECONDS);
         },
         eachBoar(visit) {
             for (const boar of boars) {

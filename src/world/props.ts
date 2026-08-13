@@ -5,13 +5,19 @@
  * 配置は占有グリッドで建物・路面を避ける（E14）。電柱の足元標高は個別に取り、
  * 急斜面でも埋まらないようにする（E21）。
  *
- * HLOD: L0 = 電柱 + 腕金 + 変圧器 + 電線 / L1 = 電柱の柱だけ / L2 = 描かない。
+ * HLOD: L0 = 電柱 + 腕金 + 変圧器 + 電線 + 街灯 / L1 = 電柱の柱 + 街灯 / L2 = 描かない。
+ *
+ * 街灯（契約15）は全電柱に付く。灯体だけ aLamp=1 の頂点属性を持ち、夜になると
+ * 自照エミッシブで光る（ドローコールは増えない）。実際に道路を照らすポイントライトは
+ * プレイヤー近傍だけへプールで配る（src/world/night-lights.ts）。
  */
 import { Mesh, MeshStandardNodeMaterial, Object3D } from 'three/webgpu';
+import { attribute, vec3 } from 'three/tsl';
 import { createBuf, pushVertex, toGeometry, type MeshBuf } from './geom';
 import { buildHlod, type Hlod } from './hlod';
 import { hash01 } from './hash';
 import { OCC_BUILDING, OCC_ROAD, type Occupancy } from './occupancy';
+import { lampNode } from './sun';
 import type { QualitySettings } from '../quality';
 import type { RoadLine } from '../data/vector';
 
@@ -28,6 +34,23 @@ const RAIL_DROP = 1.6;
 const CONCRETE: readonly [number, number, number] = [0.31, 0.3, 0.285];
 const STEEL: readonly [number, number, number] = [0.2, 0.205, 0.21];
 const WIRE: readonly [number, number, number] = [0.02, 0.02, 0.022];
+const LAMP_SHELL: readonly [number, number, number] = [0.62, 0.6, 0.56];
+
+/** 街灯: 柱頭からの下がり[m]。電線（-0.35 / -1.35 / -2.1）より下に出す */
+const LAMP_DROP = 2.75;
+/** 街灯: 道路側への張り出し[m]（腕金は道路の外側を向いているので逆向きに出す） */
+const LAMP_REACH = 1.3;
+/** 街灯: 灯体の長さ[m] */
+const LAMP_BODY = 0.62;
+/** 灯体の自照の強さ。bloom で滲ませる前提でトーンマップ上限より上に置く */
+const LAMP_EMISSIVE = 3.4;
+
+/** 灯体の中心（ポイントライト・ハローを置く点）。描画と割り当てで同じ式を使う */
+function lampAnchorOf(pole: Pole): LampAnchor {
+    const y = pole.y + pole.height - LAMP_DROP;
+    const reach = LAMP_REACH + LAMP_BODY * 0.5;
+    return { x: pole.x - pole.armX * reach, y: y + 0.06, z: pole.z - pole.armZ * reach };
+}
 
 /** テーパー付き角柱。法線は側面方向 */
 function addPost(
@@ -203,9 +226,48 @@ function addWire(
     }
 }
 
+/**
+ * aLamp 属性を「いまの頂点数」まで value で埋める。
+ * addPost / addBox は共有ヘルパーなので、書いた直後に呼んで区間を塗り分ける。
+ */
+function padLamp(b: MeshBuf, value: number): void {
+    const out = b.extra['aLamp'];
+    if (!out) return;
+    const need = b.pos.length / 3;
+    while (out.length < need) out.push(value);
+}
+
+/** 街灯の灯具（ブラケット + 灯体）。灯体だけ aLamp=1 にして夜に自照させる */
+function addLamp(b: MeshBuf, pole: Pole): void {
+    const y = pole.y + pole.height - LAMP_DROP;
+    const bx = pole.x - pole.armX * LAMP_REACH;
+    const bz = pole.z - pole.armZ * LAMP_REACH;
+    // ブラケット（柱から道路側へ、わずかに上がりながら伸びる腕）
+    padLamp(b, 0);
+    addPost(b, pole.x, y, pole.z, bx, y + 0.18, bz, 0.05, 0.05, 4, STEEL);
+    padLamp(b, 0);
+    // 灯体（腕の先に付く横向きの筒）。ここだけが光る
+    addPost(
+        b,
+        bx,
+        y + 0.14,
+        bz,
+        bx - pole.armX * LAMP_BODY,
+        y - 0.02,
+        bz - pole.armZ * LAMP_BODY,
+        0.17,
+        0.12,
+        6,
+        LAMP_SHELL,
+    );
+    padLamp(b, 1);
+}
+
 function addPole(b: MeshBuf, pole: Pole, detailed: boolean): void {
     const top = pole.y + pole.height;
     addPost(b, pole.x, pole.y - 0.3, pole.z, pole.x, top, pole.z, 0.17, 0.11, detailed ? 7 : 4, CONCRETE);
+    // 街灯は遠景（L1）にも残す。夜の町並みは灯りの列で読ませたい
+    addLamp(b, pole);
     if (!detailed) return;
     // 腕金2段
     for (const [dy, half] of [
@@ -274,12 +336,25 @@ function addRail(b: MeshBuf, rail: Rail): void {
     }
 }
 
+/** 街灯の灯体の位置。夜間のポイントライトプール・ハローが参照する（契約15） */
+export interface LampAnchor {
+    x: number;
+    y: number;
+    z: number;
+}
+
+export interface PropsResult {
+    hlod: Hlod;
+    /** 全街灯の灯体位置。生成順なので全クライアントで同じ並びになる */
+    lamps: readonly LampAnchor[];
+}
+
 export function createProps(
     roads: readonly RoadLine[],
     occupancy: Occupancy,
     getElevationAt: (x: number, z: number) => number,
     quality: QualitySettings,
-): Hlod {
+): PropsResult {
     const props: Prop[] = [];
 
     for (let ri = 0; ri < roads.length; ri++) {
@@ -392,17 +467,23 @@ export function createProps(
         roughness: 0.72,
         metalness: 0.15,
     });
+    // 灯体の自照。lampNode が薄暮で 0→1 に上がるので点灯もフェードインする（E104）。
+    // bloom に載る強さにしてあるので、実ライトが割り当たっていない街灯でも光って見える
+    material.emissiveNode = vec3(1, 0.78, 0.46).mul(
+        attribute<'float'>('aLamp', 'float').mul(lampNode).mul(LAMP_EMISSIVE),
+    );
 
     const hlod = buildHlod(props, (level, indices): Object3D | null => {
         if (level === 2) return null;
-        const buf = createBuf();
+        const buf = createBuf(['aLamp']);
         for (const index of indices) {
             const prop = props[index];
             if (prop.kind === 'pole') addPole(buf, prop, level === 0);
             else if (level === 0) addRail(buf, prop);
         }
         if (buf.pos.length === 0) return null;
-        const mesh = new Mesh(toGeometry(buf), material);
+        padLamp(buf, 0);
+        const mesh = new Mesh(toGeometry(buf, { aLamp: 1 }), material);
         mesh.name = `props-L${level}`;
         mesh.castShadow = quality.shadows && level === 0;
         mesh.receiveShadow = true;
@@ -410,5 +491,8 @@ export function createProps(
         return mesh;
     });
     hlod.group.name = 'props';
-    return hlod;
+
+    const lamps: LampAnchor[] = [];
+    for (const prop of props) if (prop.kind === 'pole') lamps.push(lampAnchorOf(prop));
+    return { hlod, lamps };
 }

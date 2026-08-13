@@ -82,18 +82,16 @@ export function noBots(): boolean {
 export const GOTO_STANDOFF = 3;
 
 /**
- * ?matchgoto=chest|item|mimic|lookout 目標の手前へテレポートする（デバッグ限定）。
+ * ?matchgoto=chest|item|mimic 目標の手前へテレポートする（デバッグ限定）。
  * chest は隠された宝箱の通し検証用、item は「いちばん近い未取得アイテム」へ次々に飛ぶ
  * （拾うたびに次のアイテムへ自動で移る・契約11の検証用）。
- * mimic は偽宝箱、lookout は見晴らしスポット（千里眼）の検証用（契約12）。
+ * mimic は偽宝箱の検証用（契約12）。
  * 無指定と不正値は null なので、通常フローには何も出ない（key は契約14で廃止）
  */
-export type MatchGoto = 'chest' | 'item' | 'mimic' | 'lookout';
+export type MatchGoto = 'chest' | 'item' | 'mimic';
 export function matchGoto(): MatchGoto | null {
     const value = new URLSearchParams(location.search).get('matchgoto');
-    return value === 'chest' || value === 'item' || value === 'mimic' || value === 'lookout'
-        ? value
-        : null;
+    return value === 'chest' || value === 'item' || value === 'mimic' ? value : null;
 }
 
 // --- 決定的乱数 -------------------------------------------------------------

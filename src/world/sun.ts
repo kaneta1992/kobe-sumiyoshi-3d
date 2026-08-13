@@ -3,6 +3,7 @@
  * 同じ uniform を参照できるよう、シーングラフから切り離してここに置く。
  *
  * 時刻はパラメータ化（?hour=）。値は決定的なので全クライアントで同じ空になる。
+ * 既定では壁時計から 5分/周 で回る（cycleHour・契約15）。?hour / ?shot を付けると止まる。
  */
 import { Color, SRGBColorSpace, Vector2, Vector3 } from 'three/webgpu';
 import { uniform } from 'three/tsl';
@@ -26,8 +27,11 @@ export const hazeSunColor = new Color();
 export const ambientColor = new Color();
 export const bounceColor = new Color();
 
-/** 直射日光（夜は月光）の強さ・環境光の強さ。環境構築時に読む */
-export const lighting = { sun: 3.2, ambient: 0.9, night: 0 };
+/**
+ * 直射日光（夜は月光）の強さ・環境光の強さ。環境構築時に読み、
+ * 昼夜サイクル中は environment.update が毎フレーム読み直す（E108: 夜に環境光が残らない）
+ */
+export const lighting = { sun: 3.2, ambient: 0.9, night: 0, lamp: 0 };
 
 export const sunDirNode = uniform(sunDirection);
 export const sunColorNode = uniform(sunColor);
@@ -42,6 +46,16 @@ export const bounceColorNode = uniform(bounceColor);
 export const nightNode = uniform(0);
 /** 夕景の度合い（0=高い太陽 / 1=地平近く）。太陽まわりのにじみの広さに使う */
 export const duskNode = uniform(0);
+/**
+ * 灯りの点灯度合い（0=消灯 / 1=全点灯・契約15）。night より少し早く立ち上がるので、
+ * 日没前の薄暮から街灯・窓が段階的に点く（E104: パチッと全点灯しない）
+ */
+export const lampNode = uniform(0);
+/**
+ * 窓が点いている割合（0〜1）。夕〜宵で最大、深夜は疎らになる。
+ * シェーダー側はセルごとの決定的ハッシュをこの値と比べて点灯を決める
+ */
+export const windowLitNode = uniform(0);
 
 /**
  * ベイクGIの効き。1 で焼いた値そのまま、0 で無効。
@@ -59,6 +73,36 @@ export const windStrengthNode = uniform(1.0);
 /** フォグの効き始め・効き切りとハイトフォグの減衰高度 */
 export const fogRangeNode = uniform(new Vector2(500, 6800));
 export const fogHeightNode = uniform(new Vector2(60, 0.0016));
+
+/** 昼夜が一周する実時間[s]（契約15）。?daylen= で変えられる */
+export const DAY_CYCLE_SECONDS = 300;
+
+/**
+ * 壁時計から時刻[h]を決める（契約15）。
+ *
+ * 同期メッセージを一切使わずに全クライアントの時刻を一致させるための要。
+ * unix 時刻を周期で割った位相そのものなので、後から参加した人も、タブを裏に
+ * 置いていた人も、計算しなおすだけで即座に同じ空になる（E107）。
+ * 数秒の時計ずれは太陽高度にして 0.5° 未満なので視覚上は無視できる。
+ */
+export function cycleHour(unixMs: number, cycleSeconds: number): number {
+    const period = Math.max(1, cycleSeconds) * 1000;
+    const phase = ((unixMs % period) + period) % period;
+    return (phase / period) * 24;
+}
+
+/**
+ * 時刻ごとの窓の点灯率（3時間刻み・0時始まり）。
+ * 宵（18〜21時）が最大で、就寝後の深夜（3時）が最小。昼側の値は lamp で消えるので効かない。
+ */
+const WINDOW_LIT = [0.12, 0.05, 0.14, 0.3, 0.34, 0.4, 0.62, 0.36] as const;
+
+function windowLitAt(hour: number): number {
+    const p = ((((hour % 24) + 24) % 24) / 3) % 8;
+    const i = Math.floor(p);
+    const f = p - i;
+    return WINDOW_LIT[i] + (WINDOW_LIT[(i + 1) % 8] - WINDOW_LIT[i]) * f;
+}
 
 const DEG = Math.PI / 180;
 const LATITUDE = 34.740726 * DEG;
@@ -181,6 +225,15 @@ export function setSunHour(hour: number): void {
 
     nightNode.value = night;
     duskNode.value = dusk;
+
+    // --- 灯り（契約15） ---
+    // 街灯は日没を待たずに点き始める（実際の街も薄暮で点く）。night より早く、
+    // かつ緩やかに立ち上がるので、境目でパチッと切り替わらない（E104）
+    const lamp = smoothstep01(0.075, -0.035, sinAlt);
+    lighting.lamp = lamp;
+    lampNode.value = lamp;
+    // 窓は「点いている割合」を時刻から引き、そこへ薄暮のフェードを掛ける
+    windowLitNode.value = lamp * windowLitAt(hour);
 }
 
 /** 1バウンスの反射色（アスファルト・土・モルタルのならし） */

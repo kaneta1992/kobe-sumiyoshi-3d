@@ -104,8 +104,6 @@ export interface Match {
     drawMap(draw: MapDraw): void;
     /** 全体マップを後から渡す（どこでもドアの行き先指定・契約11） */
     attachMap(map: MapOverlay): void;
-    /** 霧玉で探知から消えている相手か（マップのマーカー抑止・契約11） */
-    isFogged(id: string): boolean;
     dispose(): void;
 }
 
@@ -837,14 +835,9 @@ export function createMatch(options: MatchOptions): Match {
         // 飛んだ先は R の戻り先にもなる（game.warpTo）。
         // ?matchgoto=item は「いちばん近い未取得アイテム」を追いかける。拾うと次の
         // アイテムが最寄りになるので、そのまま次々に飛べる（アイテムの通し確認用）。
-        // mimic / lookout も同じ仕組みで偽宝箱・見晴らしスポットの手前へ飛ぶ（契約12）
-        if ((gotoParam === 'item' || gotoParam === 'mimic' || gotoParam === 'lookout') && !spectator && !winner) {
-            const near =
-                gotoParam === 'item'
-                    ? dir.nearestDrop(px, pz)
-                    : gotoParam === 'mimic'
-                      ? dir.nearestMimic(px, pz)
-                      : dir.nearestLookoutSpot(px, pz);
+        // mimic も同じ仕組みで偽宝箱の手前へ飛ぶ（契約12）
+        if ((gotoParam === 'item' || gotoParam === 'mimic') && !spectator && !winner) {
+            const near = gotoParam === 'item' ? dir.nearestDrop(px, pz) : dir.nearestMimic(px, pz);
             if (near && (near.x !== gotoItemX || near.z !== gotoItemZ)) {
                 gotoItemX = near.x;
                 gotoItemZ = near.z;
@@ -862,9 +855,7 @@ export function createMatch(options: MatchOptions): Match {
                 hud.announce(
                     gotoParam === 'item'
                         ? 'デバッグ: 次のアイテムの手前へ移動（R で戻る）'
-                        : gotoParam === 'mimic'
-                          ? 'デバッグ: 偽宝箱の手前へ移動（R で戻る）'
-                          : 'デバッグ: 見晴らしスポットへ移動（R で戻る）',
+                        : 'デバッグ: 偽宝箱の手前へ移動（R で戻る）',
                 );
             }
         } else if (gotoParam === 'chest' && !spectator && !winner) {
@@ -1069,10 +1060,6 @@ export function createMatch(options: MatchOptions): Match {
         attachMap(map) {
             mapOverlay = map;
             dir.attachMap((onPick, onCancel) => map.pickPoint(onPick, onCancel));
-        },
-
-        isFogged(id) {
-            return dir.isFogged(id);
         },
 
         dispose() {

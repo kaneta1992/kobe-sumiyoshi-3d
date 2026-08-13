@@ -7,9 +7,13 @@
  */
 
 const LOOK_KEY = 'kobe3d.look';
-/** 視点感度の倍率の範囲（1 = 従来の感度） */
+/**
+ * 視点感度の倍率の範囲（1 = 従来の感度）。
+ * 上限は「もっと速く回したい」という声に合わせて 2.5 → 5 へ広げた（契約15 追記9）。
+ * 保存済みの値は従来どおり読める（範囲を広げただけなのでクランプに掛からない）
+ */
 export const LOOK_MIN = 0.4;
-export const LOOK_MAX = 2.5;
+export const LOOK_MAX = 5;
 
 function readNumber(key: string, fallback: number, min: number, max: number): number {
     try {

@@ -12,10 +12,31 @@ import { LOOK_MAX, LOOK_MIN, getLookScale, isSeen, markSeen, setLookScale } from
 
 /** 初回の出典トーストを出しておく時間[ms] */
 const CREDIT_TOAST_HOLD = 7000;
+/** 視点感度の案内トーストを出しておく時間[ms] */
+const LOOK_TOAST_HOLD = 6000;
 
 export interface InfoPanel {
     open(tab?: string): void;
     close(): void;
+}
+
+/** createInfoPanel が入れる。パネルが無い（古い index.html）なら null のまま */
+let openPanel: ((tab?: string) => void) | null = null;
+
+/**
+ * 初めて指で視点を回したときに「感度は ℹ️ → 設定 で変えられる」と知らせる（契約15 追記9）。
+ * 2回目以降は出さない。タップすると設定タブが開く
+ */
+export function showLookHint(): void {
+    const toast = document.getElementById('look-toast');
+    if (!toast || isSeen('look')) return;
+    markSeen('look');
+    toast.classList.remove('hidden');
+    toast.addEventListener('click', () => {
+        toast.classList.add('hidden');
+        openPanel?.('settings');
+    });
+    window.setTimeout(() => toast.classList.add('hidden'), LOOK_TOAST_HOLD);
 }
 
 export function createInfoPanel(): InfoPanel | null {
@@ -39,6 +60,7 @@ export function createInfoPanel(): InfoPanel | null {
         modal.classList.remove('hidden');
     };
     const close = (): void => modal.classList.add('hidden');
+    openPanel = open;
 
     button.addEventListener('click', () => {
         if (modal.classList.contains('hidden')) open();

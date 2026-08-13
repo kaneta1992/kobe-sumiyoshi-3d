@@ -38,16 +38,15 @@ const TAU = Math.PI * 2;
 
 /** インスタンス上限（超えたぶんは描かない。配置がこれを超えない設計にしてある） */
 const MAX_PICKUPS = 32;
-/** POI 8 + 補給2 + 見晴らしスポット4 ぶん（契約12） */
+/** POI 8 + 補給2 ぶん */
 const MAX_BEACONS = 16;
 const MAX_COINS = 192;
 const MAX_CRATES = 4;
 const MAX_CANOPIES = 10;
 const MAX_WINGS = 10;
-/** イノシシ（群れ・逃げる個体）・偽宝箱・見晴らしスポット（契約12） */
+/** イノシシ（群れ・逃げる個体）・偽宝箱（契約12） */
 const MAX_BOARS = 8;
 const MAX_MIMICS = 4;
-const MAX_LOOKOUTS = 4;
 /** 倒れたステッキ（使った地点に残る方向の印・契約14-4）と 気配の粒（契約14-5） */
 const MAX_MARKS = 8;
 const MAX_MOTES = 14;
@@ -83,8 +82,6 @@ export interface MatchItemObjects {
     boars: InstancePool;
     /** 偽宝箱（ミミック）。本物と同じジオメトリ・契約12 */
     mimics: InstancePool;
-    /** 見晴らしスポットの目印（展望デッキ・契約12） */
-    lookouts: InstancePool;
     /** 使った地点に残る「倒れた尋ね人ステッキ」。yaw が宝箱の方角（契約14-4） */
     marks: InstancePool;
     /** 宝箱・ミミックの気配（自分の周りを舞うキラキラ・契約14-5） */
@@ -177,25 +174,6 @@ function createWingGeometry(): BufferGeometry {
         });
     }
     parts.push({ geometry: new BoxGeometry(0.42, 0.1, 0.9), matrix: partMatrix(0, 0.06, 0.4), color: edge });
-    return mergeParts(parts);
-}
-
-/**
- * 見晴らしスポットの目印（契約12）。展望デッキ風の柱＋手すり。
- * 「ここで千里眼が使える」ことが遠くから分かればよいので小さく作る
- */
-function createLookoutGeometry(): BufferGeometry {
-    const wood = 0x9a6b45;
-    const rail = 0xe3e8ee;
-    const parts: GeometryPart[] = [
-        { geometry: new CylinderGeometry(0.16, 0.2, 2.4, 8), matrix: partMatrix(0, 1.2, 0), color: wood },
-        { geometry: new CylinderGeometry(1.5, 1.5, 0.16, 14), matrix: partMatrix(0, 2.4, 0), color: wood },
-        { geometry: new TorusGeometry(1.45, 0.06, 6, 18), matrix: partMatrix(0, 3, 0, 1, 1, 1, Math.PI / 2, 0, 0), color: rail },
-        { geometry: new CylinderGeometry(0.05, 0.05, 0.62, 6), matrix: partMatrix(1.45, 2.7, 0), color: rail },
-        { geometry: new CylinderGeometry(0.05, 0.05, 0.62, 6), matrix: partMatrix(-1.45, 2.7, 0), color: rail },
-        { geometry: new CylinderGeometry(0.05, 0.05, 0.62, 6), matrix: partMatrix(0, 2.7, 1.45), color: rail },
-        { geometry: new CylinderGeometry(0.05, 0.05, 0.62, 6), matrix: partMatrix(0, 2.7, -1.45), color: rail },
-    ];
     return mergeParts(parts);
 }
 
@@ -363,10 +341,6 @@ export function createMatchItemObjects(scene: Scene, quality: QualitySettings): 
     });
     const mimics = build(createChestGeometry(), mimicMaterial, MAX_MIMICS, false, true);
 
-    // --- 見晴らしスポットの目印（契約12）---
-    const lookoutMaterial = new MeshStandardNodeMaterial({ vertexColors: true, roughness: 0.7 });
-    const lookouts = build(createLookoutGeometry(), lookoutMaterial, MAX_LOOKOUTS, false);
-
     // --- 倒れたステッキ（契約14-4）---
     const markMaterial = new MeshStandardNodeMaterial({
         vertexColors: true,
@@ -394,7 +368,6 @@ export function createMatchItemObjects(scene: Scene, quality: QualitySettings): 
         wings,
         boars,
         mimics,
-        lookouts,
         marks,
         motes,
         reset() {
@@ -407,7 +380,6 @@ export function createMatchItemObjects(scene: Scene, quality: QualitySettings): 
                 wings,
                 boars,
                 mimics,
-                lookouts,
                 marks,
                 motes,
             ]) {

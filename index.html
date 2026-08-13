@@ -91,8 +91,10 @@
                 user-select: none;
                 -webkit-user-select: none;
             }
-            /* E93: 初回だけ「出典はここ」と知らせる小さなトースト */
-            #info-toast {
+            /* E93: 初回だけ「出典はここ」と知らせる小さなトースト。
+               #look-toast（初回の視点感度案内・契約15 追記9）も同じ見た目を使う */
+            #info-toast,
+            #look-toast {
                 position: fixed;
                 z-index: 22;
                 right: max(10px, env(safe-area-inset-right, 0px));
@@ -106,7 +108,12 @@
                 line-height: 1.5;
                 cursor: pointer;
             }
+            /* 出典トーストと同時に出ても重ならないよう1段ずらす */
+            #look-toast {
+                bottom: calc(max(10px, env(safe-area-inset-bottom, 0px)) + 100px);
+            }
             #info-toast.hidden,
+            #look-toast.hidden,
             #info-modal.hidden {
                 display: none;
             }
@@ -118,11 +125,15 @@
                     left: max(10px, env(safe-area-inset-left, 0px));
                     top: max(10px, env(safe-area-inset-top, 0px));
                 }
-                #info-toast {
+                #info-toast,
+                #look-toast {
                     right: auto;
                     bottom: auto;
                     left: max(10px, env(safe-area-inset-left, 0px));
                     top: calc(max(10px, env(safe-area-inset-top, 0px)) + 48px);
+                }
+                #look-toast {
+                    top: calc(max(10px, env(safe-area-inset-top, 0px)) + 108px);
                 }
             }
             #info-modal {
@@ -873,6 +884,10 @@
         <div id="info-button" title="出典・操作・設定">ℹ️</div>
         <div id="info-toast" class="hidden">
             地図・地形データの出典は ℹ️ ボタンに掲載しています（タップで開く）
+        </div>
+        <!-- 初めて指で視点を回したときだけ、感度設定の在り処を知らせる（契約15 追記9） -->
+        <div id="look-toast" class="hidden">
+            視点の感度は ℹ️ → 設定 で変えられます（タップで開く）
         </div>
         <div id="info-modal" class="hidden">
             <div class="info-card">

@@ -4,8 +4,8 @@
  * 受け持ち:
  *   拾得       接触で申告 → ホスト裁定（宝箱と同経路。先着が正・E73）
  *   所持       2枠 + 収集品（地図の切れ端はスロットを使わない）
- *   効果       どこでもドア / ステッキ / マント / 足袋 / 傘 / 霧玉 / 千里眼
- *   情報       ステッキの方向線・千里眼の扇形・地図の円・宝箱の気配（契約14）
+ *   効果       どこでもドア / 尋ね人ステッキ / 六甲おろしのマント / 韋駄天の地下足袋（契約15 追記10 で4種）
+ *   情報       ステッキの方向線・地図の円・宝箱の気配（契約14）
  *   ディレクター ルートビーコン・コイン誘導・補給機・リード監視・アンチストール
  *
  * 契約14の情報経済: **無償で宝箱の位置を出すものはここには無い**。プレイヤーが自分で
@@ -29,7 +29,6 @@ import {
     MATCH_DEBUG,
     buildItemLayout,
     debugItems,
-    findLookouts,
     type ItemId,
     type ItemLayout,
 } from './items';
@@ -71,21 +70,17 @@ const SPEED_CAP = 2;
  * レアアイテムの突破感を優先する裁定）。最大 2.0 × 1.3 = 2.6 倍
  */
 const TABI_SPEED = 1.3;
-/** マント滑空: 落下速度の上限[m/s] と 水平速度[m/s] */
-const CAPE_SINK = 2.2;
-const CAPE_GLIDE = 12;
-/** 傘: 落下速度の上限[m/s] と 水平速度[m/s]。傘が開くのはこの高さ以上[m] */
-const UMBRELLA_SINK = 4.2;
-const UMBRELLA_GLIDE = 6.5;
-const UMBRELLA_ALTITUDE = 3;
+/**
+ * 六甲おろしのマントで打ち上がる高度[m]（契約15 追記10）。
+ * 水平:垂直 1.7:1 で滑空するので、ここから 1.9km 先まで届く =
+ * 2.4km 四方のどこへでも降りられる。安置の外から中へ一気に戻る手にもなる
+ */
+const CAPE_LAUNCH_HEIGHT = 1150;
 /** 地図の切れ端が揃う枚数 と、揃ったときに出る円の半径[m]（契約14-4） */
 const MAP_PIECES = 3;
 const MAP_CIRCLE = 40;
 /** 円の中心を宝箱からずらす最大距離[m]（中心が答えにならないように） */
 const MAP_CIRCLE_OFFSET = 18;
-/** 千里眼の扇形の半角[rad] と 距離帯の刻み[m]（契約14-4） */
-const CONE_HALF = 0.26;
-const BAND_STEP = 100;
 /** ステッキの方向線をマップに描く長さ[m] */
 const RAY_LENGTH = 1400;
 /** 補給機がエリアを横切る時間[s]（マッチ時計）と、投下するまでの時間[s] */
@@ -106,8 +101,6 @@ const BEACON_HIDE = 10;
 const FX_REFRESH = 1.2;
 const FX_HOLD = 2.2;
 
-/** 千里眼が使える見晴らしスポットからの距離[m] */
-const LOOKOUT_USE = 22;
 /** 気配の粒: 舞う半径[m]・高さ[m]・最大数（近いほど増える・契約14-5） */
 const MOTE_RADIUS = 1.9;
 const MOTE_HEIGHT = 1.3;
@@ -128,7 +121,7 @@ export interface DirectorOptions {
     /** 花火の打ち上げ・輸送機の使い回し（契約10 のオブジェクト） */
     objects: MatchObjects;
     items: MatchItemObjects;
-    /** イノシシ（群れ・笛・ミミック。契約12） */
+    /** イノシシ（群れ・ミミック。契約12） */
     wildlife: Wildlife;
     selfId: string;
     /** アイテム index を取ったと申告する（ホスト裁定へ流す） */
@@ -181,8 +174,6 @@ export interface Director {
     applyTake(index: number, who: string): void;
     /** 遠隔プレイヤーの効果表示（E77） */
     applyFx(peerId: string, effect: string, seconds: number): void;
-    /** ステッキ・マップの探知から消えているか（霧玉・E77） */
-    isFogged(id: string): boolean;
     /** アイテム由来の移動倍率（安置の減速と掛け合わせる） */
     readonly speedScale: number;
     /** いま回収できる場のアイテム（契約13-3）。無ければ null */
@@ -195,21 +186,14 @@ export interface Director {
     nearestDrop(x: number, z: number): { x: number; z: number } | null;
     /** 場に残っているアイテムを巡回する（BOT の目標選び・契約12） */
     eachDrop(visit: (index: number, x: number, z: number) => void): void;
-    /** ?matchgoto=mimic / lookout 用: いちばん近い偽宝箱 / 見晴らしスポット（契約12） */
+    /** ?matchgoto=mimic 用: いちばん近い偽宝箱（契約12） */
     nearestMimic(x: number, z: number): { x: number; z: number } | null;
-    nearestLookoutSpot(x: number, z: number): { x: number; z: number } | null;
     dispose(): void;
 }
 
 export function createDirector(options: DirectorOptions): Director {
     const { world, game, hud, objects, items, wildlife, selfId } = options;
     const planeY = world.stats.maxElevation + PLANE_CLEARANCE;
-    /**
-     * 見晴らしスポット（契約12）。地形は変わらないので最初のマッチで1回だけ測る。
-     * 標高の上位から離れた4か所（全員が同じ場所になる）
-     */
-    let lookouts: { x: number; z: number; y: number }[] | null = null;
-
     let layout: ItemLayout | null = null;
     /** 全体マップの1点指し（main.ts が attachMap で差す。未接続なら false を返すだけ） */
     let pickOnMap: (
@@ -234,14 +218,11 @@ export function createDirector(options: DirectorOptions): Director {
     /** 申告中のアイテム index → 入れたスロット（-1 = 地図の切れ端） */
     const pending = new Map<number, number>();
     let mapPieces = 0;
-    let fogLeft = 0;
     /**
      * 集めた手がかり（契約14-4）。マッチが終わるまで消えない = 情報が積み上がる。
-     * ステッキ = 使用地点から宝箱へ伸びる方向線 / 千里眼 = 方角+距離帯の扇形 /
-     * 地図3枚 = 宝箱を含む半径40mの円
+     * ステッキ = 使用地点から宝箱へ伸びる方向線 / 地図3枚 = 宝箱を含む半径40mの円
      */
     const marks: { x: number; y: number; z: number; angle: number }[] = [];
-    const cones: { x: number; z: number; angle: number; near: number; far: number }[] = [];
     let mapCircle: { x: number; z: number } | null = null;
     /** 円の中心を宝箱からずらす向き（シード由来。中心＝答えにしない） */
     let circleSeed = 0;
@@ -257,6 +238,8 @@ export function createDirector(options: DirectorOptions): Director {
     let mimicY = new Float32Array(0);
     let picking = false;
     let canUse = false;
+    /** マントで降下中か（打ち上げてから着地するまで・契約15 追記10） */
+    let capeFall = false;
     /** 遠隔へ配っている自分の空中状態 */
     let airState = '';
     let airSent = 0;
@@ -287,15 +270,8 @@ export function createDirector(options: DirectorOptions): Director {
     const drawPeerFx = (id: string, x: number, y: number, z: number): void => {
         const fx = peerFx.get(id);
         if (!fx || fx.until < peerNow) return;
-        if (fx.effect === 'canopy') items.canopies.push(x, y + 2.9, z, 0, 1);
-        else if (fx.effect === 'glide') items.wings.push(x, y + 1.5, z, 0, 1);
+        if (fx.effect === 'glide') items.wings.push(x, y + 1.5, z, 0, 1);
     };
-
-    function isFoggedAt(id: string, now: number): boolean {
-        if (id === selfId) return fogLeft > 0;
-        const fx = peerFx.get(id);
-        return !!fx && fx.effect === 'fog' && fx.until >= now;
-    }
 
     /** 立てる地点へ寄せる（建物の中・急斜面へ落とさない・E74） */
     const findStandable = (x: number, z: number): { x: number; z: number } => {
@@ -409,53 +385,19 @@ export function createDirector(options: DirectorOptions): Director {
             );
             return;
         }
-        if (id === 'fog') {
-            slots[index] = null;
-            fogLeft = spec.seconds;
-            options.sendFx('fog', spec.seconds);
-            objects.burst(game.state.x, game.state.y + 1.2, game.state.z, 0.56);
-            options.announce('住吉川の霧玉 — 45秒、探知から消える');
-            return;
-        }
-        if (id === 'whistle') {
-            // 空中・乗り物の上では吹けない（着地してから乗る・E85）
-            if (game.state.mode !== 'walk' || !game.state.grounded) {
-                options.announce('地面に降りてからでないとイノシシは呼べない');
+        if (id === 'cape') {
+            // 契約15 追記10: 使うとはるか上空へ打ち上がり、そこからパラシュート無しで
+            // 滑空して降りる。地上を走る移動とは別次元の一手で、使い切り
+            if (game.state.mode !== 'walk') {
+                options.announce('降りてからでないとマントは広げられない');
                 return;
             }
             slots[index] = null;
-            wildlife.summon();
-            return;
+            objects.burst(game.state.x, game.state.y + 1.4, game.state.z, 0.62);
+            game.sky.launch(CAPE_LAUNCH_HEIGHT);
+            capeFall = true;
+            options.announce('六甲おろしのマント — 空へ舞い上がった！ 好きな場所へ降りろ');
         }
-        if (id === 'eye') {
-            const spot = nearestLookout(game.state.x, game.state.z);
-            if (!spot) {
-                options.announce('展望台の千里眼は「見晴らしスポット」でしか使えない');
-                return;
-            }
-            // 契約14-4: 方角 + ざっくりした距離帯。扇形がマップに残る（点は出さない）
-            slots[index] = null;
-            const x = game.state.x;
-            const z = game.state.z;
-            const dx = chestX - x;
-            const dz = chestZ - z;
-            const distance = Math.hypot(dx, dz);
-            const near = Math.max(0, Math.round(distance / BAND_STEP) * BAND_STEP - BAND_STEP);
-            cones.push({ x, z, angle: Math.atan2(dx, -dz), near, far: near + BAND_STEP * 2 });
-            objects.burst(x, game.state.y + 2, z, 0.42);
-            options.announce(
-                `展望台の千里眼 — 宝箱は${compassName(dx, dz)}へ ${near}〜${near + BAND_STEP * 2}m`,
-            );
-        }
-    };
-
-    /** 使える距離にある見晴らしスポット（無ければ null・契約12） */
-    const nearestLookout = (x: number, z: number): { x: number; z: number; y: number } | null => {
-        if (!lookouts) return null;
-        for (const spot of lookouts) {
-            if (Math.hypot(spot.x - x, spot.z - z) <= LOOKOUT_USE) return spot;
-        }
-        return null;
     };
 
     const onKeyDown = (e: KeyboardEvent): void => {
@@ -522,25 +464,16 @@ export function createDirector(options: DirectorOptions): Director {
         return active;
     };
 
-    /** 空中での補助（マント・傘）を決めて、遠隔へ配る状態も更新する */
+    /**
+     * マントで打ち上がってから着地するまでの見た目（契約15 追記10）。
+     * 自分には翼を出し、遠隔にも「あいつ飛んでるぞ」が伝わるよう配信する。
+     * 降下そのものは game 側（skydive）が持っていて、ここは表示だけ
+     */
     const updateAir = (frame: DirectorFrame): void => {
-        const hasCape = slots[0] === 'cape' || slots[1] === 'cape';
-        const hasUmbrella = slots[0] === 'umbrella' || slots[1] === 'umbrella';
-        const airborne = frame.active && game.state.mode === 'walk' && !game.state.grounded;
-        const altitude = game.state.y - world.getElevationAt(game.state.x, game.state.z);
-        let next = '';
-        if (airborne && hasCape && game.jumpHeld) next = 'glide';
-        else if (airborne && hasUmbrella && altitude > UMBRELLA_ALTITUDE) next = 'canopy';
-
-        if (next === 'glide') game.setAirAssist(CAPE_SINK, CAPE_GLIDE);
-        else if (next === 'canopy') game.setAirAssist(UMBRELLA_SINK, UMBRELLA_GLIDE);
-        else game.setAirAssist(0, 0);
-
-        // 自分の見た目
+        if (capeFall && game.sky.state === 'off') capeFall = false;
+        const next = capeFall && frame.active ? 'glide' : '';
         if (next === 'glide') {
             items.wings.push(game.state.x, game.state.y + 1.5, game.state.z, game.state.yaw, 1);
-        } else if (next === 'canopy') {
-            items.canopies.push(game.state.x, game.state.y + 2.9, game.state.z, game.state.yaw, 1);
         }
 
         // 遠隔への配信（状態が変わったときと、続いている間は1.2秒ごと）
@@ -548,8 +481,8 @@ export function createDirector(options: DirectorOptions): Director {
         if (next !== airState || (next !== '' && airSent <= 0)) {
             if (MATCH_DEBUG && next !== airState) {
                 console.info(
-                    `[director] 空中補助 ${airState || 'なし'} → ${next || 'なし'}` +
-                        `　高度 ${altitude.toFixed(1)}m　時刻 ${(performance.now() * 0.001).toFixed(2)}s`,
+                    `[director] マント降下 ${airState || 'なし'} → ${next || 'なし'}` +
+                        `　時刻 ${(performance.now() * 0.001).toFixed(2)}s`,
                 );
             }
             airState = next;
@@ -617,7 +550,6 @@ export function createDirector(options: DirectorOptions): Director {
         const { t, dt } = frame;
         spin = (spin + dt * 1.6) % TAU;
         bob += dt * 2.4;
-        fogLeft = Math.max(0, fogLeft - dt);
         peerNow = performance.now();
         chestX = frame.chestX;
         chestZ = frame.chestZ;
@@ -647,7 +579,6 @@ export function createDirector(options: DirectorOptions): Director {
         items.wings.begin();
         items.boars.begin();
         items.mimics.begin();
-        items.lookouts.begin();
         items.marks.begin();
         items.motes.begin();
 
@@ -658,16 +589,6 @@ export function createDirector(options: DirectorOptions): Director {
         wildFrame.t = t;
         wildFrame.dt = dt;
         wildlife.update(wildFrame);
-
-        // --- 見晴らしスポット（千里眼が使える場所を目印で示す・契約12） ---
-        if (lookouts) {
-            for (const spot of lookouts) {
-                items.lookouts.push(spot.x, spot.y, spot.z, 0, 1);
-                if (Math.hypot(px - spot.x, pz - spot.z) > BEACON_HIDE) {
-                    items.beacons.push(spot.x, spot.y + 3, spot.z, 0, 0.32, 0x64f0c8);
-                }
-            }
-        }
 
         // --- 偽宝箱（ミミック・契約12。触れると開いてイノシシが飛び出す） ---
         for (let i = 0; i < layout.mimics.length; i++) {
@@ -799,7 +720,6 @@ export function createDirector(options: DirectorOptions): Director {
         items.wings.end();
         items.boars.end();
         items.mimics.end();
-        items.lookouts.end();
         items.marks.end();
         items.motes.end();
 
@@ -823,12 +743,9 @@ export function createDirector(options: DirectorOptions): Director {
         const parts: string[] = [`⚡ ×${(coinScale() * (hasTabi() ? TABI_SPEED : 1)).toFixed(2)}`];
         if (mapPieces > 0) parts.push(`🗺 ${Math.min(mapPieces, MAP_PIECES)}/${MAP_PIECES}`);
         if (hasTabi()) parts.push(`👟 ×${TABI_SPEED}`);
-        if (slots[0] === 'cape' || slots[1] === 'cape') parts.push('🦅 Space長押しで滑空');
         // 集めた手がかりの数（マップ(M)で重ねて見る・契約14-4）
         if (marks.length > 0) parts.push(`🔮 方向線 ${marks.length}`);
-        if (cones.length > 0) parts.push(`👁 扇形 ${cones.length}`);
         if (mapCircle) parts.push('🗺 円');
-        if (fogLeft > 0) parts.push(`🌫 ${Math.ceil(fogLeft)}s`);
         if (game.boarSeconds > 0) parts.push(`🐗 ${Math.ceil(game.boarSeconds)}s`);
         // 気配は距離が近いほど強い（契約14-5）
         if (sense > 0) parts.push(sense > 0.6 ? '✨ すぐそこだ！' : '✨ 気配');
@@ -845,16 +762,6 @@ export function createDirector(options: DirectorOptions): Director {
             layout = buildItemLayout(seed, nextLayout, world.mapFeatures.roads, previousSeed, probe);
             circleSeed = (seed ^ 0x4d3ac71b) >>> 0;
             const surface = game.physics.surfaceHeight;
-            // 見晴らしスポットは地形だけで決まるので1回測れば使い回せる（契約12）
-            if (!lookouts) {
-                lookouts = findLookouts(world.getElevationAt);
-                for (const spot of lookouts) spot.y = surface(spot.x, spot.z);
-                console.info(
-                    `[director] 見晴らしスポット ${lookouts
-                        .map((s) => `${s.x.toFixed(0)},${s.z.toFixed(0)}(${s.y.toFixed(0)}m)`)
-                        .join(' / ')}`,
-                );
-            }
             mimicOpened = new Uint8Array(layout.mimics.length);
             mimicY = new Float32Array(layout.mimics.length);
             for (let i = 0; i < layout.mimics.length; i++) {
@@ -902,13 +809,11 @@ export function createDirector(options: DirectorOptions): Director {
             pending.clear();
             peerFx.clear();
             mapPieces = 0;
-            fogLeft = 0;
             // ⚡の成長はマッチ単位。リマッチでは必ず 1.00 から（契約13-10）
             coins = 0;
             pickIndex = -1;
             // 集めた手がかりもマッチ単位。リマッチには持ち越さない（E99）
             marks.length = 0;
-            cones.length = 0;
             mapCircle = null;
             sense = 0;
             senseTold = false;
@@ -921,7 +826,6 @@ export function createDirector(options: DirectorOptions): Director {
             leadWarned = false;
             leadShown = -1;
             items.reset();
-            game.setAirAssist(0, 0);
             game.setSlopePower(false);
             hud.setSlots(null, null);
             hud.setBadge('');
@@ -931,25 +835,7 @@ export function createDirector(options: DirectorOptions): Director {
             if (!layout) return;
             const { ctx, screenX, screenY, ppm, scale, full } = draw;
 
-            // --- 集めた手がかり（契約14-4）。線・扇形・円が重なるほど場所が絞れる ---
-            // 千里眼の扇形（方角 + 距離帯）
-            for (const cone of cones) {
-                const sx = screenX(cone.x);
-                const sy = screenY(cone.z);
-                // 画面の角度へ（マップは +z が下・-z が上なので、北 = 上 = -90°）
-                const base = cone.angle - Math.PI / 2;
-                ctx.save();
-                ctx.fillStyle = 'rgba(100, 240, 200, 0.16)';
-                ctx.strokeStyle = 'rgba(100, 240, 200, 0.9)';
-                ctx.lineWidth = 1.5 * scale;
-                ctx.beginPath();
-                ctx.arc(sx, sy, Math.max(1, cone.near * ppm), base - CONE_HALF, base + CONE_HALF);
-                ctx.arc(sx, sy, Math.max(1, cone.far * ppm), base + CONE_HALF, base - CONE_HALF, true);
-                ctx.closePath();
-                ctx.fill();
-                ctx.stroke();
-                ctx.restore();
-            }
+            // --- 集めた手がかり（契約14-4）。線と円が重なるほど場所が絞れる ---
             // ステッキの方向線（2本の交点が宝箱）
             for (const mark of marks) {
                 const sx = screenX(mark.x);
@@ -1016,24 +902,6 @@ export function createDirector(options: DirectorOptions): Director {
                 ctx.stroke();
             });
 
-            // 見晴らしスポット（千里眼が使える場所・契約12）
-            if (lookouts) {
-                ctx.fillStyle = '#64f0c8';
-                ctx.strokeStyle = '#ffffff';
-                ctx.lineWidth = 1.5 * scale;
-                for (const spot of lookouts) {
-                    const sx = screenX(spot.x);
-                    const sy = screenY(spot.z);
-                    const size = 5 * scale;
-                    ctx.beginPath();
-                    ctx.moveTo(sx, sy - size);
-                    ctx.lineTo(sx + size, sy + size * 0.8);
-                    ctx.lineTo(sx - size, sy + size * 0.8);
-                    ctx.closePath();
-                    ctx.fill();
-                    ctx.stroke();
-                }
-            }
             // 補給クレート
             for (let i = 0; i < layout.supplies.length; i++) {
                 if (!supplyLanded[i] || !spotAlive(-1 - i)) continue;
@@ -1052,7 +920,6 @@ export function createDirector(options: DirectorOptions): Director {
             if (!full) return;
             const rows: [string, string][] = [];
             if (marks.length > 0) rows.push(['#9b7bff', 'ステッキの方向線（交点＝宝箱）']);
-            if (cones.length > 0) rows.push(['#64f0c8', '千里眼の扇形（方角と距離帯）']);
             if (mapCircle) rows.push(['#f2d16b', `地図の円（半径${MAP_CIRCLE}m・この中）`]);
             if (rows.length === 0) return;
             ctx.save();
@@ -1105,15 +972,11 @@ export function createDirector(options: DirectorOptions): Director {
                 peerFx.delete(peerId);
                 return;
             }
-            if (effect !== 'glide' && effect !== 'canopy' && effect !== 'fog') return;
+            // 廃止したアイテムの効果（canopy=傘 / fog=霧玉・契約15 追記10）は黙って捨てる。
+            // 古いクライアントから届いても落ちないよう、受信は互換のまま残す
+            if (effect !== 'glide') return;
             const hold = Math.max(0, Math.min(120, seconds));
             peerFx.set(peerId, { effect, until: performance.now() + hold * 1000 });
-            if (effect === 'fog') {
-                options.announce(`${options.nameOf(peerId)}が霧に紛れて消えた`);
-            }
-        },
-        isFogged(id) {
-            return isFoggedAt(id, performance.now());
         },
         get speedScale() {
             // ⚡は上限2倍、足袋はその上に重ねる（契約13 項目11の裁定）
@@ -1170,18 +1033,6 @@ export function createDirector(options: DirectorOptions): Director {
             }
             return best;
         },
-        nearestLookoutSpot(x, z) {
-            if (!lookouts) return null;
-            let best: { x: number; z: number } | null = null;
-            let bestDistance = Infinity;
-            for (const spot of lookouts) {
-                const d = Math.hypot(spot.x - x, spot.z - z);
-                if (d >= bestDistance) continue;
-                bestDistance = d;
-                best = spot;
-            }
-            return best;
-        },
         nearestDrop(x, z) {
             if (!layout) return null;
             let best: { x: number; z: number } | null = null;
@@ -1199,7 +1050,6 @@ export function createDirector(options: DirectorOptions): Director {
         dispose() {
             window.removeEventListener('keydown', onKeyDown);
             items.dispose();
-            game.setAirAssist(0, 0);
             game.setSlopePower(false);
         },
     };

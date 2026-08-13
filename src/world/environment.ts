@@ -43,6 +43,8 @@ import {
 
 /** 影を描き直すカメラ移動量[m]（mobile の静的シャドウキャッシュ） */
 const SHADOW_REFRESH_DISTANCE = 14;
+/** 影を描き直す太陽の移動量（前回向きとの内積のしきい値。約1.5°） */
+const SHADOW_REFRESH_SUN_DOT = Math.cos(1.5 * (Math.PI / 180));
 
 function createSkyDome(): Mesh {
     const dir = positionLocal.normalize();
@@ -181,13 +183,31 @@ export function createEnvironment(scene: Scene, quality: QualitySettings): Envir
 
     const lastShadowAnchor = new Vector3(Infinity, Infinity, Infinity);
     const shadowAnchor = new Vector3();
+    /** 前回シャドウを描き直したときの太陽の向き（昼夜サイクルの追従判定用） */
+    const lastShadowSun = new Vector3().copy(sunDirection);
 
     return {
         group,
         sun,
         update(camera, q, focus) {
             sky.position.copy(camera.position);
-            if (csm) return;
+
+            // --- 時刻の反映（契約15） ---
+            // 光の色・強さは sun.ts が時刻から決める。昼夜サイクル中はここが唯一の
+            // 反映点で、これを怠ると夜になっても昼の環境光が残る（E108）。
+            // ?hour 固定時は毎フレーム同じ値を入れ直すだけで害はない
+            sun.color.copy(sunColor);
+            sun.intensity = lighting.sun;
+            hemi.color.copy(ambientColor);
+            hemi.groundColor.copy(ambientColor).multiplyScalar(0.42).offsetHSL(-0.06, -0.1, 0.02);
+            hemi.intensity = lighting.ambient * (q.ao ? 0.82 : 1);
+
+            if (csm) {
+                // CSM は毎フレーム light.position→target の向きからカスケードを組み直す。
+                // 太陽が動くので向きも入れ直す（構築時と同じ「原点を狙う」置き方のまま）
+                sun.position.copy(sunDirection).multiplyScalar(2500);
+                return;
+            }
             // 段階降格で静的キャッシュへ落ちたら、毎フレームの影の描き直しをやめる
             if (sun.shadow.autoUpdate === q.staticShadows) {
                 sun.shadow.autoUpdate = !q.staticShadows;
@@ -198,10 +218,18 @@ export function createEnvironment(scene: Scene, quality: QualitySettings): Envir
             // 一定距離ごとにジャンプさせると、足元の影が飛んでいるのが見えてしまう
             if (focus) shadowAnchor.set(focus.x, focus.y, focus.z);
             else shadowAnchor.copy(camera.position);
-            if (q.staticShadows && shadowAnchor.distanceTo(lastShadowAnchor) < SHADOW_REFRESH_DISTANCE) {
+            // 静的キャッシュでも太陽が動けば描き直す（昼夜サイクル中に影の向きが
+            // 固まったままにならないように・契約15）
+            const sunMoved = lastShadowSun.dot(sunDirection) < SHADOW_REFRESH_SUN_DOT;
+            if (
+                q.staticShadows &&
+                !sunMoved &&
+                shadowAnchor.distanceTo(lastShadowAnchor) < SHADOW_REFRESH_DISTANCE
+            ) {
                 return;
             }
             lastShadowAnchor.copy(shadowAnchor);
+            lastShadowSun.copy(sunDirection);
             sun.target.position.copy(shadowAnchor);
             sun.position.copy(shadowAnchor).addScaledVector(sunDirection, shadowLightDistance);
             sun.target.updateMatrixWorld();

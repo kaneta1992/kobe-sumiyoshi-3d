@@ -25,6 +25,7 @@ import {
     abs,
     attribute,
     float,
+    hash,
     mix,
     normalWorld,
     positionView,
@@ -39,7 +40,14 @@ import { footprintKey } from '../geo';
 import { hash01 } from './hash';
 import { createBuf, pushQuadFacing, pushTriangleFacing, pushVertex, toGeometry, type MeshBuf } from './geom';
 import { buildHlod, type Hlod } from './hlod';
-import { GI_AO_STRENGTH, GI_BOUNCE_SCALE, bounceColorNode, skyHorizonNode } from './sun';
+import {
+    GI_AO_STRENGTH,
+    GI_BOUNCE_SCALE,
+    bounceColorNode,
+    lampNode,
+    skyHorizonNode,
+    windowLitNode,
+} from './sun';
 import type { QualitySettings } from '../quality';
 import type { BuildingHeightMap, GiMap } from '../data/terrain-assets';
 import type { BuildingShape, Point2 } from '../data/vector';
@@ -62,6 +70,8 @@ const FILL_RATIO_FOR_PITCHED = 0.74;
  * 潰される。外へ出して「その壁が面している空間の開け具合」を拾う
  */
 const GI_PROBE_OFFSET = 1.6;
+/** 夜の窓明かりの強さ。bloom で滲ませる前提でトーンマップ上限より上に置く（契約15-4） */
+const WINDOW_GLOW = 1.5;
 
 type RoofKind = 'flat' | 'hip' | 'gable';
 
@@ -605,7 +615,30 @@ function createFacadeMaterial(): MeshStandardNodeMaterial {
     // 空可視率は環境光だけを削り、直射日光は削らない
     const gi = attribute<'vec2'>('aGi', 'vec2');
     material.aoNode = mix(float(1), gi.x, GI_AO_STRENGTH);
-    material.emissiveNode = color.mul(bounceColorNode).mul(gi.y.mul(GI_BOUNCE_SCALE));
+
+    // --- 夜の窓明かり（契約15-4 / 契約07の任意項目） ---
+    // 窓セルの通し番号から決定的に点灯を決める。実行時乱数を使わないので、
+    // 同じ建物の同じ窓が全クライアントで同じように点く（マルチプレイの前提）
+    const cellId = fx
+        .floor()
+        .add(4096)
+        .mul(131)
+        .add(fy.floor().add(64).mul(7))
+        .add(seed.mul(719).floor().mul(3));
+    // windowLitNode = その時刻に点いている窓の割合。深夜は下がるので疎らになる
+    const litCell = hash(cellId).lessThan(windowLitNode).select(float(1), float(0));
+    // 室内の光は電球色が多数派。少数を蛍光灯の白へ振って単調さを崩す
+    const roomTint = hash(cellId.add(31));
+    const roomColor = mix(vec3(1, 0.7, 0.36), vec3(0.82, 0.9, 1), roomTint.mul(roomTint).mul(roomTint));
+    // 明かりは albedo の窓割りより少し遠くまで残す（消える距離が近いと町が暗く見える）。
+    // ただし遠景はハロー（night-lights.ts）が担当するので、ここは手前だけでよい
+    const litFade = smoothstep(110, 290, positionView.length()).oneMinus().mul(isWall);
+    const litWindows = windows.mul(litCell).mul(litFade).mul(lampNode);
+
+    material.emissiveNode = color
+        .mul(bounceColorNode)
+        .mul(gi.y.mul(GI_BOUNCE_SCALE))
+        .add(roomColor.mul(litWindows.mul(WINDOW_GLOW)));
     material.roughnessNode = mix(float(0.86), float(0.16), windows.mul(detail));
     material.metalnessNode = windows.mul(detail).mul(0.35);
     return material;

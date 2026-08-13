@@ -10,7 +10,8 @@
  *   ?quality=mobile|desktop / ?tier=0..2   品質プリセットの強制
  *   ?stats              画面内 stats（fps / draw / tri / chunk / HLOD / scale / phys）
  *   ?fly                自由カメラ（デバッグ用。物理を読み込まない）
- *   ?hour=15.5          太陽の時刻（0〜24。夜は月光になる）
+ *   ?hour=15.5          太陽の時刻（0〜24。夜は月光になる）。指定すると昼夜サイクルが止まる
+ *   ?daylen=60          昼夜が一周する実時間[s]（既定300 = 5分・契約15）
  *   ?shot=1..6          画作りレビュー用の定点カメラ（契約07）
  *   ?spawn=x,z          指定座標にいちばん近い道路上から開始（橋などの目視検証用）
  *   ?room=名前          マルチプレイのルーム（既定 kobe-sumiyoshi-3d-v1）
@@ -29,14 +30,23 @@ import { createFlyCamera, shotHour, shotIndex, shotView, type ShotView } from '.
 import type { Game } from './game';
 import type { Match } from './match';
 import type { Multiplayer } from './net/multiplayer';
-import { createQuality, initialQuality, maxTier, sunHour, tierIsPinned, type QualitySettings } from './quality';
+import {
+    createQuality,
+    dayLengthSeconds,
+    initialQuality,
+    maxTier,
+    sunHour,
+    tierIsPinned,
+    type QualitySettings,
+} from './quality';
 import { createPostProcessing, type PostChain } from './render/post';
-import { createStatsOverlay } from './ui/stats';
+import { createStatsOverlay, worldStats } from './ui/stats';
 import { createInfoPanel } from './ui/info';
 import { createMapOverlay, type MapOverlay } from './ui/map';
 import { hideLoading, setHelp, setLoadingProgress, setStatus, showFatal } from './ui/loading';
 import { createEnvironment } from './world/environment';
-import { fogRangeNode, setSunHour } from './world/sun';
+import { createNightLights } from './world/night-lights';
+import { cycleHour, fogRangeNode, setSunHour } from './world/sun';
 import { buildWorld, worldEvents, type World, type WorldProgress } from './world';
 
 /** 動的解像度スケーリングの段階 */
@@ -53,15 +63,35 @@ async function start(): Promise<void> {
     let quality: QualitySettings = initialQuality();
     // ?webgl を付けると WebGL2 バックエンドを強制する（E5-b のフォールバック確認用）
     const params = new URLSearchParams(location.search);
-    // 定点カメラ（?shot）は画に固有の時刻を持つ。?hour が明示されていればそちらを優先。
+    // 時刻は既定で壁時計から 5分/周 で回る（契約15）。全クライアントが同じ式で
+    // 導くので同期メッセージは要らない。?hour と ?shot は時刻を固定してサイクルを
+    // 止める — 定点スクショの再現性を保つため（E105）。
     // 太陽光の色・強さは環境の構築時に読むので、ここで確定させておく
     const shot = shotIndex();
-    const forcedHour = params.has('hour') ? null : shotHour(shot);
-    setSunHour(forcedHour ?? sunHour());
+    const fixedHour = params.has('hour') ? sunHour() : shot > 0 ? (shotHour(shot) ?? sunHour()) : null;
+    const dayLength = dayLengthSeconds();
+    /** サイクルが動いているときだけ毎フレーム時刻を進める */
+    const advanceClock = (): void => {
+        const hour = fixedHour ?? cycleHour(Date.now(), dayLength);
+        if (fixedHour === null) setSunHour(hour);
+        worldStats.hour = hour;
+    };
+    setSunHour(fixedHour ?? cycleHour(Date.now(), dayLength));
     const forceWebGL = params.has('webgl');
     const renderer = new WebGPURenderer({ antialias: false, forceWebGL });
     const basePixelRatio = Math.min(window.devicePixelRatio, quality.maxPixelRatio);
     let scaleIndex = 0;
+    let scaleTimer = 0;
+    let slowTimer = 0;
+    /**
+     * 遊べる状態になったか（シェーダーのプリウォームまで終わったか）。
+     * 動的解像度と品質降格はここが true になってから動かす。
+     *
+     * **world の有無で代用してはいけない**: world はプリウォームの**前**に入るので、
+     * シェーダーのコンパイル待ちで落ちたフレームを「性能不足」と読み違えて、
+     * 起動しただけで最低段階まで落ちてしまう（E114）
+     */
+    let playable = false;
     renderer.setPixelRatio(basePixelRatio);
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.toneMapping = ACESFilmicToneMapping;
@@ -119,6 +149,10 @@ async function start(): Promise<void> {
 
     const environment = createEnvironment(scene, quality);
     fogRangeNode.value.set(quality.fogNear, quality.fogFar);
+    // 夜間照明（契約15）。ポイントライトのプールはここで作りきる — シーンのライト構成が
+    // 変わるとノードマテリアルが総再コンパイルになるので、ワールド構築・プリウォームより
+    // 前に確定させ、以後は増減させない
+    const nightLights = createNightLights(scene, quality);
     // 出典・操作・設定は右下の「ℹ️」に畳む（常時表示をやめる・契約13-5）
     createInfoPanel();
 
@@ -149,6 +183,8 @@ async function start(): Promise<void> {
 
     /** ワールドが揃ってから物理・操作系を作る（E2: ロード完了前にスポーンしない） */
     const onWorldReady = async (ready: World): Promise<void> => {
+        // 街灯のハローはプリウォームでコンパイルさせたいので、いちばん先に渡す
+        nightLights.setLamps(ready.lamps);
         const spawn = ready.spawn;
         const groundY = ready.getElevationAt(spawn.x, spawn.z);
         controls?.setView(
@@ -191,8 +227,8 @@ async function start(): Promise<void> {
                     onToggle: (open) => active.setInputSuspended(open, 'map'),
                     // 安置円・目標マーカー（契約10）。?match でなければ描かない
                     drawMatch: overlay ? (draw) => overlay.drawMap(draw) : null,
-                    // 霧玉を使った相手はマップからも消える（契約11・E77）
-                    hiddenPeer: overlay ? (id) => overlay.isFogged(id) : null,
+                    // 相手をマップから隠す仕掛けはいまは無い（霧玉は契約15 追記10 で廃止）
+                    hiddenPeer: null,
                 });
                 // どこでもドアの行き先指定に全体マップを使う（契約11）
                 overlay?.attachMap(map);
@@ -232,6 +268,16 @@ async function start(): Promise<void> {
         setLoadingProgress(1, 1, 'シェーダーを準備中');
         await world.prewarm(renderer, scene, camera);
         hideLoading();
+
+        // ここからが「遊んでいる時間」。ロードとコンパイルで荒れた計測は捨てて、
+        // 解像度も最初の段から測り直す — そうしないと起動しただけで最低段階まで
+        // 落ちた状態で始まってしまう（E114）
+        scaleIndex = 0;
+        renderer.setPixelRatio(basePixelRatio);
+        scaleTimer = 0;
+        slowTimer = 0;
+        stats.reset();
+        playable = true;
     };
     worldEvents.addEventListener('ready', (e) => {
         void onWorldReady((e as CustomEvent<World>).detail);
@@ -251,12 +297,13 @@ async function start(): Promise<void> {
     };
 
     let last = performance.now();
-    let scaleTimer = 0;
-    let slowTimer = 0;
     renderer.setAnimationLoop((now: number) => {
         const dt = Math.min(0.1, (now - last) / 1000);
         last = now;
         renderer.info.reset();
+        // 時刻は壁時計から引き直す。タブを裏に置いていた間に進んだぶんも、
+        // 復帰した瞬間に正しい時刻へ合う（照明の点灯状態を溜め込まない・E107）
+        advanceClock();
         // マッチは輸送機の座席姿勢を先に渡すので game より前（契約10）
         match?.update(dt);
         if (game) game.update(dt);
@@ -270,14 +317,17 @@ async function start(): Promise<void> {
         map?.update(dt); // 中で10Hzに間引く（マーカー層だけ描き直す）
         // 影の箱はプレイヤーへ寄せる（mobile の追従シャドウ・契約13-7）
         environment.update(camera, quality, game?.state);
+        // 夜間照明。実ライトを配る中心はプレイヤー（?fly ならカメラ）
+        nightLights.update(dt, game?.state ?? camera.position, game?.state ?? null, multiplayer);
+        worldStats.lights = nightLights.activeLights;
         world?.update(camera, quality);
 
         if (post) post.render();
         else renderer.render(scene, camera);
 
         const frameMs = stats.sample(dt, RENDER_SCALES[scaleIndex]);
-        // ロード中・プリウォーム中の重さで品質を落とさない
-        if (!world) return;
+        // ロード中・プリウォーム中の重さで品質を落とさない（E114）
+        if (!playable) return;
         const targetMs = 1000 / quality.targetFps;
 
         // --- 動的解像度スケーリング（追記2-2） ---

@@ -56,8 +56,14 @@ export interface Skydive {
      * 搭乗中は毎フレーム機体側の姿勢を渡すこと（位置は完全に上書きされる）
      */
     ride(x: number, y: number, z: number, yaw: number): void;
-    /** 機体から飛び降りる（ride 中のみ有効） */
+    /** 機体から飛び降りる（ride 中のみ有効）。高度 110m で自動的に傘が開く */
     leave(): void;
+    /**
+     * その場から真上へ打ち上げて自由落下へ入る（六甲おろしのマント・契約15 追記10）。
+     * **傘は開かない** — 落下中の水平:垂直 1.7:1 の滑空だけで着地点を決める。
+     * y は打ち上げ後の高度[m]（足元の標高ではなく絶対高）
+     */
+    launch(x: number, y: number, z: number, yaw: number): void;
     /**
      * 1フレーム進める。dirX/dirZ はワールド水平の移動方向（長さ 0..1）。
      * surfaceY は現在位置の足場の高さ。着地したら true を返す
@@ -73,6 +79,8 @@ export function createSkydive(): Skydive {
     let state: SkyState = 'off';
     let yaw = 0;
     let pitch = 0;
+    /** 高度で傘を自動展開してよいか。マントの打ち上げ（追記10）では開かない */
+    let canopyAllowed = true;
 
     return {
         get state() {
@@ -97,8 +105,19 @@ export function createSkydive(): Skydive {
         leave() {
             if (state !== 'ride') return;
             state = 'fall';
+            canopyAllowed = true;
             // 機首方向へ少しだけ押し出す（真下に落ちて機体にめり込まないように）
             velocity.set(-Math.sin(yaw) * 12, -2, -Math.cos(yaw) * 12);
+        },
+        launch(x, y, z, startYaw) {
+            state = 'fall';
+            canopyAllowed = false;
+            position.set(x, y, z);
+            // 打ち上がりきった頂点から始める。上向きの初速は与えない —
+            // 「打ち上げの演出」ではなく「そこから滑空する遊び」が本体（追記10）
+            velocity.set(0, 0, 0);
+            yaw = startYaw;
+            pitch = 0;
         },
         update(dt, dirX, dirZ, surfaceY) {
             if (state === 'off' || state === 'ride') return false;
@@ -137,8 +156,9 @@ export function createSkydive(): Skydive {
             pitch = Math.atan2(velocity.y, Math.max(speed, 1));
 
             const height = position.y - surfaceY;
-            // 傘は高度で自動展開する（操作を1つ増やさない・ポップな傘は描画側の担当）
-            if (!canopy && height < CANOPY_ALTITUDE) state = 'canopy';
+            // 傘は高度で自動展開する（操作を1つ増やさない・ポップな傘は描画側の担当）。
+            // マントの打ち上げでは開かない — 着地まで自分の滑空で決めさせる（追記10）
+            if (!canopy && canopyAllowed && height < CANOPY_ALTITUDE) state = 'canopy';
             if (height <= LAND_HEIGHT) {
                 position.y = surfaceY;
                 return true;

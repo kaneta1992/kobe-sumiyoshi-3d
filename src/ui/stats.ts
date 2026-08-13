@@ -19,11 +19,20 @@ export const worldStats = {
     treeFar: 0,
     /** 直近フレームの物理計算時間[ms]（契約04） */
     physicsMs: 0,
+    /** いまの時刻[h]（昼夜サイクル・契約15） */
+    hour: 15,
+    /** 点灯中の実ポイントライト数（街灯プール + 提灯・契約15） */
+    lights: 0,
 };
 
 export interface StatsOverlay {
     /** 毎フレーム呼ぶ。戻り値は平滑化フレーム時間[ms] */
     sample(dt: number, renderScale: number): number;
+    /**
+     * 平滑化フレーム時間を初期値へ戻す（E114）。
+     * ロードとシェーダーコンパイルで荒れた計測を、遊び始めの判断に持ち込まないため
+     */
+    reset(): void;
     /** GPUメモリ目安を測り直す（ワールド構築後に1回） */
     measure(scene: Scene): void;
     readonly frameMs: number;
@@ -113,10 +122,19 @@ export function createStatsOverlay(
                         `tree ${worldStats.treeNear}/${worldStats.treeMid}/${worldStats.treeFar}\n` +
                         `scale ${renderScale.toFixed(2)}   vram~${formatMB(gpuBytes)}   ` +
                         `phys ${worldStats.physicsMs.toFixed(1)}ms\n` +
+                        `${Math.floor(worldStats.hour).toString().padStart(2, '0')}:` +
+                        `${Math.floor((worldStats.hour % 1) * 60).toString().padStart(2, '0')}   ` +
+                        `light ${worldStats.lights}\n` +
                         label();
                 }
             }
             return frameMs;
+        },
+        reset() {
+            frameMs = 16.7;
+            acc = 0;
+            frames = 0;
+            sinceUpdate = 0;
         },
         measure(scene) {
             gpuBytes = estimateGpuBytes(scene);

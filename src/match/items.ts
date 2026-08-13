@@ -25,16 +25,12 @@ import {
 
 const TAU = Math.PI * 2;
 
-export type ItemId =
-    | 'door'
-    | 'stick'
-    | 'cape'
-    | 'tabi'
-    | 'umbrella'
-    | 'map'
-    | 'fog'
-    | 'whistle'
-    | 'eye';
+/**
+ * 所持アイテムは4種 + 枠外の収集品1種（契約15 追記10 のユーザー裁定）。
+ * 傘・霧玉・イノシシ笛・千里眼は廃止した — 種類を絞って一つずつの役割を濃くする。
+ * 旧アイテムの効果メッセージが古いクライアントから届いても、受信側は黙って捨てる
+ */
+export type ItemId = 'door' | 'stick' | 'cape' | 'tabi' | 'map';
 
 export interface ItemSpec {
     id: ItemId;
@@ -78,10 +74,12 @@ export const ITEMS: Readonly<Record<ItemId, ItemSpec>> = {
     cape: {
         id: 'cape',
         name: '六甲おろしのマント',
-        kind: 'hold',
+        kind: 'use',
         color: 0x2ecc71,
         mark: '🦅',
-        hint: '所持中、ジャンプ長押しで滑空',
+        // 契約15 追記10: 「所持中に滑空」から「使うと打ち上げ → スカイダイビング」へ。
+        // 傘は付かないので、着地点は自分の空中操作だけで決める
+        hint: '使うとはるか上空へ打ち上がる。そこから滑空してどこへでも降りられる',
         seconds: 0,
     },
     tabi: {
@@ -93,15 +91,6 @@ export const ITEMS: Readonly<Record<ItemId, ItemSpec>> = {
         hint: '所持中、移動+30%・急坂でも減速しない',
         seconds: 0,
     },
-    umbrella: {
-        id: 'umbrella',
-        name: 'メリーポピンズの傘',
-        kind: 'hold',
-        color: 0x4fc3f7,
-        mark: '☂',
-        hint: '所持中、落下がゆっくり。高所から傘が再展開する',
-        seconds: 0,
-    },
     map: {
         id: 'map',
         name: '宝の地図の切れ端',
@@ -109,34 +98,6 @@ export const ITEMS: Readonly<Record<ItemId, ItemSpec>> = {
         color: 0xf2d16b,
         mark: '🗺',
         hint: '3枚集めると宝箱のいる半径40mの円がマップに出る',
-        seconds: 0,
-    },
-    fog: {
-        id: 'fog',
-        name: '住吉川の霧玉',
-        kind: 'use',
-        color: 0xc9d6e4,
-        mark: '🌫',
-        hint: '45秒、ほかのプレイヤーのマップから自分が消える',
-        seconds: 45,
-    },
-    whistle: {
-        id: 'whistle',
-        name: 'イノシシ呼び笛',
-        kind: 'use',
-        color: 0x8d6b4b,
-        mark: '🐗',
-        hint: '使うとイノシシに乗れる（90秒・坂に強い）',
-        seconds: 90,
-    },
-    eye: {
-        id: 'eye',
-        name: '展望台の千里眼',
-        kind: 'use',
-        color: 0x64f0c8,
-        mark: '👁',
-        // 契約14-4: 方角 + ざっくりした距離帯。マップに扇形が残る
-        hint: '見晴らしスポットで使うと宝箱の方角と距離帯（扇形）がマップに残る',
         seconds: 0,
     },
 };
@@ -167,16 +128,14 @@ const MIMIC_MIN = 45;
 const MIMIC_RADIUS = 220;
 /** ミミックの隠し場所を探す半径[m]（本物と同じ隠し方をする・契約14-4/E101） */
 const MIMIC_HIDE = 55;
-/** 見晴らしスポット（千里眼・契約12）: 標高を測る格子の分割数 */
-const LOOKOUT_GRID = 41;
 /** 補給機の飛来時刻[s]（マッチ時計。ディレクターが前倒しすることがある） */
 const SUPPLY_AT = [165, 300] as const;
-/** クレートに入る良アイテムの候補（2つ1組） */
+/** クレートに入る良アイテムの候補（2つ1組。4種になったので全組み合わせ） */
 const SUPPLY_SETS: readonly (readonly [ItemId, ItemId])[] = [
     ['door', 'cape'],
-    ['tabi', 'umbrella'],
+    ['stick', 'tabi'],
     ['door', 'tabi'],
-    ['cape', 'umbrella'],
+    ['cape', 'stick'],
 ];
 
 /**
@@ -349,10 +308,11 @@ export function buildItemLayout(
         push((rnd() * 2 - 1) * (AREA_HALF - 180), (rnd() * 2 - 1) * (AREA_HALF - 180));
     }
 
-    // アイテムの内訳。地図の切れ端は必ず3枚以上出す（4枚入れて1枚は取り損ねてもよくする）
+    // アイテムの内訳。地図の切れ端は必ず3枚以上出す（4枚入れて1枚は取り損ねてもよくする）。
+    // 4種になったぶん1種あたりの本数を増やして、POI 16枠が薄くならないようにする（追記10）
     const pool: ItemId[] = ['map', 'map', 'map', 'map'];
-    for (const id of ['door', 'stick', 'cape', 'tabi', 'umbrella', 'fog', 'whistle', 'eye'] as const) {
-        pool.push(id, id);
+    for (const id of ['door', 'stick', 'cape', 'tabi'] as const) {
+        pool.push(id, id, id);
     }
     // 種類の偏りを均すシャッフル（Fisher-Yates・シード由来）
     for (let i = pool.length - 1; i > 0; i--) {
@@ -414,31 +374,6 @@ export function buildItemLayout(
 }
 
 /**
- * 見晴らしスポット（契約12の千里眼）。**四象限それぞれの最高地点**を1か所ずつ選ぶ。
- * 全体の標高上位から選ぶと山側（北西）に4つとも固まって、街側で使えなくなる。
- * 地形は全員同じなので**シードを使わなくても全員一致**する（実行時乱数も使わない）。
- */
-export function findLookouts(
-    getElevationAt: (x: number, z: number) => number,
-): { x: number; z: number; y: number }[] {
-    const best: ({ x: number; z: number; y: number } | null)[] = [null, null, null, null];
-    const span = AREA_HALF - 120;
-    for (let ix = 0; ix < LOOKOUT_GRID; ix++) {
-        for (let iz = 0; iz < LOOKOUT_GRID; iz++) {
-            const x = -span + (2 * span * ix) / (LOOKOUT_GRID - 1);
-            const z = -span + (2 * span * iz) / (LOOKOUT_GRID - 1);
-            const quadrant = (x < 0 ? 0 : 1) + (z < 0 ? 0 : 2);
-            const y = getElevationAt(x, z);
-            const current = best[quadrant];
-            if (!current || y > current.y) best[quadrant] = { x, z, y };
-        }
-    }
-    const picked: { x: number; z: number; y: number }[] = [];
-    for (const spot of best) if (spot) picked.push(spot);
-    return picked;
-}
-
-/**
  * ?matchdebug でアイテム効果の遷移をコンソールへ出す（検証用）。
  * 起動時に1回だけ読む — 判定を毎フレームやらない
  */
@@ -462,9 +397,7 @@ export const LEAD_MIN = (() => {
 export function debugItems(): ItemId[] {
     const value = new URLSearchParams(location.search).get('matchitem');
     if (!value) return [];
-    if (value === 'all') {
-        return ['door', 'stick', 'cape', 'tabi', 'umbrella', 'map', 'fog', 'whistle', 'eye'];
-    }
+    if (value === 'all') return ['door', 'stick', 'cape', 'tabi', 'map'];
     const out: ItemId[] = [];
     for (const part of value.split(',')) {
         const id = part.trim() as ItemId;

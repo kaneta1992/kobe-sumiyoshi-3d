@@ -60,7 +60,7 @@ export interface MapOverlayOptions {
     onToggle(open: boolean): void;
     /** マッチの安置円・目標マーカー（契約10）。?match でないときは null */
     drawMatch?: ((draw: MapDraw) => void) | null;
-    /** 探知から消えている相手はマーカーを出さない（霧玉・契約11） */
+    /** 探知から消えている相手はマーカーを出さない（null なら全員出す） */
     hiddenPeer?: ((id: string) => boolean) | null;
 }
 
@@ -557,7 +557,7 @@ export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
         id: string,
     ): void => {
         if (!markerCtx) return;
-        // 霧玉で探知から消えている相手は出さない（契約11・E77）
+        // 探知から消えている相手は出さない
         if (hiddenPeer?.(id)) return;
         drawPlayer(markerCtx, x, z, yaw, driving, cssColor(color), markerScale);
     };

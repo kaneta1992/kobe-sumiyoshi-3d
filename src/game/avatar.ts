@@ -58,6 +58,12 @@ const HEAD_C = HEAD_Y - NECK_Y;
  */
 const WALK_REF = 1.9;
 const RUN_REF = 5.2;
+/**
+ * スクワッシュ&ストレッチと上下バウンスの振幅倍率（契約15 追記8）。
+ * 「ビヨンビヨンしすぎ」だったので走り・着地・踏み切り・空中の伸縮をまとめて半分にする。
+ * 0 にすると硬い動きになるので、ポップさを殺さない範囲の減衰にとどめること
+ */
+const SQUASH_SCALE = 0.5;
 
 // 頂点色で1メッシュに束ねるパーツの色
 const EYE_DARK = 0x241d1f;
@@ -566,11 +572,17 @@ export function createPlayerAvatar(quality: QualitySettings): PlayerAvatar {
             }
 
             // --- 全身: 上下バウンス + スクワッシュ&ストレッチ ---
-            // 走りは接地（位相 0, π）で潰れ、空中で伸びる。誇張のため横は体積保存より強く逆に振る
-            const bounce = (wWalk * 0.032 + wRun * 0.115) * Math.abs(swing) + wIdle * breath * 0.006;
+            // 走りは接地（位相 0, π）で潰れ、空中で伸びる。誇張のため横は体積保存より強く逆に振る。
+            // 振幅は SQUASH_SCALE で一括して落とす（契約15 追記8: 伸縮が過剰だった）。
+            // 個々の係数は「元の誇張の比率」を保ったまま残す — 戻したくなったら倍率だけ触ればよい
+            const bounce =
+                (wWalk * 0.032 + wRun * 0.115) * Math.abs(swing) * SQUASH_SCALE +
+                wIdle * breath * 0.006;
             const beat = -Math.cos(phase * 2);
             const stretch =
-                1 + (wWalk * 0.03 + wRun * 0.19) * beat + squash + wAir * 0.07 + wFly * 0.05;
+                1 +
+                ((wWalk * 0.03 + wRun * 0.19) * beat + squash + wAir * 0.07 + wFly * 0.05) *
+                    SQUASH_SCALE;
             const scaleY = Math.max(0.6, stretch);
             const scaleXZ = 1 + (1 - scaleY) * 0.85;
             body.position.y = bounce + hop;
