@@ -15,17 +15,26 @@ export type SkyState = 'off' | 'ride' | 'fall' | 'canopy';
 
 /** 自由落下の重力[m/s²]（実物より軽くして落ちる時間を稼ぐ） */
 const GRAVITY = 16;
-/** 自由落下の終端速度[m/s] */
-const TERMINAL = 62;
-/** 自由落下中の水平最高速度[m/s] */
-const FALL_GLIDE = 36;
+/**
+ * 自由落下の終端速度[m/s]（契約13-8 でやや抑えた）。
+ * 前傾（スティック全倒し）でさらに DIVE_BRAKE ぶん落ちにくくなるので、
+ * 「まっすぐ下」より「前へ滑る」ほうが得になる
+ */
+const TERMINAL = 48;
+/**
+ * 自由落下中の水平最高速度[m/s]（契約13-8 で強化）。
+ * TERMINAL を上回るので、全倒しなら水平:垂直が 1:1 を超える
+ */
+const FALL_GLIDE = 58;
+/** 前傾しきったときに終端速度へ掛かる係数（水平へ体重を預けるほど落ちにくい） */
+const DIVE_BRAKE = 0.72;
 /** パラシュート展開後の降下速度[m/s] */
-const CANOPY_SINK = 7;
-/** パラシュート展開後の水平速度[m/s] */
-const CANOPY_GLIDE = 14;
-/** 水平速度の追従の速さ[1/s]（落下中 / 傘） */
-const FALL_ACCEL = 1.5;
-const CANOPY_ACCEL = 3;
+const CANOPY_SINK = 6;
+/** パラシュート展開後の水平速度[m/s]（契約13-8 で強化。傘でも狙って寄せられる） */
+const CANOPY_GLIDE = 22;
+/** 水平速度の追従の速さ[1/s]（落下中 / 傘）。契約13-8 で操作の効きを上げた */
+const FALL_ACCEL = 3.2;
+const CANOPY_ACCEL = 4.5;
 /** 足場からこの高さで自動的に傘が開く[m] */
 const CANOPY_ALTITUDE = 110;
 /** 傘を開くときに縦速度を殺す速さ[1/s] */
@@ -106,7 +115,10 @@ export function createSkydive(): Skydive {
             if (canopy) {
                 velocity.y += (-CANOPY_SINK - velocity.y) * (1 - Math.exp(-CANOPY_BRAKE * dt));
             } else {
-                velocity.y = Math.max(-TERMINAL, velocity.y - GRAVITY * dt);
+                // 前傾（入力を倒しているほど）で終端速度が下がる = 水平へ伸びる（契約13-8）
+                const lean = Math.min(1, length);
+                const terminal = TERMINAL * (1 - (1 - DIVE_BRAKE) * lean);
+                velocity.y = Math.max(-terminal, velocity.y - GRAVITY * dt);
             }
 
             position.addScaledVector(velocity, dt);

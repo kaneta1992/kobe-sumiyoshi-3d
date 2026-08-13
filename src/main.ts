@@ -32,6 +32,7 @@ import type { Multiplayer } from './net/multiplayer';
 import { createQuality, initialQuality, maxTier, sunHour, tierIsPinned, type QualitySettings } from './quality';
 import { createPostProcessing, type PostChain } from './render/post';
 import { createStatsOverlay } from './ui/stats';
+import { createInfoPanel } from './ui/info';
 import { createMapOverlay, type MapOverlay } from './ui/map';
 import { hideLoading, setHelp, setLoadingProgress, setStatus, showFatal } from './ui/loading';
 import { createEnvironment } from './world/environment';
@@ -118,6 +119,8 @@ async function start(): Promise<void> {
 
     const environment = createEnvironment(scene, quality);
     fogRangeNode.value.set(quality.fogNear, quality.fogFar);
+    // 出典・操作・設定は右下の「ℹ️」に畳む（常時表示をやめる・契約13-5）
+    createInfoPanel();
 
     let post: PostChain | null = createPostProcessing(renderer, scene, camera, quality);
     const stats = createStatsOverlay(
@@ -265,7 +268,8 @@ async function start(): Promise<void> {
         }
         multiplayer?.update(dt);
         map?.update(dt); // 中で10Hzに間引く（マーカー層だけ描き直す）
-        environment.update(camera);
+        // 影の箱はプレイヤーへ寄せる（mobile の追従シャドウ・契約13-7）
+        environment.update(camera, quality, game?.state);
         world?.update(camera, quality);
 
         if (post) post.render();

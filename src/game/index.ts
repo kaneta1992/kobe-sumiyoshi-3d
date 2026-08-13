@@ -27,7 +27,7 @@ import {
 import { CHARACTER_CENTER_OFFSET, createCharacter } from './character';
 import { createFollowCamera } from './follow-camera';
 import { createHelicopter, type Helicopter } from './helicopter';
-import { createInput, LOOK_SPEED } from './input';
+import { createInput, lookSpeed } from './input';
 import { createPhysics, type Physics } from './physics';
 import { createSkydive, type SkyState } from './skydive';
 import { CHASSIS_HALF, VEHICLE_GROUND_OFFSET, createVehicle } from './vehicle';
@@ -38,8 +38,13 @@ export { initPhysics } from './physics';
 const ENTER_RADIUS = 5;
 /** 地形からこれだけ下に落ちたらリスポーン[m]（E19） */
 const FALL_LIMIT = 20;
-/** カメラの追従距離[m] */
-const WALK_DISTANCE = 5;
+/**
+ * カメラの追従距離[m]。徒歩の既定速度を上げた（契約13-12）ので、
+ * 画面内に前方の道が入るよう少し引いてある
+ */
+const WALK_DISTANCE = 6.6;
+/** 徒歩の注視点の追従の速さ[1/s]。速度が上がったぶん既定（16）より強く追わせる */
+const WALK_FOLLOW_RATE = 26;
 const DRIVE_DISTANCE = 8.4;
 /** カメラの注視点の高さ[m]（チビ体型の胸〜頭のあたり・契約06） */
 const WALK_FOCUS = 1;
@@ -68,7 +73,7 @@ const SKY_FOLLOW_RATE = 55;
 const SKY_PITCH = -0.5;
 
 const HELP_WALK =
-    'WASD: 移動　Shift: 走る　Space: ジャンプ　ドラッグ/マウス: 視点　F: 乗車　R: 位置リセット';
+    'WASD: 移動　Shift: 歩く（ゆっくり）　Space: ジャンプ　ドラッグ/マウス: 視点　F: 乗車　E: 回収　R: 位置リセット';
 const HELP_DRIVE = 'W/S: アクセル・後退　A/D: ハンドル　Space: ブレーキ　F: 降車　R: 姿勢リセット';
 const HELP_HELI =
     '★ヘリ　W/S: 前後　A/D: バンク旋回　Space: 上昇　C: 下降　Shift: ブースト　F: 着陸して降りる';
@@ -78,16 +83,21 @@ const HELP_SUPERMAN = '　G: スーパーマン';
 const HELP_NEAR_CAR = '　★ F で乗車';
 const HELP_NEAR_HELI = '　★ F でヘリに乗る';
 const HELP_RIDE = '★輸送機　Space: 飛び降りる　ドラッグ/マウス: 視点';
-const HELP_FALL = '★降下中　WASD: 移動　高度 110m で自動的に傘が開く';
+const HELP_FALL =
+    '★降下中　WASD/スティック: 前傾で水平へ大きく滑る　ドラッグ/マウス: 見回し　高度 110m で自動的に傘が開く';
 
 /** ヘリに乗れる距離[m]（機体中心から。全長8mのローターの下に立てば乗れる） */
 const HELI_ENTER_RADIUS = 7;
 /** ヘリの追従カメラ距離[m] と 注視点の高さ[m] */
 const HELI_DISTANCE = 13;
 const HELI_FOCUS = 1.6;
-/** イノシシ騎乗中のカメラ距離[m] と 移動速度の倍率（徒歩の 1.6 倍・契約12） */
-const BOAR_DISTANCE = 6.4;
-const BOAR_SPEED_SCALE = 1.6;
+/**
+ * イノシシ騎乗中のカメラ距離[m] と 移動速度の倍率（契約12）。
+ * 徒歩の既定が速くなった（契約13-12）ので、倍率は控えめに直した
+ * （イノシシの取り柄は速さより「急坂に強い」ことへ寄せる）
+ */
+const BOAR_DISTANCE = 7.4;
+const BOAR_SPEED_SCALE = 1.15;
 
 /**
  * 'sky' は輸送機からの降下中（契約10）。同期上は徒歩と同じ扱い。
@@ -624,7 +634,7 @@ export function createGame(options: GameOptions): Game {
             const keys = input.state;
 
             if (keys.lookX !== 0 || keys.lookY !== 0) {
-                follow.look(keys.lookX, keys.lookY, LOOK_SPEED);
+                follow.look(keys.lookX, keys.lookY, lookSpeed());
                 sinceLook = 0;
             } else {
                 sinceLook += dt;
@@ -698,9 +708,10 @@ export function createGame(options: GameOptions): Game {
             vehicleInput.brake = driving ? keys.brake : true;
 
             physics.step(dt, (fixed) => {
-                // 騎乗中は常に「走っている」扱い（イノシシの脚は歩かない）
+                // 契約13-9: 既定が全力。Shift・「歩く」ボタンを押している間だけ遅くする。
+                // 騎乗中は常に全力（イノシシの脚は歩かない）
                 if (driving || piloting) character.fixedUpdate(fixed, 0, 0, false);
-                else character.fixedUpdate(fixed, moveDir.x, moveDir.z, keys.run || riding);
+                else character.fixedUpdate(fixed, moveDir.x, moveDir.z, keys.run && !riding);
                 vehicle.fixedUpdate(fixed, vehicleInput);
             });
             worldStats.physicsMs = physics.lastStepMs;
@@ -836,9 +847,9 @@ export function createGame(options: GameOptions): Game {
                 }
                 follow.update(dt, craft.position, HELI_FOCUS, HELI_DISTANCE);
             } else if (riding) {
-                follow.update(dt, feet, WALK_FOCUS + BOAR_SEAT.y, BOAR_DISTANCE);
+                follow.update(dt, feet, WALK_FOCUS + BOAR_SEAT.y, BOAR_DISTANCE, WALK_FOLLOW_RATE);
             } else {
-                follow.update(dt, feet, WALK_FOCUS, WALK_DISTANCE);
+                follow.update(dt, feet, WALK_FOCUS, WALK_DISTANCE, WALK_FOLLOW_RATE);
             }
 
             // --- 落下・エリア外からの復帰（E19。降下・飛行中は空にいるのが正常なので見ない） ---
@@ -874,7 +885,8 @@ export function createGame(options: GameOptions): Game {
             state.z = feet.z;
             state.yaw = mode === 'sky' ? skydive.yaw : flying ? flyYaw : character.yaw;
             state.speed = mode === 'sky' ? 0 : flying ? Math.min(flySpeed, 6) : character.speed;
-            state.running = keys.run;
+            // 「全力で動いているか」。既定が全力なので Shift（歩く）を押していない間が true
+            state.running = !keys.run;
             state.grounded = !flying && mode !== 'sky' && character.grounded;
             // 乗り物の座標（同期とマップが読む）。乗っている物によって中身が入れ替わる
             if (piloting) {

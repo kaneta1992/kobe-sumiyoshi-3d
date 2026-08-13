@@ -20,22 +20,43 @@ export const CHARACTER_CENTER_OFFSET = HALF_HEIGHT + RADIUS;
 /** 全高[m] */
 export const CHARACTER_HEIGHT = CHARACTER_CENTER_OFFSET * 2;
 
-const WALK_SPEED = 1.9;
-const RUN_SPEED = 5.2;
+/**
+ * 移動速度[m/s]（契約13-9 / 13-12 で既定を大幅に引き上げた）。
+ * BASE = 既定（従来のダッシュ 5.2 の約2倍）。Shift・「歩く」ボタンで SLOW まで落とせる。
+ * スタミナは無い（いくらでも走れる）。ここへ ⚡ の倍率（最大2倍）と
+ * 韋駄天の地下足袋（×1.3）が掛かるので、最高速は約 27m/s になる
+ */
+const BASE_SPEED = 10.4;
+const SLOW_SPEED = 1.9;
 /** 速度の追従の速さ[1/s]。歩き出し・止まりを少しだけ鈍らせる */
 const ACCEL = 14;
+/**
+ * 空中での追従の速さ[1/s]（契約13-13）。地上より鈍らせることで、踏み切ったときの
+ * 水平速度が「走り幅跳び」として残る。0 にすると空中で一切曲がれないので、
+ * 着地点を微調整できるぶんだけ残す
+ */
+const AIR_ACCEL = 5;
 /** 向きの追従の速さ[rad/s] */
 const TURN_RATE = 12;
 const GRAVITY = 9.81;
 /** 落下速度の上限[m/s] */
 const MAX_FALL = 55;
-/** 接地中に地面へ押し付ける速度[m/s]（下り坂で浮かないように） */
-const GROUND_STICK = 2;
 /**
- * ジャンプの初速[m/s]（契約06 追記1）。到達高さ = v²/2g ≒ 1.08m で、
- * 60cm の段差を余裕をもって越えられる。二段ジャンプはしない
+ * 接地中に地面へ押し付ける速度[m/s]（下り坂で浮かないように）。
+ * 既定速度を上げた（契約13-12）ぶん、下り坂で足が離れないよう強めてある
  */
-const JUMP_SPEED = 4.6;
+const GROUND_STICK = 6;
+/**
+ * 地面へ吸い付く距離[m]。1物理ステップ（1/60秒）で進む距離が最高速では 0.45m に
+ * なるので、急な下り坂が段差扱いにならないよう広げてある（契約13-12）
+ */
+const SNAP_DISTANCE = 0.9;
+/**
+ * ジャンプの初速[m/s]（契約06 追記1 → 契約13-13 で強化）。
+ * 到達高さ = v²/2g ≒ 2.0m。塀・生け垣を飛び越えられ、60cm の段差要件も当然満たす。
+ * 滞空は 2v/g ≒ 1.28秒なので、既定速度 10.4m/s で踏み切れば 13m 跳ぶ。二段ジャンプはしない
+ */
+const JUMP_SPEED = 6.3;
 /** 体当たりで押し飛ばす時間[s]（契約10）。この間だけ移動へ押し出しを上乗せする */
 const KNOCKBACK_TIME = 0.28;
 /** 通常の登坂限界[deg] と 自動スライドの開始角[deg] */
@@ -55,7 +76,7 @@ export interface Character {
     readonly speed: number;
     readonly grounded: boolean;
     /** 物理ステップ1回ぶん進める。dir は**ワールド座標**の水平移動方向（長さ 0..1） */
-    fixedUpdate(dt: number, dirX: number, dirZ: number, run: boolean): void;
+    fixedUpdate(dt: number, dirX: number, dirZ: number, slow: boolean): void;
     /** 次の物理ステップで踏み切る（接地していなければ無視される = 二段ジャンプなし） */
     jump(): void;
     /** 描画位置を前ステップとの間で補間する */
@@ -97,7 +118,7 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
     controller.setMaxSlopeClimbAngle((SLOPE_CLIMB * Math.PI) / 180);
     controller.setMinSlopeSlideAngle((SLOPE_SLIDE * Math.PI) / 180);
     controller.enableAutostep(0.45, 0.2, true);
-    controller.enableSnapToGround(0.5);
+    controller.enableSnapToGround(SNAP_DISTANCE);
     controller.setApplyImpulsesToDynamicBodies(false);
 
     const current = new Vector3(x, y, z);
@@ -140,7 +161,7 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
         get grounded() {
             return grounded;
         },
-        fixedUpdate(dt, dirX, dirZ, run) {
+        fixedUpdate(dt, dirX, dirZ, slow) {
             previous.copy(current);
             previousFacing = facing;
             if (!active) return;
@@ -159,10 +180,12 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
             // 空中補助（マント・傘）は接地していない間だけ効かせる
             const gliding = !grounded && (airSink > 0 || airSpeed > 0);
             const wanted =
-                gliding && airSpeed > 0 ? airSpeed : (run ? RUN_SPEED : WALK_SPEED) * speedScale;
+                gliding && airSpeed > 0 ? airSpeed : (slow ? SLOW_SPEED : BASE_SPEED) * speedScale;
             const length = Math.hypot(dirX, dirZ);
             const scale = length > 1 ? 1 / length : 1;
-            const factor = 1 - Math.exp(-ACCEL * dt);
+            // 滑空（マント・傘）は自前の速度で操るので従来どおりの効き。
+            // ただの滞空中は AIR_ACCEL で鈍らせ、助走の勢いを残す（契約13-13）
+            const factor = 1 - Math.exp(-(grounded || gliding ? ACCEL : AIR_ACCEL) * dt);
             velocity.x += (dirX * scale * wanted - velocity.x) * factor;
             velocity.z += (dirZ * scale * wanted - velocity.z) * factor;
 
@@ -185,7 +208,7 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
             const movement = controller.computedMovement();
             grounded = controller.computedGrounded();
             if (grounded && !snapped) {
-                controller.enableSnapToGround(0.5);
+                controller.enableSnapToGround(SNAP_DISTANCE);
                 snapped = true;
             }
 
@@ -220,7 +243,7 @@ export function createCharacter(physics: Physics, x: number, y: number, z: numbe
             jumpLatched = false;
             pushLeft = 0;
             if (!snapped) {
-                controller.enableSnapToGround(0.5);
+                controller.enableSnapToGround(SNAP_DISTANCE);
                 snapped = true;
             }
             facing = tyaw;

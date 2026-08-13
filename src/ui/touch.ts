@@ -1,9 +1,16 @@
 /**
- * スマホ用のタッチUI（左バーチャルスティック + 右のボタン）。
+ * スマホ用のタッチUI（左バーチャルスティック + 右のボタン）。契約13-1 で全面見直し。
  *
- * 表示の出し分け（E20）: タッチ点を持つ端末でだけ作る。マウスとタッチの両方がある
- * 端末（Surface 等）では「最初にタッチで触った時点」で出す。キーボード・マウス操作は
- * 出しても殺さないので、どちらでも破綻しない。
+ * 表示の出し分け（E20 / 契約13-1 のバグ修正）:
+ *   「最後に使った入力デバイス」に従う。**本物のタッチ（touchstart）でだけ出し、
+ *   マウスを使った瞬間に引っ込める**。以前は pointerdown を見ていたため、
+ *   マウスのドラッグでもタッチUIが出ることがあった。
+ *   粗いポインタしか無い端末（= スマホ・タブレット）では最初から出す。
+ *
+ * 配置（契約13-1）:
+ *   - 親指の到達圏へ寄せる（左下スティック・右下ボタン。どちらも下端 + セーフエリア）
+ *   - 当たり判定はボタン本体より広い（padding ぶんの透明な余白を持たせる）
+ *   - 押し間違いを避けるためボタン同士の間隔を空け、回収ボタン表示中はジャンプを隠す（E94）
  *
  * 実装は pointer events のみ。スティックとボタンは canvas より上の DOM なので、
  * ここで受けたポインタは視点ドラッグ（canvas 側のハンドラ）へは流れない。
@@ -16,7 +23,7 @@ export interface TouchControls {
     /** スティックの倒し量（-1..1）。x = 右 / z = 前 */
     readonly stickX: number;
     readonly stickZ: number;
-    /** アクセル（徒歩では「走る」） */
+    /** 徒歩では「歩く」（契約13-9 で既定が全力になったので、ボタンは減速側） */
     readonly accel: boolean;
     readonly brake: boolean;
     /** 乗降ボタンの押下を1回ぶん取り出す */
@@ -37,8 +44,16 @@ const DEADZONE = 0.16;
 function button(label: string, extraClass: string): HTMLDivElement {
     const el = document.createElement('div');
     el.className = `touch-button ${extraClass}`;
-    el.textContent = label;
+    const face = document.createElement('div');
+    face.className = 'touch-face';
+    face.textContent = label;
+    el.appendChild(face);
     return el;
+}
+
+function setLabel(el: HTMLDivElement, label: string): void {
+    const face = el.firstElementChild;
+    if (face) face.textContent = label;
 }
 
 export function createTouchControls(): TouchControls | null {
@@ -47,8 +62,8 @@ export function createTouchControls(): TouchControls | null {
 
     const root = document.createElement('div');
     root.id = 'touch-ui';
-    // マウス専用機からの誤表示を避けるため、粗いポインタしか無い端末以外は
-    // 最初のタッチまで隠しておく
+    // 粗いポインタしか無い端末（スマホ）は最初から出す。マウスもある端末では
+    // 本物のタッチがあるまで隠しておく
     const coarseOnly = !(window.matchMedia?.('(any-pointer: fine)').matches ?? false);
     if (!coarseOnly) root.classList.add('hidden');
 
@@ -61,10 +76,12 @@ export function createTouchControls(): TouchControls | null {
     const buttons = document.createElement('div');
     buttons.className = 'touch-buttons';
     const interactButton = button('乗る', 'touch-interact');
-    const accelButton = button('走る', 'touch-accel');
+    const accelButton = button('歩く', 'touch-accel');
     const brakeButton = button('ブレーキ', 'touch-brake');
     const jumpButton = button('ジャンプ', 'touch-jump');
-    buttons.append(brakeButton, jumpButton, accelButton, interactButton);
+    // 2×2 の塊にする（CSS で row-reverse + wrap-reverse）。DOM の先頭ほど右下 =
+    // いちばん親指が届く位置になるので、よく押す順に並べる（契約13-1）
+    buttons.append(jumpButton, accelButton, interactButton, brakeButton);
 
     // 起動時は徒歩。ブレーキボタンは運転中だけ・ジャンプボタンは徒歩のときだけ出す
     brakeButton.classList.add('hidden');
@@ -166,13 +183,22 @@ export function createTouchControls(): TouchControls | null {
     jumpButton.addEventListener('pointerleave', jumpUp);
     jumpButton.addEventListener('lostpointercapture', jumpUp);
 
-    // マウス機でも最初にタッチしたら出す（E20）
-    const onFirstTouch = (e: PointerEvent): void => {
-        if (e.pointerType !== 'touch') return;
-        root.classList.remove('hidden');
-        window.removeEventListener('pointerdown', onFirstTouch);
+    // --- 表示デバイスの追従（契約13-1 のバグ修正） ---
+    // touchstart は本物の指でしか飛ばない。pointerdown の pointerType は環境によって
+    // 'touch' に化けることがあるので、出す条件はこちらを正とする
+    const onTouchStart = (): void => root.classList.remove('hidden');
+    /** マウス（実ポインタ）を使ったら引っ込める。指を離した直後の合成イベントは無視する */
+    const onMouse = (e: PointerEvent): void => {
+        if (e.pointerType !== 'mouse') return;
+        if (stickPointer >= 0) return;
+        root.classList.add('hidden');
+        onBlur();
     };
-    if (!coarseOnly) window.addEventListener('pointerdown', onFirstTouch, { capture: true });
+    if (!coarseOnly) {
+        window.addEventListener('touchstart', onTouchStart, { capture: true, passive: true });
+        window.addEventListener('pointerdown', onMouse, { capture: true });
+        window.addEventListener('pointermove', onMouse, { capture: true });
+    }
 
     const onBlur = (): void => {
         releaseStick();
@@ -214,12 +240,12 @@ export function createTouchControls(): TouchControls | null {
         setMode(mode) {
             const heli = mode === 'heli';
             const onBoard = mode !== 'walk';
-            interactButton.textContent = onBoard ? '降りる' : '乗る';
-            accelButton.textContent =
-                mode === 'drive' ? 'アクセル' : heli ? 'ブースト' : '走る';
+            setLabel(interactButton, onBoard ? '降りる' : '乗る');
+            // 徒歩の既定が全力になったので、このボタンは「歩く（ゆっくり）」（契約13-9）
+            setLabel(accelButton, mode === 'drive' ? 'アクセル' : heli ? 'ブースト' : '歩く');
             // ヘリはコレクティブ（上昇/下降）を Space・C と同じボタンへ割り当てる
-            brakeButton.textContent = heli ? '上昇' : 'ブレーキ';
-            jumpButton.textContent = heli ? '下降' : 'ジャンプ';
+            setLabel(brakeButton, heli ? '上昇' : 'ブレーキ');
+            setLabel(jumpButton, heli ? '下降' : 'ジャンプ');
             brakeButton.classList.toggle('hidden', mode !== 'drive' && !heli);
             jumpButton.classList.toggle('hidden', mode === 'drive' || mode === 'boar');
         },
@@ -228,7 +254,9 @@ export function createTouchControls(): TouchControls | null {
         },
         dispose() {
             window.removeEventListener('blur', onBlur);
-            window.removeEventListener('pointerdown', onFirstTouch, { capture: true });
+            window.removeEventListener('touchstart', onTouchStart, { capture: true });
+            window.removeEventListener('pointerdown', onMouse, { capture: true });
+            window.removeEventListener('pointermove', onMouse, { capture: true });
             root.remove();
         },
     };

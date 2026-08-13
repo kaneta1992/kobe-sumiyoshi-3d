@@ -5,6 +5,7 @@
  * ロックできない場合とタッチではドラッグに落とす。どちらも movementX/Y を
  * 使うので下流は同じ扱いでよい。
  */
+import { getLookScale } from '../ui/settings';
 import { createTouchControls, type ControlMode, type TouchControls } from '../ui/touch';
 
 export interface InputState {
@@ -12,7 +13,11 @@ export interface InputState {
     moveX: number;
     /** 前方向 -1..1 */
     moveZ: number;
-    /** 走る（徒歩）/ アクセル全開（運転） */
+    /**
+     * 修飾ボタン（Shift / タッチの左ボタン）を押しているか。意味は乗り物ごとに違う:
+     * 徒歩 = ゆっくり歩く（契約13-9 で既定が全力になったので減速側）/
+     * 運転 = アクセル全開 / ヘリ・飛行 = ブースト
+     */
     run: boolean;
     /** ブレーキ・パーキングブレーキ（飛行中は上昇） */
     brake: boolean;
@@ -52,8 +57,13 @@ export interface Input {
     dispose(): void;
 }
 
-/** 視点の感度[rad/px] */
+/** 視点の基準感度[rad/px]。実際に使う値は設定の倍率を掛けた lookSpeed() */
 const LOOK_SPEED = 0.0028;
+
+/** いま効いている視点感度[rad/px]（設定で変えられる・契約13-1） */
+export function lookSpeed(): number {
+    return LOOK_SPEED * getLookScale();
+}
 
 const MOVE_KEYS: Record<string, [number, number]> = {
     KeyW: [0, 1],

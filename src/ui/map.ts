@@ -64,6 +64,8 @@ export interface MapOverlayOptions {
 export interface MapOverlay {
     /** 毎フレーム呼ぶ。中で 10Hz に間引く */
     update(dt: number): void;
+    /** 全体マップを開いているか（画面端インジケータを引っ込める・E95） */
+    readonly isOpen: boolean;
     /**
      * 全体マップを開いて、次にタップ/クリックした地点をワールド座標で返す
      * （どこでもドア・契約11）。閉じられたら onPick の代わりに onCancel が呼ばれる。
@@ -812,6 +814,9 @@ export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
             timer = 0;
             if (open) drawFull();
             else drawMini();
+        },
+        get isOpen() {
+            return open;
         },
         pickPoint(onPick, onCancel) {
             if (pickHandler) return false;

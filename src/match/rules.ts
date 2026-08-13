@@ -8,7 +8,7 @@
  * 時間はすべて「マッチ時計の秒」。マッチ時計は ?matchspeed= 倍で早送りできる（デバッグ用）。
  */
 import { AREA_HALF } from '../config';
-import { LANDMARKS } from '../world/landmarks';
+import { allPlaces } from '../world/landmarks';
 
 const TAU = Math.PI * 2;
 
@@ -45,8 +45,11 @@ export const BUMP_COOLDOWN = 3;
 export const BUMP_PUSH = 1.5;
 /** 体当たりが成立する最低速度[m/s]（走っていること） */
 export const BUMP_SPEED = 3.2;
-/** チャンネリングが中断される移動速度[m/s] */
-export const CHANNEL_STILL = 0.5;
+/**
+ * チャンネリングが中断される移動速度[m/s]。
+ * 既定の移動速度を上げた（契約13-9）ぶん、止まりきる前の余韻で切れないよう緩めてある
+ */
+export const CHANNEL_STILL = 0.9;
 /** 安置の外での移動速度倍率 */
 export const OUTSIDE_SPEED = 0.5;
 /** 輸送機の飛行高度（地形の最高点からの余裕）[m] */
@@ -73,6 +76,11 @@ export function seedOverride(): number | null {
 /** ?matchauto でロビーの開始ボタンを押さずに始める（ソロ検証用） */
 export function autoStart(): boolean {
     return new URLSearchParams(location.search).has('matchauto');
+}
+
+/** ?nobots で BOT なしで始める（ロビーのホスト設定の初期値・契約13-2） */
+export function noBots(): boolean {
+    return new URLSearchParams(location.search).has('nobots');
 }
 
 /** デバッグテレポートで対象から離しておく距離[m]。REACH より外なので接触判定は自分で歩いて成立させる */
@@ -108,6 +116,23 @@ export function createRandom(seed: number): () => number {
         t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
         return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     };
+}
+
+/**
+ * シードだけで決まる 0..count-1 の並び替え（Fisher-Yates）。
+ * POI の抽選と「直近使用の除外」に使う（契約13-4）。全クライアントで同じ列になる
+ */
+export function shuffledOrder(seed: number, count: number): readonly number[] {
+    const rnd = createRandom(seed);
+    const out: number[] = [];
+    for (let i = 0; i < count; i++) out.push(i);
+    for (let i = count - 1; i > 0; i--) {
+        const j = Math.floor(rnd() * (i + 1));
+        const swap = out[i];
+        out[i] = out[j];
+        out[j] = swap;
+    }
+    return out;
 }
 
 /** 文字列（ピアID）を 32bit へ（FNV-1a） */
@@ -167,15 +192,19 @@ function scatter(from: Point, radius: number, rnd: () => number, margin: number)
 }
 
 /**
- * シードから配置を作る。最終安置は実在ランドマークの抽選で、そこから逆順に
+ * シードから配置を作る。最終安置は実在POIの抽選で、そこから逆順に
  * 中心を外へ広げていくので「次の円は必ず現在の円のだいたい内側」になる。
+ * previousSeed を渡すと、直前のマッチの最終安置は選ばない（契約13-4）
  */
-export function buildLayout(seed: number): MatchLayout {
+export function buildLayout(seed: number, previousSeed: number | null = null): MatchLayout {
     const rnd = createRandom(seed);
     const radii = [START_RADIUS, STAGES[0].radius, STAGES[1].radius, STAGES[2].radius];
 
-    // 最終安置＝実在ランドマーク（座標が data-spec で確定しているものだけ）
-    const landmark = LANDMARKS[Math.min(LANDMARKS.length - 1, Math.floor(rnd() * LANDMARKS.length))];
+    // 最終安置＝実在POI（data-spec のランドマーク + bvmap Anno の実在注記。創作しない）
+    const places = allPlaces();
+    const order = shuffledOrder((seed ^ 0x3c79a1d5) >>> 0, places.length);
+    const before = previousSeed === null ? -1 : shuffledOrder((previousSeed ^ 0x3c79a1d5) >>> 0, places.length)[0];
+    const landmark = places[order[0] === before && order.length > 1 ? order[1] : order[0]];
     const c3 = scatter({ x: landmark.x, z: landmark.z }, radii[3] * 0.4, rnd, radii[3] * 0.6);
     const c2 = scatter(c3, (radii[2] - radii[3]) * 0.7, rnd, radii[2] * 0.5);
     const c1 = scatter(c2, (radii[1] - radii[2]) * 0.7, rnd, radii[1] * 0.5);

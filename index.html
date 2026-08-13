@@ -66,17 +66,136 @@
             #net:empty {
                 display: none;
             }
-            /* 出典表記は各データの利用条件（常時表示・非表示にしないこと）:
-               地理院タイル = 出典明示、兵庫県 50cmメッシュ DSM/DEM = CC-BY 4.0 */
-            #credit {
-                right: 10px;
-                bottom: 10px;
-                max-width: min(46em, 70vw);
-                text-align: right;
-            }
+            /* 出典表記は各データの利用条件（文言は削除・改変しないこと）:
+               地理院タイル = 出典明示、兵庫県 50cmメッシュ DSM/DEM = CC-BY 4.0。
+               契約13-5 で常時表示をやめ、右下の ℹ️ → モーダルへ畳んだ（表示方法だけの変更） */
             #credit a {
                 color: #9fc7ff;
-                pointer-events: auto;
+            }
+            #info-button {
+                position: fixed;
+                z-index: 22;
+                right: max(10px, env(safe-area-inset-right, 0px));
+                bottom: max(10px, env(safe-area-inset-bottom, 0px));
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                width: 40px;
+                height: 40px;
+                border-radius: 50%;
+                background: rgba(12, 16, 22, 0.62);
+                border: 1px solid rgba(255, 255, 255, 0.24);
+                font-size: 18px;
+                line-height: 1;
+                cursor: pointer;
+                user-select: none;
+                -webkit-user-select: none;
+            }
+            /* E93: 初回だけ「出典はここ」と知らせる小さなトースト */
+            #info-toast {
+                position: fixed;
+                z-index: 22;
+                right: max(10px, env(safe-area-inset-right, 0px));
+                bottom: calc(max(10px, env(safe-area-inset-bottom, 0px)) + 48px);
+                max-width: min(24em, 78vw);
+                padding: 8px 12px;
+                border-radius: 8px;
+                background: rgba(12, 16, 22, 0.82);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                font-size: 12px;
+                line-height: 1.5;
+                cursor: pointer;
+            }
+            #info-toast.hidden,
+            #info-modal.hidden {
+                display: none;
+            }
+            /* モバイルは右下がタッチ操作系で埋まるので、左上（統計を隠した場所）へ逃がす */
+            @media (pointer: coarse), (max-width: 760px) {
+                #info-button {
+                    right: auto;
+                    bottom: auto;
+                    left: max(10px, env(safe-area-inset-left, 0px));
+                    top: max(10px, env(safe-area-inset-top, 0px));
+                }
+                #info-toast {
+                    right: auto;
+                    bottom: auto;
+                    left: max(10px, env(safe-area-inset-left, 0px));
+                    top: calc(max(10px, env(safe-area-inset-top, 0px)) + 48px);
+                }
+            }
+            #info-modal {
+                position: fixed;
+                inset: 0;
+                z-index: 30;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 16px;
+                background: rgba(6, 9, 13, 0.62);
+            }
+            #info-modal .info-card {
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+                width: min(560px, 100%);
+                max-height: min(80vh, 640px);
+                padding: 16px;
+                border-radius: 14px;
+                background: rgba(14, 19, 26, 0.97);
+                border: 1px solid rgba(255, 255, 255, 0.14);
+                box-shadow: 0 12px 44px rgba(0, 0, 0, 0.55);
+            }
+            #info-modal .info-tabs {
+                display: flex;
+                gap: 6px;
+            }
+            #info-modal .info-tabs button {
+                flex: 1;
+                padding: 9px 6px;
+                border: 0;
+                border-radius: 8px;
+                background: rgba(255, 255, 255, 0.07);
+                color: #c6d0dc;
+                font: inherit;
+                font-size: 13px;
+                cursor: pointer;
+            }
+            #info-modal .info-tabs button.active {
+                background: #3f7ad6;
+                color: #ffffff;
+            }
+            #info-modal .info-body {
+                overflow-y: auto;
+                font-size: 13px;
+                line-height: 1.7;
+            }
+            #info-modal .info-body section.hidden {
+                display: none;
+            }
+            #info-modal .info-row {
+                padding: 2px 0;
+            }
+            #info-modal .info-dim {
+                color: #93a1b2;
+                font-size: 12px;
+            }
+            #info-modal input[type='range'] {
+                width: 100%;
+                margin: 8px 0 4px;
+            }
+            #info-modal .info-close {
+                align-self: center;
+                padding: 9px 26px;
+                border: 0;
+                border-radius: 999px;
+                background: #3f7ad6;
+                color: #ffffff;
+                font: inherit;
+                font-size: 14px;
+                font-weight: 700;
+                cursor: pointer;
             }
             #loading {
                 position: fixed;
@@ -207,8 +326,7 @@
             #touch-ui.hidden {
                 display: none;
             }
-            #touch-ui .touch-stick,
-            #touch-ui .touch-button {
+            #touch-ui .touch-stick {
                 position: absolute;
                 pointer-events: auto;
                 touch-action: none;
@@ -217,57 +335,103 @@
                 background: rgba(12, 16, 22, 0.34);
                 backdrop-filter: blur(2px);
             }
-            /* 出典表記（常時表示が利用条件）と重ならないよう、操作系は下端から持ち上げる */
+            /* 出典を ℹ️ へ畳んだ（契約13-5）ので、操作系は親指の届く下端まで下ろせる。
+               セーフエリア + わずかな余白だけを空ける（契約13-1） */
             #touch-ui .touch-stick,
             #touch-ui .touch-buttons {
-                bottom: calc(env(safe-area-inset-bottom, 0px) + 118px);
+                bottom: calc(env(safe-area-inset-bottom, 0px) + 22px);
             }
             #touch-ui .touch-stick {
-                left: max(16px, env(safe-area-inset-left));
-                width: 120px;
-                height: 120px;
+                left: calc(max(14px, env(safe-area-inset-left)));
+                width: 148px;
+                height: 148px;
             }
             #touch-ui .touch-knob {
                 position: absolute;
                 left: 50%;
                 top: 50%;
-                width: 50px;
-                height: 50px;
-                margin: -25px 0 0 -25px;
+                width: 62px;
+                height: 62px;
+                margin: -31px 0 0 -31px;
                 border-radius: 50%;
                 background: rgba(233, 240, 248, 0.5);
             }
+            /* 2×2 の塊。行は下から上へ積み、各行は右から左へ並べる
+               （DOM の先頭 = 右下 = いちばん親指が届く位置） */
             #touch-ui .touch-buttons {
                 position: absolute;
-                right: max(16px, env(safe-area-inset-right));
+                right: calc(max(4px, env(safe-area-inset-right)));
                 display: flex;
-                align-items: flex-end;
-                gap: 10px;
+                flex-direction: row-reverse;
+                flex-wrap: wrap-reverse;
+                justify-content: flex-start;
+                width: 190px;
             }
+            /* 当たり判定はボタンの見た目より広い（透明な padding を挟んで押し間違いを減らす） */
             #touch-ui .touch-button {
                 position: relative;
+                pointer-events: auto;
+                touch-action: none;
+                padding: 5px 8px;
+                background: none;
+                border: 0;
+            }
+            #touch-ui .touch-button .touch-face {
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                width: 68px;
-                height: 68px;
+                width: 76px;
+                height: 76px;
+                border-radius: 50%;
+                border: 1px solid rgba(255, 255, 255, 0.32);
+                background: rgba(12, 16, 22, 0.42);
+                backdrop-filter: blur(2px);
                 font-size: 12px;
                 letter-spacing: 0.04em;
                 color: #e8edf2;
                 text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
             }
-            #touch-ui .touch-button.active {
-                background: rgba(111, 168, 255, 0.5);
+            #touch-ui .touch-button.active .touch-face {
+                background: rgba(111, 168, 255, 0.55);
             }
-            #touch-ui .touch-button.disabled {
-                opacity: 0.35;
+            #touch-ui .touch-button.disabled .touch-face {
+                opacity: 0.32;
             }
             #touch-ui .touch-button.hidden {
                 display: none;
             }
-            #touch-ui .touch-interact {
-                width: 78px;
-                height: 78px;
+            #touch-ui .touch-interact .touch-face {
+                width: 84px;
+                height: 84px;
+                border-color: rgba(140, 195, 255, 0.6);
+            }
+            /* E94: 画面下中央に回収ボタンが出ている間はジャンプを消して誤タップを防ぐ */
+            body.match-action-open #touch-ui .touch-jump {
+                display: none;
+            }
+            /* 小さい画面ではひと回り小さくして、スティックと取り合わないようにする */
+            @media (max-height: 620px) {
+                #touch-ui .touch-stick {
+                    width: 124px;
+                    height: 124px;
+                }
+                #touch-ui .touch-button .touch-face {
+                    width: 64px;
+                    height: 64px;
+                    font-size: 11px;
+                }
+                #touch-ui .touch-interact .touch-face {
+                    width: 70px;
+                    height: 70px;
+                }
+            }
+            /* モバイルでは左上のワールド統計・左下の操作説明を出さない（HUD の整理・契約13-1）。
+               同じ内容は ℹ️ の「操作」タブから読める */
+            @media (pointer: coarse), (max-width: 760px) {
+                #status,
+                #help {
+                    display: none;
+                }
             }
             /* マッチUI（src/match/hud.ts が中身を作る・契約10）。
                ?match のときだけ生成される。3D の上・全体マップの下に置く */
@@ -278,10 +442,15 @@
                 pointer-events: none;
                 /* アイテム枠の下端。タッチUIがある画面ではボタン群の上へ逃がす（E78） */
                 --match-bottom: 18px;
+                /* 回収ボタンの下端（モバイルは左スティック・右ボタンの間の下中央） */
+                --match-action-bottom: 26px;
             }
+            /* モバイルは画面下が左スティック（〜154px）と右のボタン塊（〜194px）で
+               埋まっているので、アイテム枠と回収ボタンはその上に中央で縦に積む（E78 / E94） */
             @media (pointer: coarse), (max-width: 760px) {
                 #match-ui {
-                    --match-bottom: 200px;
+                    --match-bottom: 202px;
+                    --match-action-bottom: 268px;
                 }
             }
             /* 安置の外にいる間の赤い縁。減速していることを画で伝える */
@@ -308,6 +477,17 @@
                 /* 左上の #status・右上のミニマップと取り合わない幅に収める（E50） */
                 max-width: min(44em, 62vw);
                 text-align: center;
+            }
+            /* モバイルは左上の統計を隠してある（契約13-1）ぶん、状態行を広く使える。
+               右上のミニマップ 116px + ℹ️ 40px を避ける */
+            @media (pointer: coarse), (max-width: 760px) {
+                #match-ui .match-top {
+                    max-width: calc(100vw - 120px);
+                }
+                #match-ui .match-status {
+                    padding: 5px 9px;
+                    font-size: 11px;
+                }
             }
             #match-ui .match-status {
                 padding: 5px 12px;
@@ -346,7 +526,7 @@
             #match-ui .match-channel {
                 position: absolute;
                 left: 50%;
-                bottom: calc(env(safe-area-inset-bottom, 0px) + 26%);
+                bottom: calc(env(safe-area-inset-bottom, 0px) + 42%);
                 transform: translateX(-50%);
                 width: min(340px, 74vw);
                 text-align: center;
@@ -364,20 +544,148 @@
                 font-size: 12px;
                 text-shadow: 0 1px 3px rgba(0, 0, 0, 0.75);
             }
-            /* 効いているアイテムの残り時間・地図の切れ端（契約11） */
+            /* 効いているアイテムの残り時間・速度倍率（契約11 / 13-10）。
+               契約13-1 で上部に情報が集まるので、バッジは小さめにして状態行を邪魔しない */
             #match-ui .match-badge {
-                padding: 3px 12px;
+                padding: 2px 10px;
                 border-radius: 999px;
                 background: rgba(24, 58, 110, 0.6);
-                font-size: 12px;
-                letter-spacing: 0.06em;
+                font-size: 11px;
+                letter-spacing: 0.04em;
                 font-variant-numeric: tabular-nums;
+            }
+            /* フェーズ遷移トースト（契約13-6）。実況より大きく、画面中央やや上に出す */
+            #match-ui .match-toast {
+                position: absolute;
+                left: 50%;
+                top: 22%;
+                transform: translateX(-50%);
+                max-width: min(30em, 86vw);
+                padding: 12px 22px;
+                border-radius: 12px;
+                background: rgba(18, 44, 86, 0.9);
+                border: 1px solid rgba(150, 200, 255, 0.6);
+                box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+                font-size: 17px;
+                font-weight: 700;
+                letter-spacing: 0.02em;
+                text-align: center;
+                text-shadow: 0 1px 4px rgba(0, 0, 0, 0.7);
+            }
+            #match-ui .match-toast.pop {
+                animation: match-pop 0.4s ease-out;
+            }
+            /* 安置の外にいるときだけ出す画面端インジケータ（契約13-6）。
+               宝箱・鍵の方角は出さない — 場所を推理するのがこのゲームの芯 */
+            #match-ui .match-edge {
+                position: absolute;
+                left: 50%;
+                /* 画面のやや上を中心に回す。真下を指したときにアイテム枠と重ならない位置 */
+                top: 42%;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 3px;
+            }
+            #match-ui .match-edge-dial {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                width: 46px;
+                height: 46px;
+                border-radius: 50%;
+                background: rgba(46, 132, 235, 0.5);
+                border: 2px solid rgba(180, 220, 255, 0.9);
+                color: #ffffff;
+                font-size: 22px;
+                line-height: 1;
+                /* 絵文字は右向きなので、上（= 進行方向）を向くよう 90°戻す */
+                transform: rotate(-90deg);
+            }
+            #match-ui .match-edge-label {
+                padding: 2px 8px;
+                border-radius: 999px;
+                background: rgba(12, 16, 22, 0.78);
+                font-size: 11px;
+                white-space: nowrap;
+                font-variant-numeric: tabular-nums;
+            }
+            /* 統一の回収UI（契約13-3）。PC は「E」バッジ + 文字、モバイルは大きなボタン */
+            #match-ui .match-action {
+                position: absolute;
+                left: 50%;
+                bottom: calc(env(safe-area-inset-bottom, 0px) + var(--match-action-bottom));
+                transform: translateX(-50%);
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 10px 20px;
+                border-radius: 999px;
+                background: rgba(12, 16, 22, 0.78);
+                border: 2px solid rgba(255, 210, 87, 0.9);
+                box-shadow: 0 6px 22px rgba(0, 0, 0, 0.45);
+                pointer-events: auto;
+                touch-action: none;
+                cursor: pointer;
+                overflow: hidden;
+                user-select: none;
+                -webkit-user-select: none;
+            }
+            #match-ui .match-action.active {
+                background: rgba(60, 44, 12, 0.86);
+                border-color: #ffd257;
+            }
+            /* 長押しの進捗はボタン自身が満ちていく（別の場所を見なくてよい） */
+            #match-ui .match-action-ring {
+                position: absolute;
+                left: 0;
+                top: 0;
+                bottom: 0;
+                width: 0%;
+                background: linear-gradient(90deg, rgba(255, 210, 87, 0.45), rgba(255, 154, 60, 0.5));
+                transition: width 0.08s linear;
+            }
+            #match-ui .match-action-key {
+                position: relative;
+                padding: 1px 8px;
+                border-radius: 6px;
+                background: rgba(255, 255, 255, 0.16);
+                border: 1px solid rgba(255, 255, 255, 0.4);
+                font-size: 12px;
+                font-weight: 700;
+            }
+            #match-ui .match-action-mark {
+                position: relative;
+                font-size: 22px;
+                line-height: 1;
+            }
+            #match-ui .match-action-label {
+                position: relative;
+                font-size: 15px;
+                font-weight: 700;
+                letter-spacing: 0.02em;
+                white-space: nowrap;
+            }
+            /* タッチ端末では「E」の案内は不要。そのぶんボタンを大きくする */
+            @media (pointer: coarse), (max-width: 760px) {
+                #match-ui .match-action-key {
+                    display: none;
+                }
+                #match-ui .match-action {
+                    padding: 16px 30px;
+                }
+                #match-ui .match-action-label {
+                    font-size: 17px;
+                }
+                #match-ui .match-action-mark {
+                    font-size: 26px;
+                }
             }
             /* 尋ね人ステッキの方角矢印（契約11） */
             #match-ui .match-arrow {
                 position: absolute;
                 left: 50%;
-                bottom: calc(env(safe-area-inset-bottom, 0px) + var(--match-bottom) + 92px);
+                bottom: calc(env(safe-area-inset-bottom, 0px) + var(--match-bottom) + 148px);
                 transform: translateX(-50%);
                 display: flex;
                 flex-direction: column;
@@ -421,8 +729,8 @@
                 flex-direction: column;
                 align-items: center;
                 justify-content: center;
-                width: 116px;
-                height: 68px;
+                width: 104px;
+                height: 60px;
                 padding: 0 6px;
                 border-radius: 12px;
                 border: 1px solid rgba(255, 255, 255, 0.28);
@@ -483,6 +791,21 @@
                 line-height: 1.7;
                 color: #c6d0dc;
             }
+            /* ロビーのホスト設定（BOT: あり/なし・契約13-2） */
+            #match-ui .match-panel-toggle {
+                margin-top: 4px;
+                padding: 7px 20px;
+                border: 1px solid rgba(255, 255, 255, 0.3);
+                border-radius: 999px;
+                background: rgba(255, 255, 255, 0.08);
+                color: #e8edf2;
+                font: inherit;
+                font-size: 13px;
+                cursor: pointer;
+            }
+            #match-ui .match-panel-toggle.hidden {
+                display: none;
+            }
             #match-ui .match-panel-button {
                 margin-top: 6px;
                 padding: 10px 26px;
@@ -505,6 +828,96 @@
             #match-ui .hidden {
                 display: none;
             }
+            /* 初回マッチ前のルール説明カード（契約13-6。src/ui/onboarding.ts が中身を作る） */
+            #onboarding {
+                position: fixed;
+                inset: 0;
+                z-index: 28;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 16px;
+                background: rgba(6, 9, 13, 0.72);
+            }
+            #onboarding.hidden {
+                display: none;
+            }
+            #onboarding .onboarding-card {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 10px;
+                width: min(420px, 100%);
+                padding: 26px 24px 18px;
+                border-radius: 16px;
+                background: rgba(14, 19, 26, 0.97);
+                border: 1px solid rgba(255, 255, 255, 0.14);
+                box-shadow: 0 12px 44px rgba(0, 0, 0, 0.55);
+                text-align: center;
+            }
+            #onboarding .onboarding-mark {
+                font-size: 44px;
+                line-height: 1;
+            }
+            #onboarding .onboarding-title {
+                font-size: 18px;
+                font-weight: 700;
+                letter-spacing: 0.02em;
+            }
+            #onboarding .onboarding-body {
+                font-size: 13px;
+                line-height: 1.8;
+                color: #c6d0dc;
+            }
+            #onboarding .onboarding-dots {
+                display: flex;
+                gap: 7px;
+                margin-top: 2px;
+            }
+            #onboarding .onboarding-dot {
+                width: 7px;
+                height: 7px;
+                border-radius: 50%;
+                background: rgba(255, 255, 255, 0.22);
+            }
+            #onboarding .onboarding-dot.active {
+                background: #6fa8ff;
+            }
+            #onboarding .onboarding-row {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                margin-top: 4px;
+            }
+            #onboarding .onboarding-next {
+                padding: 11px 30px;
+                border: 0;
+                border-radius: 999px;
+                background: #3f7ad6;
+                color: #ffffff;
+                font: inherit;
+                font-size: 15px;
+                font-weight: 700;
+                cursor: pointer;
+            }
+            #onboarding .onboarding-skip {
+                padding: 11px 18px;
+                border: 0;
+                border-radius: 999px;
+                background: transparent;
+                color: #93a1b2;
+                font: inherit;
+                font-size: 13px;
+                cursor: pointer;
+            }
+            #onboarding .onboarding-hide {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                font-size: 12px;
+                color: #93a1b2;
+                cursor: pointer;
+            }
         </style>
     </head>
     <body>
@@ -512,18 +925,65 @@
 
         <div id="status" class="panel">起動中…</div>
         <div id="net" class="panel"></div>
-        <div id="help" class="panel">WASD: 移動　Shift: 走る　ドラッグ/マウス: 視点　F: 乗車　R: 位置リセット</div>
-        <div id="credit" class="panel">
-            出典:
-            <a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank" rel="noreferrer">
-                地理院タイル（国土地理院）
-            </a><br />
-            この作品は、以下の著作物を改変して利用しています。兵庫県 50cmメッシュ DSM/DEM（2021〜2022年度）、[兵庫県]（<a
-                href="https://creativecommons.org/licenses/by/4.0/deed.ja"
-                target="_blank"
-                rel="noreferrer"
-                >CC BY 4.0</a
-            >）。建物高さ・地形・樹木は本アプリが上記データを加工して生成したもので、兵庫県が作成・公表したものではありません。
+        <div id="help" class="panel">
+            WASD: 移動　Shift: 歩く（ゆっくり）　ドラッグ/マウス: 視点　F: 乗車　R: 位置リセット
+        </div>
+
+        <!-- 出典表記は各データの利用条件（文言は削除・改変しないこと）。
+             契約13-5 で「常時表示」から「ℹ️ → モーダル」へ表示方法だけを変えた。
+             初回ロード時は #info-toast で出典の在り処を必ず知らせる（E93） -->
+        <div id="info-button" title="出典・操作・設定">ℹ️</div>
+        <div id="info-toast" class="hidden">
+            地図・地形データの出典は ℹ️ ボタンに掲載しています（タップで開く）
+        </div>
+        <div id="info-modal" class="hidden">
+            <div class="info-card">
+                <div class="info-tabs">
+                    <button data-tab="credit" class="active">出典・ライセンス</button>
+                    <button data-tab="help">操作</button>
+                    <button data-tab="settings">設定</button>
+                </div>
+                <div class="info-body">
+                    <section data-panel="credit" id="credit">
+                        出典:
+                        <a
+                            href="https://maps.gsi.go.jp/development/ichiran.html"
+                            target="_blank"
+                            rel="noreferrer"
+                        >
+                            地理院タイル（国土地理院）
+                        </a><br />
+                        この作品は、以下の著作物を改変して利用しています。兵庫県 50cmメッシュ DSM/DEM（2021〜2022年度）、[兵庫県]（<a
+                            href="https://creativecommons.org/licenses/by/4.0/deed.ja"
+                            target="_blank"
+                            rel="noreferrer"
+                            >CC BY 4.0</a
+                        >）。建物高さ・地形・樹木は本アプリが上記データを加工して生成したもので、兵庫県が作成・公表したものではありません。
+                    </section>
+                    <section data-panel="help" class="hidden">
+                        <div class="info-row"><b>移動</b>　WASD / 左スティック</div>
+                        <div class="info-row"><b>歩く（ゆっくり）</b>　Shift / 「歩く」ボタン</div>
+                        <div class="info-row"><b>ジャンプ</b>　Space / ジャンプボタン</div>
+                        <div class="info-row"><b>視点</b>　マウスドラッグ / 画面スワイプ</div>
+                        <div class="info-row"><b>回収</b>　E / 画面下の「回収」ボタン</div>
+                        <div class="info-row"><b>乗車・降車</b>　F / 「乗る」ボタン</div>
+                        <div class="info-row"><b>マップ</b>　M / ミニマップをタップ</div>
+                        <div class="info-row"><b>アイテム使用</b>　1・2 / 画面下のアイテム枠をタップ</div>
+                        <div class="info-row"><b>位置リセット</b>　R</div>
+                        <div class="info-row info-dim" id="info-help"></div>
+                    </section>
+                    <section data-panel="settings" class="hidden">
+                        <label class="info-row" for="info-look">
+                            視点の感度　<span id="info-look-value">×1.00</span>
+                        </label>
+                        <input id="info-look" type="range" />
+                        <div class="info-row info-dim">
+                            スワイプ・マウスドラッグの両方に効きます（この端末に保存されます）
+                        </div>
+                    </section>
+                </div>
+                <button class="info-close">閉じる</button>
+            </div>
         </div>
 
         <div id="loading">

@@ -26,13 +26,31 @@ import {
     OUTSIDE_SPEED,
     PLANE_CLEARANCE,
     REACH,
+    STAGES,
     createRandom,
     type MatchLayout,
     type ZoneNow,
 } from './rules';
 
-/** BOT の水平移動速度[m/s]（人間の全力 5.2 より遅い） */
-const BOT_SPEED = 4.3;
+/** BOT の水平移動速度[m/s]（人間の既定 10.4 より遅い・契約13-9 の再調整） */
+const BOT_SPEED = 8.6;
+/** ⚡1個ぶんの速度アップと上限倍率（人間と同じルール・契約13-10） */
+const BOT_SPEED_PER_COIN = 0.02;
+const BOT_SPEED_CAP = 2;
+/** ⚡を拾う距離[m]（人間と同じ） */
+const COIN_REACH = 2.6;
+
+// --- 人間優位のハンデ（契約13-6。「気づいたら負けてた」を無くす） ---
+/** 鍵へ向かい始めるまでの遅れ[s]の下限と幅（シードで1体ずつ決まる） */
+const KEY_HOLD_MIN = 18;
+const KEY_HOLD_SPAN = 22;
+/** 最終安置が確定してから宝箱へ向かうまで待つ[s]の下限と幅 */
+const CHEST_HOLD_MIN = 30;
+const CHEST_HOLD_SPAN = 30;
+/** 最終安置が確定するマッチ時計[s]（第3収縮の完了） */
+const FINAL_ZONE_AT = STAGES[STAGES.length - 1].to;
+/** BOT のチャンネリング速度（人間の 0.7 倍） */
+const CHEST_CHANNEL_SCALE = 0.7;
 /** 向きの追従[rad/s] */
 const TURN_RATE = 5;
 /** 経路の通過点に着いたとみなす距離[m] */
@@ -56,8 +74,6 @@ const CANOPY_ALTITUDE = 110;
 const FALL_GLIDE = 30;
 /** 安置の外にいるときに中心へ戻り始める余裕[m] */
 const ZONE_MARGIN = 30;
-/** 宝箱・鍵へ向かい始めるまでの反応の遅れの幅[s]（シードで1体ずつ決まる） */
-const REACT_DELAY = 12;
 
 type Goal = 'drop' | 'item' | 'key' | 'chest' | 'zone';
 
@@ -89,6 +105,8 @@ export interface BotsOptions {
     claimItem(index: number, botId: string): void;
     /** 未取得のアイテムを巡回する */
     eachDrop(visit: (index: number, x: number, z: number) => void): void;
+    /** 場の⚡を巡回する（BOT も拾って速くなる・契約13-10） */
+    eachCoin(visit: (x: number, z: number) => void): void;
     /** 人間（自分を含む）の位置を巡回する */
     eachHuman(visit: (id: string, x: number, y: number, z: number) => void): void;
     /** 体当たり（BOT → 誰か） */
@@ -131,8 +149,14 @@ interface Bot {
     jumpAt: number;
     /** 速さの個体差（0.9〜1.08） */
     pace: number;
-    /** 鍵・宝箱へ反応するまでの遅れ[s] */
+    /** 鍵へ反応するまでの遅れ[s]（人間優位のハンデ・契約13-6） */
     delay: number;
+    /** 最終安置の確定から宝箱へ向かうまで待つ[s]（人間優位のハンデ・契約13-6） */
+    chestDelay: number;
+    /** 拾った⚡の数（契約13-10。人間と同じルールで速くなる） */
+    coins: number;
+    /** 拾った⚡の印（体ごとにローカル。人間の取得とは干渉しない） */
+    coinTaken: Uint8Array;
     goal: Goal;
     targetX: number;
     targetZ: number;
@@ -181,6 +205,9 @@ export function createBots(options: BotsOptions): Bots {
         jumpAt: 0,
         pace: 1,
         delay: 0,
+        chestDelay: 0,
+        coins: 0,
+        coinTaken: new Uint8Array(0),
         goal: 'drop',
         targetX: 0,
         targetZ: 0,
@@ -213,8 +240,14 @@ export function createBots(options: BotsOptions): Bots {
             bot.targetZ = zone.z + (bot.z - zone.z) * scale;
             return;
         }
-        // 鍵を持っていれば宝箱へ（場所を知っているのは開示が進んでから）
-        if (frame.keyOwner === bot.id && frame.reveal >= 2) {
+        // 鍵を持っていれば宝箱へ（場所を知っているのは開示が進んでから）。
+        // ただし最終安置が確定してから 30〜60秒は宝箱へ向かわない（人間優位のハンデ・契約13-6）。
+        // それまではアイテム拾いや安置移動を続けるので、人間が先に着く余地が残る
+        if (
+            frame.keyOwner === bot.id &&
+            frame.reveal >= 2 &&
+            frame.t >= FINAL_ZONE_AT + bot.chestDelay
+        ) {
             bot.goal = 'chest';
             bot.targetItem = -1;
             bot.targetX = frame.chestX;
@@ -293,6 +326,23 @@ export function createBots(options: BotsOptions): Bots {
     };
 
     const waypoint = { x: 0, z: 0 };
+
+    // ⚡の巡回（フレーム内で関数を作らない）
+    let coinCount = 0;
+    const countCoin = (): void => {
+        coinCount++;
+    };
+    let coinBot: Bot | null = null;
+    let coinIndex = 0;
+    const takeCoin = (x: number, z: number): void => {
+        const bot = coinBot;
+        const index = coinIndex++;
+        if (!bot || index >= bot.coinTaken.length || bot.coinTaken[index]) return;
+        if (Math.abs(bot.x - x) > COIN_REACH || Math.abs(bot.z - z) > COIN_REACH) return;
+        if (Math.hypot(bot.x - x, bot.z - z) > COIN_REACH) return;
+        bot.coinTaken[index] = 1;
+        bot.coins++;
+    };
 
     // 体当たりの相手探し（フレーム内で関数を作らない）
     let scanBot: Bot | null = null;
@@ -378,7 +428,8 @@ export function createBots(options: BotsOptions): Bots {
         const toChest = Math.hypot(bot.x - frame.chestX, bot.z - frame.chestZ);
         if (frame.keyOwner === bot.id && !frame.winner && toChest < REACH) {
             if (bot.channel <= 0) options.announce(`${bot.name}が宝箱を開け始めた！`);
-            bot.channel += dt * speed;
+            // 人間より遅く開ける（0.7倍。横から割り込んで奪える猶予・契約13-6）
+            bot.channel += dt * speed * CHEST_CHANNEL_SCALE;
             bot.speed = 0;
             if (bot.channel >= CHANNEL_TIME) {
                 bot.channel = 0;
@@ -406,7 +457,8 @@ export function createBots(options: BotsOptions): Bots {
         const dz = waypoint.z - bot.z;
         const distance = Math.hypot(dx, dz);
         const outside = Math.hypot(bot.x - frame.zone.x, bot.z - frame.zone.z) > frame.zone.r;
-        const pace = BOT_SPEED * bot.pace * speed * (outside ? OUTSIDE_SPEED : 1);
+        const boost = Math.min(BOT_SPEED_CAP, 1 + bot.coins * BOT_SPEED_PER_COIN);
+        const pace = BOT_SPEED * bot.pace * boost * speed * (outside ? OUTSIDE_SPEED : 1);
         if (distance > 0.3) {
             const move = Math.min(distance, pace * dt);
             bot.x += (dx / distance) * move;
@@ -444,6 +496,12 @@ export function createBots(options: BotsOptions): Bots {
             bot.lastZ = bot.z;
         }
 
+        // --- ⚡（触れるだけ・各自ローカル。人間とまったく同じルール・契約13-10） ---
+        coinBot = bot;
+        coinIndex = 0;
+        options.eachCoin(takeCoin);
+        coinBot = null;
+
         // --- 拾得（アイテム → 鍵。裁定はホスト = 自分が出す・E83） ---
         if (bot.targetItem >= 0 && Math.hypot(bot.x - bot.targetX, bot.z - bot.targetZ) < PICK_REACH) {
             options.claimItem(bot.targetItem, bot.id);
@@ -479,6 +537,9 @@ export function createBots(options: BotsOptions): Bots {
         start(nextLayout, seed, count) {
             layout = nextLayout;
             live = Math.max(0, count);
+            // ⚡の総数を数えておく（体ごとの取得印の長さ・契約13-10）
+            coinCount = 0;
+            options.eachCoin(countCoin);
             if (!graph && live > 0) graph = buildRoadGraph(world.mapFeatures.roads);
             // マッチ本体・アイテムとは別の列を使う（配置が絡まないようにひねる）
             const rnd = createRandom((seed ^ 0x2f6d1b53) >>> 0);
@@ -489,7 +550,11 @@ export function createBots(options: BotsOptions): Bots {
                 bot.phase = 'plane';
                 bot.jumpAt = DROP_TIME * (0.12 + rnd() * 0.7);
                 bot.pace = 0.9 + rnd() * 0.18;
-                bot.delay = rnd() * REACT_DELAY;
+                // 人間優位のハンデ（契約13-6）。鍵も宝箱も「わざと出遅れる」
+                bot.delay = KEY_HOLD_MIN + rnd() * KEY_HOLD_SPAN;
+                bot.chestDelay = CHEST_HOLD_MIN + rnd() * CHEST_HOLD_SPAN;
+                bot.coins = 0;
+                bot.coinTaken = new Uint8Array(coinCount);
                 // 降下地点は第1安置の中（そこそこ散らばり、収縮で置いていかれない）
                 const angle = rnd() * Math.PI * 2;
                 const radius = Math.sqrt(rnd()) * nextLayout.radii[1] * 0.85;

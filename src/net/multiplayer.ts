@@ -155,6 +155,10 @@ export type MatchPacket = {
     e?: string;
     /** fx: 効果が続く秒数 */
     d?: number;
+    /** start: 直前のマッチのシード（POI の連続同一を避ける・契約13-4） */
+    p?: number;
+    /** start: 1 = BOT なしで始める（ホストのロビー設定・契約13-2） */
+    nb?: number;
 };
 
 /** ピアごとの受信バッファ。配列は参加時に確保し、以後は書き換えるだけ */

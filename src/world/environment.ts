@@ -94,8 +94,17 @@ function createFogNode(): unknown {
 export interface Environment {
     group: Group;
     sun: DirectionalLight;
-    /** 毎フレーム呼ぶ。空をカメラに追従させ、影の更新要否を決める */
-    update(camera: PerspectiveCamera): void;
+    /**
+     * 毎フレーム呼ぶ。空をカメラに追従させ、影の更新要否を決める。
+     * quality は world.update と同じく**そのフレームの設定**を渡す（段階降格が効く）。
+     * focus はシャドウボックスを寄せたい地点（プレイヤーの足元）。
+     * 省略するとカメラ位置に寄せる（?fly など操作系が無いとき）
+     */
+    update(
+        camera: PerspectiveCamera,
+        quality: QualitySettings,
+        focus?: { x: number; y: number; z: number },
+    ): void;
 }
 
 export function createEnvironment(scene: Scene, quality: QualitySettings): Environment {
@@ -142,6 +151,12 @@ export function createEnvironment(scene: Scene, quality: QualitySettings): Envir
             csm = null;
         }
     }
+    /**
+     * 単一シャドウのとき、光源を注視点からどれだけ離すか[m]。
+     * **near..far の内側に収める**こと — 外へ置くとシャドウマップに何も写らず、
+     * 影が丸ごと消える（mobile で影が出ていなかった原因・契約13-7）
+     */
+    const shadowLightDistance = quality.shadowDistance * 3;
     if (!csm) {
         const cam = sun.shadow.camera;
         const extent = quality.shadowDistance;
@@ -150,10 +165,11 @@ export function createEnvironment(scene: Scene, quality: QualitySettings): Envir
         cam.top = extent;
         cam.bottom = -extent;
         cam.near = 10;
-        cam.far = extent * 6;
+        cam.far = shadowLightDistance + extent * 3;
         cam.updateProjectionMatrix();
     }
-    // 太陽が動かない構成では毎フレーム描き直さない（追記2-4）
+    // 太陽が動かない構成では毎フレーム描き直さない（追記2-4）。
+    // mobile の追従シャドウ（契約13-7）はここが false なので毎フレーム描き直す
     if (quality.staticShadows && !csm) {
         sun.shadow.autoUpdate = false;
         sun.shadow.needsUpdate = true;
@@ -164,22 +180,33 @@ export function createEnvironment(scene: Scene, quality: QualitySettings): Envir
     scene.add(group);
 
     const lastShadowAnchor = new Vector3(Infinity, Infinity, Infinity);
+    const shadowAnchor = new Vector3();
 
     return {
         group,
         sun,
-        update(camera) {
+        update(camera, q, focus) {
             sky.position.copy(camera.position);
             if (csm) return;
-            // 単一シャドウはカメラ前方に箱を置いて追従させる（近距離だけ担当する）
-            const anchor = camera.position;
-            if (anchor.distanceTo(lastShadowAnchor) < SHADOW_REFRESH_DISTANCE) return;
-            lastShadowAnchor.copy(anchor);
-            sun.target.position.copy(anchor);
-            sun.position.copy(anchor).addScaledVector(sunDirection, 900);
+            // 段階降格で静的キャッシュへ落ちたら、毎フレームの影の描き直しをやめる
+            if (sun.shadow.autoUpdate === q.staticShadows) {
+                sun.shadow.autoUpdate = !q.staticShadows;
+                sun.shadow.needsUpdate = true;
+            }
+            // 単一シャドウは箱を1つだけ追従させる（近距離だけ担当する）。
+            // 動的影（契約13-7 の mobile）はプレイヤーへ毎フレーム寄せる —
+            // 一定距離ごとにジャンプさせると、足元の影が飛んでいるのが見えてしまう
+            if (focus) shadowAnchor.set(focus.x, focus.y, focus.z);
+            else shadowAnchor.copy(camera.position);
+            if (q.staticShadows && shadowAnchor.distanceTo(lastShadowAnchor) < SHADOW_REFRESH_DISTANCE) {
+                return;
+            }
+            lastShadowAnchor.copy(shadowAnchor);
+            sun.target.position.copy(shadowAnchor);
+            sun.position.copy(shadowAnchor).addScaledVector(sunDirection, shadowLightDistance);
             sun.target.updateMatrixWorld();
             sun.updateMatrixWorld();
-            if (quality.staticShadows) sun.shadow.needsUpdate = true;
+            if (q.staticShadows) sun.shadow.needsUpdate = true;
         },
     };
 }

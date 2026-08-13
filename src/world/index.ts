@@ -12,6 +12,7 @@ import { countDemTiles, loadElevationSampler } from '../data/dem';
 import { countPhotoTiles, loadAerialImage } from '../data/photo';
 import { loadBuildingHeights, loadGi, loadHeightmap, loadTrees } from '../data/terrain-assets';
 import type { TreeInstance } from '../data/terrain-assets';
+import { AREA_HALF } from '../config';
 import { countVectorTiles, loadVectorFeatures } from '../data/vector';
 import type { WaterShape } from '../data/vector';
 import type { QualitySettings } from '../quality';
@@ -19,6 +20,7 @@ import { buildRoadProfiles, type RoadPath } from '../shared/road-profile.js';
 import { worldStats } from '../ui/stats';
 import { buildBridgeSpans, createBridges, type BridgeSpan } from './bridges';
 import { createBuildings, type BuildingCollision } from './buildings';
+import { setPlaces, type Landmark } from './landmarks';
 import { buildOccupancy } from './occupancy';
 import { createProps } from './props';
 import { createRoads } from './roads';
@@ -111,6 +113,39 @@ function nextFrame(): Promise<void> {
     return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
 
+/** Anno 由来POIを採用する最寄り道路までの距離[m]（到達可能性チェック・E96） */
+const POI_ROAD_REACH = 50;
+/** POI として扱うエリアの内側の余裕[m]（端すぎるとマッチが成立しない） */
+const POI_AREA_MARGIN = 60;
+
+/**
+ * Anno（実在注記）から到達できるPOIだけを残す（契約13-4 / E96）。
+ * 「エリアの内側」かつ「最寄りの道路から 50m 以内」の注記だけを採る。
+ * 名前も座標も実データそのままで、ここで創作は一切しない
+ */
+function reachablePlaces(
+    notes: readonly { x: number; z: number; text: string; code: number }[],
+    roads: readonly RoadPath[],
+): Landmark[] {
+    const limit = AREA_HALF - POI_AREA_MARGIN;
+    const reach = POI_ROAD_REACH * POI_ROAD_REACH;
+    const picked: Landmark[] = [];
+    for (const note of notes) {
+        if (Math.abs(note.x) > limit || Math.abs(note.z) > limit) continue;
+        let nearest = Infinity;
+        for (const road of roads) {
+            for (const p of road.points) {
+                const d = (p.x - note.x) ** 2 + (p.z - note.z) ** 2;
+                if (d < nearest) nearest = d;
+            }
+            if (nearest <= reach) break;
+        }
+        if (nearest > reach) continue;
+        picked.push({ name: note.text, x: note.x, z: note.z });
+    }
+    return picked;
+}
+
 export async function buildWorld(
     scene: Scene,
     quality: QualitySettings,
@@ -157,6 +192,13 @@ export async function buildWorld(
     // （pinned）= 路面と地面に段差が出ない。橋だけが両端の取付点を結ぶ直線になる（契約08）
     const profiled = buildRoadProfiles(features.roads, terrain.getElevationAt, { pinned: true });
     const bridgeSpans = buildBridgeSpans(profiled.paths);
+
+    // Anno 由来の実在POI（契約13-4）。道路が揃ってから到達可能性で絞る（E96）
+    const poi = setPlaces(reachablePlaces(features.annotations, profiled.paths));
+    console.info(
+        `[world] 実在POI ${poi.length}件（Anno 注記 ${features.annotations.length}件から到達可能なもの + 基本ランドマーク）: ` +
+            poi.map((p) => p.name).join('・'),
+    );
 
     phase = '道路・建物の占有図を作成中';
     emit();

@@ -12,8 +12,8 @@
  */
 import { AREA_HALF } from '../config';
 import type { RoadPath } from '../shared/road-profile.js';
-import { LANDMARKS, placeName } from '../world/landmarks';
-import { createRandom, createZoneNow, zoneAt, type MatchLayout } from './rules';
+import { allPlaces, placeName } from '../world/landmarks';
+import { createRandom, createZoneNow, shuffledOrder, zoneAt, type MatchLayout } from './rules';
 
 const TAU = Math.PI * 2;
 
@@ -131,17 +131,19 @@ export const ITEMS: Readonly<Record<ItemId, ItemSpec>> = {
     },
 };
 
-/** 湧きPOI の数（実在ランドマーク優先 → 残りは道路上へ散らす） */
+/** 湧きPOI の数（実在POIの抽選 → 足りなければ道路上へ散らす） */
 const SPOT_COUNT = 8;
+/** 直近マッチで使ったとみなして避けるPOIの数（連続同一を防ぐ・契約13-4） */
+const SPOT_AVOID = 12;
 /** 1つのPOIに置くアイテム数 */
 const PER_SPOT = 2;
 /** POI どうしの最低距離[m] */
 const SPOT_GAP = 210;
 /** POI の中でアイテムを置く半径[m] */
 const SPOT_RADIUS = 1.7;
-/** コインの間隔[m] と POI から片側に何個敷くか */
+/** ⚡（速度アップ）の間隔[m] と POI から片側に何個敷くか（契約13-10 で増量） */
 const COIN_STEP = 8;
-const COIN_PER_SIDE = 10;
+const COIN_PER_SIDE = 14;
 /** コイン列を敷くのに十分な道路の長さ[m] と、その道を探しに行く範囲[m] */
 const COIN_ROAD_LENGTH = 120;
 const COIN_ROAD_SEARCH = 90;
@@ -279,14 +281,21 @@ function layCoins(
     }
 }
 
+/** POI の抽選順（シードだけで決まる。前マッチの順とは別物になる・契約13-4） */
+function spotOrder(seed: number, count: number): readonly number[] {
+    return shuffledOrder((seed ^ 0x51ed270b) >>> 0, count);
+}
+
 /**
  * シードから配置を作る。roads は全員が同じデータを持っている（ワールドは全員同一）ので、
- * 道路へのスナップを挟んでも配置は一致する
+ * 道路へのスナップを挟んでも配置は一致する。
+ * previousSeed を渡すと、直前のマッチが使ったPOIを避ける（契約13-4）
  */
 export function buildItemLayout(
     seed: number,
     layout: MatchLayout,
     roads: readonly RoadPath[],
+    previousSeed: number | null = null,
 ): ItemLayout {
     // マッチ本体のシードと同じ列を使うと配置が絡むので、ひねってから使う
     const rnd = createRandom((seed ^ 0x5bf03635) >>> 0);
@@ -305,11 +314,20 @@ export function buildItemLayout(
         return true;
     };
 
-    // 実在ランドマークを先に埋める（実況で地名を呼べる）
-    for (const landmark of LANDMARKS) {
-        if (spots.length >= SPOT_COUNT) break;
-        push(landmark.x, landmark.z);
+    // 実在POI（Anno 注記 + 基本ランドマーク）から**シードで抽選**する。
+    // 直近マッチで使ったPOIは1周目で飛ばすので、連続で同じ場所に湧かない（契約13-4）
+    const places = allPlaces();
+    const order = spotOrder(seed, places.length);
+    const avoid = previousSeed === null ? null : new Set(spotOrder(previousSeed, places.length).slice(0, SPOT_AVOID));
+    for (let pass = 0; pass < 2 && spots.length < SPOT_COUNT; pass++) {
+        for (const index of order) {
+            if (spots.length >= SPOT_COUNT) break;
+            if (pass === 0 && avoid?.has(index)) continue;
+            if (pass === 1 && !avoid?.has(index)) continue;
+            push(places[index].x, places[index].z);
+        }
     }
+    // 実在POIだけで足りなければ道路上へ散らす（POIが少ない環境でも成立させる）
     for (let guard = 0; guard < 400 && spots.length < SPOT_COUNT; guard++) {
         push((rnd() * 2 - 1) * (AREA_HALF - 180), (rnd() * 2 - 1) * (AREA_HALF - 180));
     }

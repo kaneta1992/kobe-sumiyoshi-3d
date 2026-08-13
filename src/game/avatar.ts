@@ -51,7 +51,11 @@ const HIP_X = 0.115;
 /** 頭ノードから見た頭の中心 */
 const HEAD_C = HEAD_Y - NECK_Y;
 
-/** 歩き・走りの参照速度[m/s]（character.ts の WALK_SPEED / RUN_SPEED に合わせる） */
+/**
+ * ポーズを混ぜるときの参照速度[m/s]。character.ts の SLOW_SPEED（1.9）と、
+ * 「全力疾走のポーズになりきる速度」を指す。既定速度（10.4）はこれを超えているので、
+ * そこから先は脚の回転数だけが上がる（契約13-9/12）
+ */
 const WALK_REF = 1.9;
 const RUN_REF = 5.2;
 
@@ -498,7 +502,12 @@ export function createPlayerAvatar(quality: QualitySettings): PlayerAvatar {
             const wIdle = ground * (1 - locomotion);
 
             // 歩調は速度から。歩き→走りで位相が連続するので切り替えで足がワープしない
-            phase = (phase + (0.85 + Math.min(moving, 7.5) * 0.3) * TAU * step) % TAU;
+            // 脚の回転数を実速度へ同期させる（契約13-9/12 で既定速度が 10.4m/s になり、
+            // ⚡と足袋で最大 27m/s まで伸びる）。歩き〜ダッシュ域は従来どおりの効きで、
+            // それより速い域は歩幅も伸びる前提でゆるやかに増やす（ミシン脚にしない）
+            const sprint = Math.min(moving, RUN_REF);
+            const beyond = Math.max(0, Math.min(moving, 27) - RUN_REF);
+            phase = (phase + (0.85 + sprint * 0.3 + beyond * 0.085) * TAU * step) % TAU;
             const swing = Math.sin(phase);
             const breath = Math.sin(time * 1.9);
             const sway = Math.sin(time * 0.85);
@@ -946,8 +955,14 @@ export function createBoarAvatar(quality: QualitySettings): BoarAvatar {
         group,
         update(speed, dt) {
             const step = Math.min(0.05, Math.max(0.0001, dt));
-            phase = (phase + (1.2 + Math.min(Math.abs(speed), 10) * 0.55) * TAU * step) % TAU;
-            const gait = Math.min(1, Math.abs(speed) / 5);
+            const pace = Math.abs(speed);
+            phase =
+                (phase +
+                    (1.2 + Math.min(pace, RUN_REF) * 0.55 + Math.max(0, Math.min(pace, 20) - RUN_REF) * 0.14) *
+                        TAU *
+                        step) %
+                TAU;
+            const gait = Math.min(1, pace / 5);
             body.position.y = Math.abs(Math.sin(phase)) * 0.09 * gait;
             body.rotation.x = Math.sin(phase * 2) * 0.06 * gait;
             body.rotation.z = Math.sin(phase) * 0.045 * gait;

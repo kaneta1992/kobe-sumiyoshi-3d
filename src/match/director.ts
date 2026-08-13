@@ -38,12 +38,18 @@ const TAU = Math.PI * 2;
 /** アイテムを拾える距離[m] と 高さの差[m] */
 const PICK_REACH = 2.4;
 const PICK_HEIGHT = 4.5;
-/** コインを拾える距離[m] */
-const COIN_REACH = 2.2;
-/** コインのダッシュ微強化（倍率と持続[s]） */
-const COIN_BOOST = 1.12;
-const COIN_BOOST_TIME = 10;
-/** 韋駄天の地下足袋の移動倍率 */
+/** ⚡（速度アップ）を拾える距離[m] */
+const COIN_REACH = 2.6;
+/**
+ * ⚡1個ぶんの永続速度アップと、⚡だけで届く上限倍率（契約13-10）。
+ * マッチ中は減らない・リマッチでリセット。取得は各自ローカル（同期しない）
+ */
+const SPEED_PER_COIN = 0.02;
+const SPEED_CAP = 2;
+/**
+ * 韋駄天の地下足袋の移動倍率。**⚡の上限2倍の上に重ねてよい**（契約13 追記の項目11。
+ * レアアイテムの突破感を優先する裁定）。最大 2.0 × 1.3 = 2.6 倍
+ */
 const TABI_SPEED = 1.3;
 /** マント滑空: 落下速度の上限[m/s] と 水平速度[m/s] */
 const CAPE_SINK = 2.2;
@@ -133,8 +139,11 @@ export interface Director {
     attachMap(
         pick: (onPick: (x: number, z: number) => void, onCancel: () => void) => boolean,
     ): void;
-    /** マッチ開始。配置を作り直す（リマッチでも同じ経路・E76） */
-    start(layout: MatchLayout, seed: number): void;
+    /**
+     * マッチ開始。配置を作り直す（リマッチでも同じ経路・E76）。
+     * previousSeed は直前のマッチのシード（POI の連続同一を避ける・契約13-4）
+     */
+    start(layout: MatchLayout, seed: number, previousSeed: number | null): void;
     /** ロビーへ戻す（全部消す） */
     reset(): void;
     update(frame: DirectorFrame): void;
@@ -151,6 +160,12 @@ export interface Director {
     readonly speedScale: number;
     /** 宝の地図の切れ端が3枚そろったか（宝箱の正確な位置を前倒しで開く） */
     readonly mapReveal: boolean;
+    /** いま回収できる場のアイテム（契約13-3）。無ければ null */
+    readonly pickTarget: { mark: string; name: string } | null;
+    /** 回収アクションを実行する（拾えたら true・契約13-3） */
+    takePick(): boolean;
+    /** 場に残っている⚡を巡回する（BOT も同じルールで拾う・契約13-10） */
+    eachCoin(visit: (x: number, z: number) => void): void;
     /** 展望台の千里眼が効いているか（次の安置と宝箱の先読み・契約12） */
     readonly farsight: boolean;
     /** ?matchgoto=item 用: いちばん近い未取得アイテムの位置 */
@@ -198,7 +213,10 @@ export function createDirector(options: DirectorOptions): Director {
     let mapPieces = 0;
     let stickLeft = 0;
     let fogLeft = 0;
-    let boostLeft = 0;
+    /** 拾った⚡の数（契約13-10。マッチ中は永続・リマッチでリセット） */
+    let coins = 0;
+    /** 回収アクションの対象になっている場のアイテム番号（-1 = 無し・契約13-3） */
+    let pickIndex = -1;
     /** 千里眼の残り[s]（実時間・契約12） */
     let farsightLeft = 0;
     /** 偽宝箱の開封済みフラグと足元の高さ（契約12） */
@@ -516,7 +534,6 @@ export function createDirector(options: DirectorOptions): Director {
         bob += dt * 2.4;
         stickLeft = Math.max(0, stickLeft - dt);
         fogLeft = Math.max(0, fogLeft - dt);
-        boostLeft = Math.max(0, boostLeft - dt);
         farsightLeft = Math.max(0, farsightLeft - dt);
         peerNow = performance.now();
 
@@ -570,8 +587,10 @@ export function createDirector(options: DirectorOptions): Director {
             options.announce('ミミックだ！ 中からイノシシが飛び出して逃げていった');
         }
 
-        // --- 場のアイテム ---
+        // --- 場のアイテム（契約13-3: 接触の自動取得をやめ、回収アクションで取る） ---
         const drops = layout.drops;
+        let nearestPick = -1;
+        let nearestPickDistance = PICK_REACH;
         for (let i = 0; i < drops.length; i++) {
             if (taken[i] === 1) continue;
             const drop = drops[i];
@@ -581,17 +600,12 @@ export function createDirector(options: DirectorOptions): Director {
             items.pickups.push(drop.x, y, drop.z, spin + i, 1, ITEMS[drop.id].color);
             if (taken[i] === 2 || !frame.active) continue;
             if (Math.abs(py - dropY[i]) > PICK_HEIGHT) continue;
-            if (Math.hypot(px - drop.x, pz - drop.z) > PICK_REACH) continue;
-            if (!takeIntoBag(i, drop.id)) continue;
-            taken[i] = 2;
-            options.claimItem(i);
-            const spec = ITEMS[drop.id];
-            options.announce(
-                spec.kind === 'collect'
-                    ? `${spec.name}を拾った（${Math.min(mapPieces, MAP_PIECES)}/${MAP_PIECES}）`
-                    : `${spec.name}を手に入れた — ${spec.hint}`,
-            );
+            const distance = Math.hypot(px - drop.x, pz - drop.z);
+            if (distance > nearestPickDistance) continue;
+            nearestPickDistance = distance;
+            nearestPick = i;
         }
+        pickIndex = nearestPick;
 
         // --- ルートビーコン（取り尽くすと消灯） ---
         for (let s = 0; s < layout.spots.length; s++) {
@@ -601,22 +615,23 @@ export function createDirector(options: DirectorOptions): Director {
             items.beacons.push(spot.x, spotY[s], spot.z, 0, 1, 0xffd257);
         }
 
-        // --- コイン（拾うと10秒だけダッシュ微強化） ---
-        const coins = layout.coins;
-        for (let i = 0; i < coins.length; i++) {
+        // --- ⚡（触れるだけで拾える永続の速度アップ・契約13-10） ---
+        // ここだけは回収ボタンを要求しない: 数が多く、拾うたびにボタンを押させると
+        // 走る気持ちよさが死ぬ。拾った実感は HUD の倍率表示とスパークで返す
+        const sparks = layout.coins;
+        for (let i = 0; i < sparks.length; i++) {
             if (coinTaken[i]) continue;
-            const coin = coins[i];
-            items.coins.push(coin.x, coinY[i] + 0.75, coin.z, spin * 2 + i, 1);
+            const spark = sparks[i];
+            items.coins.push(spark.x, coinY[i] + 0.75, spark.z, spin * 2 + i, 1);
             if (!frame.active) continue;
             if (Math.abs(py - coinY[i]) > PICK_HEIGHT) continue;
-            if (Math.hypot(px - coin.x, pz - coin.z) > COIN_REACH) continue;
+            if (Math.hypot(px - spark.x, pz - spark.z) > COIN_REACH) continue;
             coinTaken[i] = 1;
-            boostLeft = COIN_BOOST_TIME;
+            coins++;
         }
 
         // --- 所持効果 ---
-        const hasTabi = slots[0] === 'tabi' || slots[1] === 'tabi';
-        game.setSlopePower(hasTabi);
+        game.setSlopePower(hasTabi());
         updateAir(frame);
         options.eachPeer(drawPeerFx);
 
@@ -687,18 +702,23 @@ export function createDirector(options: DirectorOptions): Director {
         return { mark: spec.mark, name: spec.name, note: spec.kind === 'hold' ? '常時' : '使用' };
     };
 
+    /** ⚡ だけで決まる倍率（上限あり）。足袋はこの上に掛ける（契約13 項目11） */
+    const coinScale = (): number => Math.min(SPEED_CAP, 1 + coins * SPEED_PER_COIN);
+
     const badgeText = (): string => {
-        const parts: string[] = [];
+        // 速度倍率は常時表示（契約13-10）。⚡が0でも「×1.00」を出して成長が見えるようにする
+        const parts: string[] = [`⚡ ×${(coinScale() * (hasTabi() ? TABI_SPEED : 1)).toFixed(2)}`];
         if (mapPieces > 0) parts.push(`🗺 ${Math.min(mapPieces, MAP_PIECES)}/${MAP_PIECES}`);
-        if (slots[0] === 'tabi' || slots[1] === 'tabi') parts.push(`👟 ×${TABI_SPEED}`);
+        if (hasTabi()) parts.push(`👟 ×${TABI_SPEED}`);
         if (slots[0] === 'cape' || slots[1] === 'cape') parts.push('🦅 Space長押しで滑空');
         if (stickLeft > 0) parts.push(`🔮 ${Math.ceil(stickLeft)}s`);
         if (fogLeft > 0) parts.push(`🌫 ${Math.ceil(fogLeft)}s`);
-        if (boostLeft > 0) parts.push(`🪙 ${Math.ceil(boostLeft)}s`);
         if (farsightLeft > 0) parts.push(`👁 ${Math.ceil(farsightLeft)}s`);
         if (game.boarSeconds > 0) parts.push(`🐗 ${Math.ceil(game.boarSeconds)}s`);
         return parts.join('　');
     };
+
+    const hasTabi = (): boolean => slots[0] === 'tabi' || slots[1] === 'tabi';
 
     /**
      * 方角矢印（画面基準の角度に直して HUD へ渡す）。
@@ -741,8 +761,8 @@ export function createDirector(options: DirectorOptions): Director {
         attachMap(pick) {
             pickOnMap = pick;
         },
-        start(nextLayout, seed) {
-            layout = buildItemLayout(seed, nextLayout, world.mapFeatures.roads);
+        start(nextLayout, seed, previousSeed) {
+            layout = buildItemLayout(seed, nextLayout, world.mapFeatures.roads, previousSeed);
             const surface = game.physics.surfaceHeight;
             // 見晴らしスポットは地形だけで決まるので1回測れば使い回せる（契約12）
             if (!lookouts) {
@@ -788,8 +808,9 @@ export function createDirector(options: DirectorOptions): Director {
                 else if (slots[1] === null) slots[1] = id;
             }
             console.info(
-                `[director] アイテム ${layout.drops.length}（POI ${layout.spots.length}）` +
-                    `　コイン ${layout.coins.length}　補給機 ${layout.supplies.map((s) => `${s.at}s`).join('/')}` +
+                `[director] アイテム ${layout.drops.length}（POI ${layout.spots.length}: ` +
+                    `${layout.spots.map((s) => s.place).join('・')}）` +
+                    `　⚡ ${layout.coins.length}　補給機 ${layout.supplies.map((s) => `${s.at}s`).join('/')}` +
                     `　ミミック ${layout.mimics.map((m) => `${m.x.toFixed(0)},${m.z.toFixed(0)}`).join(' / ')}`,
             );
         },
@@ -802,7 +823,9 @@ export function createDirector(options: DirectorOptions): Director {
             mapPieces = 0;
             stickLeft = 0;
             fogLeft = 0;
-            boostLeft = 0;
+            // ⚡の成長はマッチ単位。リマッチでは必ず 1.00 から（契約13-10）
+            coins = 0;
+            pickIndex = -1;
             farsightLeft = 0;
             mimicOpened = new Uint8Array(0);
             wildlife.reset();
@@ -924,11 +947,39 @@ export function createDirector(options: DirectorOptions): Director {
             return isFoggedAt(id, performance.now());
         },
         get speedScale() {
-            const tabi = slots[0] === 'tabi' || slots[1] === 'tabi' ? TABI_SPEED : 1;
-            return tabi * (boostLeft > 0 ? COIN_BOOST : 1);
+            // ⚡は上限2倍、足袋はその上に重ねる（契約13 項目11の裁定）
+            return coinScale() * (hasTabi() ? TABI_SPEED : 1);
         },
         get mapReveal() {
             return mapPieces >= MAP_PIECES;
+        },
+        get pickTarget() {
+            if (!layout || pickIndex < 0) return null;
+            const spec = ITEMS[layout.drops[pickIndex].id];
+            return { mark: spec.mark, name: spec.name };
+        },
+        takePick() {
+            if (!layout || pickIndex < 0 || taken[pickIndex] !== 0) return false;
+            const index = pickIndex;
+            const drop = layout.drops[index];
+            if (!takeIntoBag(index, drop.id)) {
+                options.announce('持ち物がいっぱいで拾えない（1・2 で使うか、別のアイテムを取る）');
+                return false;
+            }
+            taken[index] = 2;
+            pickIndex = -1;
+            options.claimItem(index);
+            const spec = ITEMS[drop.id];
+            options.announce(
+                spec.kind === 'collect'
+                    ? `${spec.name}を拾った（${Math.min(mapPieces, MAP_PIECES)}/${MAP_PIECES}）`
+                    : `${spec.name}を手に入れた — ${spec.hint}`,
+            );
+            return true;
+        },
+        eachCoin(visit) {
+            if (!layout) return;
+            for (const spark of layout.coins) visit(spark.x, spark.z);
         },
         get farsight() {
             return farsightLeft > 0;

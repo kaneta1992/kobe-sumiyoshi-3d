@@ -29,9 +29,14 @@ export function setStatus(text: string): void {
     status.textContent = text;
 }
 
-/** 画面左下の操作説明。徒歩／運転／自由カメラで内容が変わる */
+/**
+ * 画面左下の操作説明。徒歩／運転／自由カメラで内容が変わる。
+ * モバイルでは左下が邪魔になるので CSS で隠し、ℹ️ の「操作」タブへ同じ文を出す（契約13-1/5）
+ */
+const infoHelp = document.getElementById('info-help');
 export function setHelp(text: string): void {
     help.textContent = text;
+    if (infoHelp) infoHelp.textContent = text;
 }
 
 /** 画面右上のマルチプレイ表示（接続人数）。空文字にすると枠ごと消える（契約05） */

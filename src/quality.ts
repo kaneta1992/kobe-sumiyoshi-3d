@@ -73,7 +73,17 @@ const DESKTOP_TIERS: readonly Partial<QualitySettings>[] = [
 
 const MOBILE_TIERS: readonly Partial<QualitySettings>[] = [
     {},
-    { shadowMapSize: 768, treeNear: 32, treeMid: 110, treeFar: 480, groundCover: false, viewDistance: 1500 },
+    // 段階1では動的影をやめて静的キャッシュへ戻す（契約13-7 の段階案）
+    {
+        shadowMapSize: 768,
+        shadowDistance: 110,
+        staticShadows: true,
+        treeNear: 32,
+        treeMid: 110,
+        treeFar: 480,
+        groundCover: false,
+        viewDistance: 1500,
+    },
     { shadows: false, bloom: false, fxaa: false, treeNear: 0, treeMid: 80, treeFar: 380, viewDistance: 1200, props: false },
 ];
 
@@ -86,11 +96,15 @@ function baseSettings(preset: QualityPreset): QualitySettings {
             maxPixelRatio: 1.0,
             minRenderScale: 0.5,
             shadows: true,
-            // mobile は近距離1カスケード + 静的キャッシュ（追記2-4）
+            /**
+             * mobile は近距離1カスケードの**プレイヤー追従シャドウ**（契約13-7）。
+             * 1024px を半径 90m に集中させるので 0.18m/texel。キャラ・車・イノシシの
+             * 動く影が出る。重ければ段階1で静的キャッシュへ落ちる
+             */
             shadowCascades: 1,
             shadowMapSize: 1024,
-            shadowDistance: 140,
-            staticShadows: true,
+            shadowDistance: 90,
+            staticShadows: false,
             // GTAO は mobile 無効。代わりに読み込み時にベイクした頂点AOを使う（追記2-5）
             ao: false,
             aoSamples: 8,
