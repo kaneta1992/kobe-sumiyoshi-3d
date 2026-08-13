@@ -10,23 +10,23 @@
  * 物理は簡略化してよい（契約12-6）: コライダーは持たず、足場の高さ（レイキャスト1本）
  * へ吸着させる。壁は抜けるが、道路グラフに沿って歩くので見た目には出ない。
  *
- * 強さ: 移動は人間の全力疾走（5.2m/s）より遅い 4.3m/s。鍵・宝箱への反応にも
- * シード由来の遅れを入れてあるので、まっすぐ向かえば人間が先着できる。
+ * 契約14-6「答えを見ない探索」: BOT は宝箱の座標へ直行しない。持っているのは
+ *   1. 安置の円（全員が無償で知っている範囲情報）
+ *   2. **見当**（belief）— シードで決まる時刻に「ステッキ相当の手がかり」を得て、
+ *      真の位置の周りに誤差半径ぶんずれた円として更新される（最初は 300m 級で大雑把）
+ *   3. 気配 — 見当の円の中を歩き回り、15m 以内へ入って初めて宝箱そのものへ向かう
+ * つまり BOT の動きは「うろうろ → だんだん絞る → 見つけたら直行」になる。
  */
 import type { Physics } from '../game/physics';
 import { botPeerId, type BotState } from '../net/peers';
 import type { World } from '../world';
 import { buildRoadGraph, type RoadGraph } from '../world/road-graph';
 import {
-    BUMP_COOLDOWN,
-    BUMP_REACH,
-    CHANNEL_TIME,
     DROP_TIME,
-    KEY_AT,
     OUTSIDE_SPEED,
     PLANE_CLEARANCE,
     REACH,
-    STAGES,
+    SENSE_RADIUS,
     createRandom,
     type MatchLayout,
     type ZoneNow,
@@ -37,20 +37,22 @@ const BOT_SPEED = 8.6;
 /** ⚡1個ぶんの速度アップと上限倍率（人間と同じルール・契約13-10） */
 const BOT_SPEED_PER_COIN = 0.02;
 const BOT_SPEED_CAP = 2;
-/** ⚡を拾う距離[m]（人間と同じ） */
-const COIN_REACH = 2.6;
+/** ⚡を拾う距離[m]（人間と同じ・契約14-9） */
+const COIN_REACH = 4.2;
 
-// --- 人間優位のハンデ（契約13-6。「気づいたら負けてた」を無くす） ---
-/** 鍵へ向かい始めるまでの遅れ[s]の下限と幅（シードで1体ずつ決まる） */
-const KEY_HOLD_MIN = 18;
-const KEY_HOLD_SPAN = 22;
-/** 最終安置が確定してから宝箱へ向かうまで待つ[s]の下限と幅 */
-const CHEST_HOLD_MIN = 30;
-const CHEST_HOLD_SPAN = 30;
-/** 最終安置が確定するマッチ時計[s]（第3収縮の完了） */
-const FINAL_ZONE_AT = STAGES[STAGES.length - 1].to;
-/** BOT のチャンネリング速度（人間の 0.7 倍） */
-const CHEST_CHANNEL_SCALE = 0.7;
+// --- 手がかりの取得（契約14-6。人間優位のハンデはここで担保する） ---
+/**
+ * 「ステッキ相当の手がかり」を得るマッチ時計[s]と、そのときの見当の誤差半径[m]。
+ * 人間はステッキ2本で数十mまで一気に絞れるので、BOT の収束はわざと遅い
+ */
+const HINT_AT = [140, 250, 340] as const;
+const HINT_ERROR = [300, 140, 55] as const;
+/** 手がかりの時刻に入れる1体ごとのばらつき[s]（シードで決まる。全員同時に動かない） */
+const HINT_JITTER = 60;
+/** 見当の円の中を歩き回るとき、次の目的地を選ぶ距離の下限[m]（近すぎる点を選び続けない） */
+const SEARCH_STEP_MIN = 25;
+/** 見当の円の中の1点に着いたとみなす距離[m] */
+const SEARCH_REACH = 8;
 /** 向きの追従[rad/s] */
 const TURN_RATE = 5;
 /** 経路の通過点に着いたとみなす距離[m] */
@@ -75,7 +77,7 @@ const FALL_GLIDE = 30;
 /** 安置の外にいるときに中心へ戻り始める余裕[m] */
 const ZONE_MARGIN = 30;
 
-type Goal = 'drop' | 'item' | 'key' | 'chest' | 'zone';
+type Goal = 'drop' | 'item' | 'search' | 'chest' | 'zone';
 
 /** 毎フレーム渡す進行状況（match/index が持っているものをそのまま渡す） */
 export interface BotFrame {
@@ -84,11 +86,11 @@ export interface BotFrame {
     /** 実時間[s] */
     dt: number;
     zone: ZoneNow;
-    keyLive: boolean;
-    keyOwner: string | null;
     winner: string | null;
-    /** 宝箱の開示段階（2 以上で BOT も宝箱の場所を知る） */
-    reveal: number;
+    /**
+     * 宝箱の真の位置。**見当（belief）を作るときと気配の判定にしか使わない**（契約14-6）。
+     * 目的地として直接渡してはいけない — それをやると「答えを知っている動き」になる
+     */
     chestX: number;
     chestY: number;
     chestZ: number;
@@ -99,18 +101,14 @@ export interface BotsOptions {
     physics: Physics;
     /** マッチ時計の倍率（早送り時は BOT も同じだけ速く動かす。既定は1） */
     speed: number;
-    /** 鍵・宝箱の取得申告（ホスト自身が裁定する） */
-    claimPrize(prize: 'key' | 'chest', botId: string): void;
+    /** 宝箱に触れたという申告（ホスト自身が裁定する） */
+    claimPrize(prize: 'chest', botId: string): void;
     /** 場のアイテムの取得申告 */
     claimItem(index: number, botId: string): void;
     /** 未取得のアイテムを巡回する */
     eachDrop(visit: (index: number, x: number, z: number) => void): void;
     /** 場の⚡を巡回する（BOT も拾って速くなる・契約13-10） */
     eachCoin(visit: (x: number, z: number) => void): void;
-    /** 人間（自分を含む）の位置を巡回する */
-    eachHuman(visit: (id: string, x: number, y: number, z: number) => void): void;
-    /** 体当たり（BOT → 誰か） */
-    bump(targetId: string, dirX: number, dirZ: number): void;
     announce(text: string): void;
 }
 
@@ -125,8 +123,6 @@ export interface Bots {
     readonly count: number;
     /** 1体引退させる（人間が途中参加したとき・E86） */
     retire(): void;
-    /** BOT が体当たりを受けた（チャンネリングが切れる・E83） */
-    knock(id: string, dirX: number, dirZ: number): void;
     /** 表示名（BOT でなければ null） */
     nameOf(id: string): string | null;
 }
@@ -149,10 +145,21 @@ interface Bot {
     jumpAt: number;
     /** 速さの個体差（0.9〜1.08） */
     pace: number;
-    /** 鍵へ反応するまでの遅れ[s]（人間優位のハンデ・契約13-6） */
-    delay: number;
-    /** 最終安置の確定から宝箱へ向かうまで待つ[s]（人間優位のハンデ・契約13-6） */
-    chestDelay: number;
+    /** 次に受け取る手がかりの番号（HINT_AT の添字。>= HINT_AT.length で打ち止め） */
+    hintAt: number;
+    /** この体の手がかり取得時刻[s]（シードで決まるばらつき込み） */
+    hintTimes: Float32Array;
+    /** 見当（belief）: 宝箱がこのあたりにあるはず、という円。r <= 0 = まだ何も知らない */
+    beliefX: number;
+    beliefZ: number;
+    beliefR: number;
+    /** 見当の円の中で「いま見に行っている」点 */
+    searchX: number;
+    searchZ: number;
+    /** 探索の目的地を決める乱数列（体ごと・シード由来） */
+    searchRandom: () => number;
+    /** 気配で宝箱を見つけたか（見つけてから初めて座標へ向かう・契約14-6） */
+    found: boolean;
     /** 拾った⚡の数（契約13-10。人間と同じルールで速くなる） */
     coins: number;
     /** 拾った⚡の印（体ごとにローカル。人間の取得とは干渉しない） */
@@ -173,8 +180,6 @@ interface Bot {
     stuckCount: number;
     lastX: number;
     lastZ: number;
-    channel: number;
-    bumpCooldown: number;
 }
 
 export function createBots(options: BotsOptions): Bots {
@@ -204,8 +209,15 @@ export function createBots(options: BotsOptions): Bots {
         dropZ: 0,
         jumpAt: 0,
         pace: 1,
-        delay: 0,
-        chestDelay: 0,
+        hintAt: 0,
+        hintTimes: new Float32Array(HINT_AT.length),
+        beliefX: 0,
+        beliefZ: 0,
+        beliefR: 0,
+        searchX: 0,
+        searchZ: 0,
+        searchRandom: createRandom(index + 1),
+        found: false,
         coins: 0,
         coinTaken: new Uint8Array(0),
         goal: 'drop',
@@ -222,11 +234,47 @@ export function createBots(options: BotsOptions): Bots {
         stuckCount: 0,
         lastX: 0,
         lastZ: 0,
-        channel: 0,
-        bumpCooldown: 0,
     });
 
-    /** 目標を決め直す（全員が知っている情報だけで判断する） */
+    /**
+     * 手がかりの更新（契約14-6）。時刻が来たら「ステッキ相当」を1つ受け取り、
+     * 見当の円を**誤差ぶんずらして**置き直す。真の位置そのものは目的地にしない
+     */
+    const updateBelief = (bot: Bot, frame: BotFrame): void => {
+        while (bot.hintAt < HINT_AT.length && frame.t >= bot.hintTimes[bot.hintAt]) {
+            const step = bot.hintAt++;
+            const radius = HINT_ERROR[step];
+            const angle = bot.searchRandom() * Math.PI * 2;
+            const distance = Math.sqrt(bot.searchRandom()) * radius;
+            bot.beliefX = frame.chestX + Math.cos(angle) * distance;
+            bot.beliefZ = frame.chestZ + Math.sin(angle) * distance;
+            bot.beliefR = radius;
+            // 新しい見当に合わせて、次に見に行く点も引き直す
+            bot.searchX = bot.beliefX;
+            bot.searchZ = bot.beliefZ;
+        }
+    };
+
+    /** 見当の円の中から次に見て回る1点を選ぶ（安置の外へは出ない） */
+    const pickSearchPoint = (bot: Bot, frame: BotFrame): void => {
+        const zone = frame.zone;
+        for (let guard = 0; guard < 8; guard++) {
+            const angle = bot.searchRandom() * Math.PI * 2;
+            const distance = Math.sqrt(bot.searchRandom()) * bot.beliefR;
+            const x = bot.beliefX + Math.cos(angle) * distance;
+            const z = bot.beliefZ + Math.sin(angle) * distance;
+            if (Math.hypot(x - zone.x, z - zone.z) > Math.max(0, zone.r - ZONE_MARGIN)) continue;
+            if (Math.hypot(x - bot.x, z - bot.z) < SEARCH_STEP_MIN) continue;
+            bot.searchX = x;
+            bot.searchZ = z;
+            return;
+        }
+        // 見当が安置の外へ出てしまったとき（円が動いた）は中心側へ寄せる
+        bot.searchX = zone.x + (bot.beliefX - zone.x) * 0.5;
+        bot.searchZ = zone.z + (bot.beliefZ - zone.z) * 0.5;
+    };
+
+    /** 目標を決め直す（自分が持っている情報 = 安置の円 + 見当 + 気配 だけで判断する） */
     const chooseGoal = (bot: Bot, frame: BotFrame): void => {
         if (!layout) return;
         const zone = frame.zone;
@@ -240,26 +288,23 @@ export function createBots(options: BotsOptions): Bots {
             bot.targetZ = zone.z + (bot.z - zone.z) * scale;
             return;
         }
-        // 鍵を持っていれば宝箱へ（場所を知っているのは開示が進んでから）。
-        // ただし最終安置が確定してから 30〜60秒は宝箱へ向かわない（人間優位のハンデ・契約13-6）。
-        // それまではアイテム拾いや安置移動を続けるので、人間が先に着く余地が残る
-        if (
-            frame.keyOwner === bot.id &&
-            frame.reveal >= 2 &&
-            frame.t >= FINAL_ZONE_AT + bot.chestDelay
-        ) {
+        // 気配の範囲（15m）に入って初めて宝箱そのものが見える（人間とまったく同じ条件）
+        if (bot.found) {
             bot.goal = 'chest';
             bot.targetItem = -1;
             bot.targetX = frame.chestX;
             bot.targetZ = frame.chestZ;
             return;
         }
-        // 鍵が出ていれば鍵へ（1体ずつ違う反応の遅れぶんは気づかない）
-        if (frame.keyLive && frame.t >= KEY_AT + bot.delay) {
-            bot.goal = 'key';
+        // 手がかりを1つでも持っていれば、その見当の円の中を歩き回る
+        if (bot.beliefR > 0) {
+            if (Math.hypot(bot.x - bot.searchX, bot.z - bot.searchZ) < SEARCH_REACH) {
+                pickSearchPoint(bot, frame);
+            }
+            bot.goal = 'search';
             bot.targetItem = -1;
-            bot.targetX = layout.key.x;
-            bot.targetZ = layout.key.z;
+            bot.targetX = bot.searchX;
+            bot.targetZ = bot.searchZ;
             return;
         }
         // それ以外は近くの未取得アイテムを拾いに行く
@@ -326,6 +371,8 @@ export function createBots(options: BotsOptions): Bots {
     };
 
     const waypoint = { x: 0, z: 0 };
+    /** 実況を出した体（見つけた瞬間は1回だけ言う） */
+    const told = new Set<string>();
 
     // ⚡の巡回（フレーム内で関数を作らない）
     let coinCount = 0;
@@ -342,21 +389,6 @@ export function createBots(options: BotsOptions): Bots {
         if (Math.hypot(bot.x - x, bot.z - z) > COIN_REACH) return;
         bot.coinTaken[index] = 1;
         bot.coins++;
-    };
-
-    // 体当たりの相手探し（フレーム内で関数を作らない）
-    let scanBot: Bot | null = null;
-    let bumpId = '';
-    let bumpX = 0;
-    let bumpZ = 0;
-    const findBumpTarget = (id: string, x: number, _y: number, z: number): void => {
-        if (!scanBot || bumpId !== '') return;
-        const dx = x - scanBot.x;
-        const dz = z - scanBot.z;
-        if (Math.hypot(dx, dz) > BUMP_REACH) return;
-        bumpId = id;
-        bumpX = dx;
-        bumpZ = dz;
     };
 
     const step = (bot: Bot, frame: BotFrame): void => {
@@ -411,10 +443,20 @@ export function createBots(options: BotsOptions): Bots {
 
         // --- 地上 ---
         bot.y = ground;
-        bot.bumpCooldown -= dt;
         bot.repathIn -= dt;
 
-        // 目標の見直し（拾われた・鍵が出た・安置が動いた、をここで拾う）
+        // 手がかりの取得と、気配（15m）での発見。ここが「答えを見ない」入口（契約14-6）
+        updateBelief(bot, frame);
+        const toChest = Math.hypot(bot.x - frame.chestX, bot.z - frame.chestZ);
+        if (!bot.found && toChest < SENSE_RADIUS) {
+            bot.found = true;
+            if (!told.has(bot.id)) {
+                told.add(bot.id);
+                options.announce(`${bot.name}が何かを見つけたようだ…`);
+            }
+        }
+
+        // 目標の見直し（拾われた・見当が変わった・安置が動いた、をここで拾う）
         const previousGoal = bot.goal;
         const previousItem = bot.targetItem;
         chooseGoal(bot, frame);
@@ -424,32 +466,12 @@ export function createBots(options: BotsOptions): Bots {
             Math.hypot(bot.targetX - bot.pathToX, bot.targetZ - bot.pathToZ) > REPATH_DISTANCE;
         if (goalMoved || bot.repathIn <= 0 || bot.pathLength === 0) repath(bot);
 
-        // --- 宝箱のチャンネリング（鍵を持っていて宝箱に触れている間） ---
-        const toChest = Math.hypot(bot.x - frame.chestX, bot.z - frame.chestZ);
-        if (frame.keyOwner === bot.id && !frame.winner && toChest < REACH) {
-            if (bot.channel <= 0) options.announce(`${bot.name}が宝箱を開け始めた！`);
-            // 人間より遅く開ける（0.7倍。横から割り込んで奪える猶予・契約13-6）
-            bot.channel += dt * speed * CHEST_CHANNEL_SCALE;
+        // --- 宝箱に触れた（契約14-2: チャンネリングは無い。触れた瞬間に申告する） ---
+        if (!frame.winner && toChest < REACH) {
+            options.claimPrize('chest', bot.id);
             bot.speed = 0;
-            if (bot.channel >= CHANNEL_TIME) {
-                bot.channel = 0;
-                options.claimPrize('chest', bot.id);
-            }
-            // 立ち止まっている間も、寄ってきた相手は突き飛ばす
-            if (bot.bumpCooldown <= 0) {
-                scanBot = bot;
-                bumpId = '';
-                options.eachHuman(findBumpTarget);
-                scanBot = null;
-                if (bumpId !== '') {
-                    const length = Math.hypot(bumpX, bumpZ) || 1;
-                    options.bump(bumpId, bumpX / length, bumpZ / length);
-                    bot.bumpCooldown = BUMP_COOLDOWN;
-                }
-            }
             return;
         }
-        bot.channel = 0;
 
         // --- 移動 ---
         steerTo(bot, waypoint);
@@ -502,30 +524,10 @@ export function createBots(options: BotsOptions): Bots {
         options.eachCoin(takeCoin);
         coinBot = null;
 
-        // --- 拾得（アイテム → 鍵。裁定はホスト = 自分が出す・E83） ---
+        // --- 拾得（アイテム。裁定はホスト = 自分が出す・E83） ---
         if (bot.targetItem >= 0 && Math.hypot(bot.x - bot.targetX, bot.z - bot.targetZ) < PICK_REACH) {
             options.claimItem(bot.targetItem, bot.id);
             bot.targetItem = -1;
-        }
-        if (
-            frame.keyLive &&
-            !frame.keyOwner &&
-            Math.hypot(bot.x - layout.key.x, bot.z - layout.key.z) < REACH
-        ) {
-            options.claimPrize('key', bot.id);
-        }
-
-        // --- 体当たり（走っている最中に相手へ突っ込んだとき） ---
-        if (bot.bumpCooldown <= 0 && bot.speed > 2 && !frame.winner) {
-            scanBot = bot;
-            bumpId = '';
-            options.eachHuman(findBumpTarget);
-            scanBot = null;
-            if (bumpId !== '') {
-                const length = Math.hypot(bumpX, bumpZ) || 1;
-                options.bump(bumpId, bumpX / length, bumpZ / length);
-                bot.bumpCooldown = BUMP_COOLDOWN;
-            }
         }
     };
 
@@ -550,9 +552,15 @@ export function createBots(options: BotsOptions): Bots {
                 bot.phase = 'plane';
                 bot.jumpAt = DROP_TIME * (0.12 + rnd() * 0.7);
                 bot.pace = 0.9 + rnd() * 0.18;
-                // 人間優位のハンデ（契約13-6）。鍵も宝箱も「わざと出遅れる」
-                bot.delay = KEY_HOLD_MIN + rnd() * KEY_HOLD_SPAN;
-                bot.chestDelay = CHEST_HOLD_MIN + rnd() * CHEST_HOLD_SPAN;
+                // 手がかりの時刻は1体ずつずらす（全員が同時に同じ方向へ動かない・契約14-6）
+                for (let k = 0; k < HINT_AT.length; k++) {
+                    bot.hintTimes[k] = HINT_AT[k] + (rnd() - 0.5) * HINT_JITTER;
+                }
+                bot.hintAt = 0;
+                bot.beliefR = 0;
+                bot.found = false;
+                // 探索の乱数列も体ごと・シード由来（実行時乱数は使わない）
+                bot.searchRandom = createRandom((seed ^ (0x51ab34cd + i * 0x9e3779b9)) >>> 0);
                 bot.coins = 0;
                 bot.coinTaken = new Uint8Array(coinCount);
                 // 降下地点は第1安置の中（そこそこ散らばり、収縮で置いていかれない）
@@ -573,17 +581,22 @@ export function createBots(options: BotsOptions): Bots {
                 bot.repathIn = 0;
                 bot.stuckFor = 0;
                 bot.stuckCount = 0;
-                bot.channel = 0;
-                bot.bumpCooldown = 0;
                 bot.speed = 0;
                 states.push({ index: i, mode: 0, x: 0, y: 0, z: 0, yaw: 0, speed: 0 });
             }
-            if (live > 0) console.info(`[bots] ${live}体が参戦（降下は ${bots[0].jumpAt.toFixed(0)}s〜）`);
+            told.clear();
+            if (live > 0) {
+                console.info(
+                    `[bots] ${live}体が参戦（降下は ${bots[0].jumpAt.toFixed(0)}s〜・` +
+                        `手がかり ${bots[0].hintTimes[0].toFixed(0)}/${bots[0].hintTimes[1].toFixed(0)}/${bots[0].hintTimes[2].toFixed(0)}s）`,
+                );
+            }
         },
         reset() {
             layout = null;
             live = 0;
             states.length = 0;
+            told.clear();
         },
         update(frame) {
             if (!layout) return;
@@ -605,17 +618,6 @@ export function createBots(options: BotsOptions): Bots {
             live--;
             states.length = live;
             console.info(`[bots] 人間の参加により1体引退（残り ${live}体）`);
-        },
-        knock(id, dirX, dirZ) {
-            for (let i = 0; i < live; i++) {
-                const bot = bots[i];
-                if (bot.id !== id) continue;
-                bot.channel = 0;
-                bot.x += dirX * 1.5;
-                bot.z += dirZ * 1.5;
-                bot.pathLength = 0;
-                return;
-            }
         },
         nameOf(id) {
             for (const bot of bots) if (bot.id === id) return bot.name;

@@ -2,14 +2,18 @@
  * アイテムの実行時状態と「退屈ゼロ」ディレクター（契約11）。
  *
  * 受け持ち:
- *   拾得       接触で申告 → ホスト裁定（鍵・宝箱と同経路。先着が正・E73）
+ *   拾得       接触で申告 → ホスト裁定（宝箱と同経路。先着が正・E73）
  *   所持       2枠 + 収集品（地図の切れ端はスロットを使わない）
- *   効果       どこでもドア / ステッキ / マント / 足袋 / 傘 / 霧玉
- *   ディレクター ルートビーコン・コイン誘導・補給機・宝箱の花火・リード監視
+ *   効果       どこでもドア / ステッキ / マント / 足袋 / 傘 / 霧玉 / 千里眼
+ *   情報       ステッキの方向線・千里眼の扇形・地図の円・宝箱の気配（契約14）
+ *   ディレクター ルートビーコン・コイン誘導・補給機・リード監視・アンチストール
+ *
+ * 契約14の情報経済: **無償で宝箱の位置を出すものはここには無い**。プレイヤーが自分で
+ * 使ったアイテムだけが手がかりを残し、それはマッチが終わるまでマップに積み上がる。
  *
  * 決定性: 配置も補給機の時刻も **シード + マッチ時計** から決まる（実行時乱数は使わない）。
- * リード監視の前倒しも「全員が同じように知っている情報」（残りビーコン数・クレート・鍵・
- * 宝箱の開示段階）だけで判定するので、各クライアントで同じタイミングに発火する。
+ * リード監視の前倒しも「全員が同じように知っている情報」（残りビーコン数・クレート）
+ * だけで判定するので、各クライアントで同じタイミングに発火する。
  *
  * 効果時間は**実時間**で数える（?matchspeed で早送りしてもアイテムの体感は変えない）。
  */
@@ -30,7 +34,17 @@ import {
     type ItemLayout,
 } from './items';
 import type { MatchObjects } from './objects';
-import { PLANE_CLEARANCE, REACH, STAGES, type MatchLayout } from './rules';
+import {
+    ANTI_STALL_AFTER,
+    FINAL_ZONE_AT,
+    PLANE_CLEARANCE,
+    REACH,
+    SENSE_RADIUS,
+    compassName,
+    createRandom,
+    type MatchLayout,
+    type WorldProbe,
+} from './rules';
 import type { Wildlife } from './wildlife';
 
 const TAU = Math.PI * 2;
@@ -38,13 +52,19 @@ const TAU = Math.PI * 2;
 /** アイテムを拾える距離[m] と 高さの差[m] */
 const PICK_REACH = 2.4;
 const PICK_HEIGHT = 4.5;
-/** ⚡（速度アップ）を拾える距離[m] */
-const COIN_REACH = 2.6;
 /**
- * ⚡1個ぶんの永続速度アップと、⚡だけで届く上限倍率（契約13-10）。
+ * ⚡（速度アップ）を拾える距離[m]。契約14-9 で 2.6 → 4.2 へ広げた:
+ * 道なりに走るだけで列が拾えるようにする（狙って踏みに行かなくてよい）
+ */
+const COIN_REACH = 4.2;
+/** ⚡を描く距離[m]。列は数百個あるのでインスタンス上限に収まるよう近傍だけ出す */
+const COIN_DRAW = 170;
+/**
+ * ⚡1個ぶんの永続速度アップと、⚡だけで届く上限倍率（契約13-10 / 契約14-9）。
+ * 0.03 なので上限 2.0 には **34個**で届く（1マッチで現実的に到達できる量）。
  * マッチ中は減らない・リマッチでリセット。取得は各自ローカル（同期しない）
  */
-const SPEED_PER_COIN = 0.02;
+const SPEED_PER_COIN = 0.03;
 const SPEED_CAP = 2;
 /**
  * 韋駄天の地下足袋の移動倍率。**⚡の上限2倍の上に重ねてよい**（契約13 追記の項目11。
@@ -58,19 +78,25 @@ const CAPE_GLIDE = 12;
 const UMBRELLA_SINK = 4.2;
 const UMBRELLA_GLIDE = 6.5;
 const UMBRELLA_ALTITUDE = 3;
-/** 地図の切れ端が揃う枚数 */
+/** 地図の切れ端が揃う枚数 と、揃ったときに出る円の半径[m]（契約14-4） */
 const MAP_PIECES = 3;
+const MAP_CIRCLE = 40;
+/** 円の中心を宝箱からずらす最大距離[m]（中心が答えにならないように） */
+const MAP_CIRCLE_OFFSET = 18;
+/** 千里眼の扇形の半角[rad] と 距離帯の刻み[m]（契約14-4） */
+const CONE_HALF = 0.26;
+const BAND_STEP = 100;
+/** ステッキの方向線をマップに描く長さ[m] */
+const RAY_LENGTH = 1400;
 /** 補給機がエリアを横切る時間[s]（マッチ時計）と、投下するまでの時間[s] */
 const SUPPLY_FLIGHT = 18;
 const SUPPLY_RELEASE = 8;
 /** クレートの降下速度[m/s]（マッチ時計） */
 const CRATE_SINK = 26;
-/** 宝箱の花火: 第2収縮以降この間隔[s]で上げる */
-const CHEST_FIREWORK_PERIOD = 60;
 /** リードが2未満のときに前倒しした補給機が飛ぶまで[s] */
 const EARLY_LEAD_DELAY = 6;
-/** 補給機も残っていないときの追い花火の間隔[s] */
-const EARLY_FIREWORK_PERIOD = 20;
+/** アンチストールの花火を上げる高さ[m]（建物越しにも見える高さから散らす・契約14-7） */
+const STALL_BURST_HEIGHT = 45;
 /**
  * ビーコンを消す距離[m]。加算合成の柱の中に入ると画面が真っ白になるうえ、
  * そこまで来た人にはもう案内は要らない
@@ -80,9 +106,12 @@ const BEACON_HIDE = 10;
 const FX_REFRESH = 1.2;
 const FX_HOLD = 2.2;
 
-/** 千里眼が使える見晴らしスポットからの距離[m] と 先読みが続く時間[s] */
+/** 千里眼が使える見晴らしスポットからの距離[m] */
 const LOOKOUT_USE = 22;
-const FARSIGHT_TIME = 45;
+/** 気配の粒: 舞う半径[m]・高さ[m]・最大数（近いほど増える・契約14-5） */
+const MOTE_RADIUS = 1.9;
+const MOTE_HEIGHT = 1.3;
+const MOTE_MAX = 14;
 /** 偽宝箱（ミミック）が開く距離[m] と 開いたときに押し戻される距離[m] */
 const MIMIC_REACH = REACH;
 const MIMIC_PUSH = 2.4;
@@ -102,8 +131,6 @@ export interface DirectorOptions {
     /** イノシシ（群れ・笛・ミミック。契約12） */
     wildlife: Wildlife;
     selfId: string;
-    /** マッチ時計の倍率（補給機の飛行に使う） */
-    speed: number;
     /** アイテム index を取ったと申告する（ホスト裁定へ流す） */
     claimItem(index: number): void;
     /** 効果を全員へ配る（fx パケット） */
@@ -120,12 +147,12 @@ export interface DirectorFrame {
     t: number;
     /** 実時間の経過[s]（効果時間はこちらで数える） */
     dt: number;
-    /** 宝箱の開示段階（時間による 0..3。地図3枚は director 側で上乗せする） */
-    reveal: number;
-    keyLive: boolean;
+    /** 宝箱の位置（ヒントの計算に使う。**表示には一切使わない**・契約14） */
     chestX: number;
     chestY: number;
     chestZ: number;
+    /** 決着したか（アンチストールを止める） */
+    over: boolean;
     /** 拾得・使用ができる状態か（降下中・観戦・決着後は false） */
     active: boolean;
 }
@@ -143,7 +170,7 @@ export interface Director {
      * マッチ開始。配置を作り直す（リマッチでも同じ経路・E76）。
      * previousSeed は直前のマッチのシード（POI の連続同一を避ける・契約13-4）
      */
-    start(layout: MatchLayout, seed: number, previousSeed: number | null): void;
+    start(layout: MatchLayout, seed: number, previousSeed: number | null, probe: WorldProbe): void;
     /** ロビーへ戻す（全部消す） */
     reset(): void;
     update(frame: DirectorFrame): void;
@@ -158,16 +185,12 @@ export interface Director {
     isFogged(id: string): boolean;
     /** アイテム由来の移動倍率（安置の減速と掛け合わせる） */
     readonly speedScale: number;
-    /** 宝の地図の切れ端が3枚そろったか（宝箱の正確な位置を前倒しで開く） */
-    readonly mapReveal: boolean;
     /** いま回収できる場のアイテム（契約13-3）。無ければ null */
     readonly pickTarget: { mark: string; name: string } | null;
     /** 回収アクションを実行する（拾えたら true・契約13-3） */
     takePick(): boolean;
     /** 場に残っている⚡を巡回する（BOT も同じルールで拾う・契約13-10） */
     eachCoin(visit: (x: number, z: number) => void): void;
-    /** 展望台の千里眼が効いているか（次の安置と宝箱の先読み・契約12） */
-    readonly farsight: boolean;
     /** ?matchgoto=item 用: いちばん近い未取得アイテムの位置 */
     nearestDrop(x: number, z: number): { x: number; z: number } | null;
     /** 場に残っているアイテムを巡回する（BOT の目標選び・契約12） */
@@ -179,7 +202,7 @@ export interface Director {
 }
 
 export function createDirector(options: DirectorOptions): Director {
-    const { world, game, hud, objects, items, wildlife, selfId, speed } = options;
+    const { world, game, hud, objects, items, wildlife, selfId } = options;
     const planeY = world.stats.maxElevation + PLANE_CLEARANCE;
     /**
      * 見晴らしスポット（契約12）。地形は変わらないので最初のマッチで1回だけ測る。
@@ -211,14 +234,24 @@ export function createDirector(options: DirectorOptions): Director {
     /** 申告中のアイテム index → 入れたスロット（-1 = 地図の切れ端） */
     const pending = new Map<number, number>();
     let mapPieces = 0;
-    let stickLeft = 0;
     let fogLeft = 0;
+    /**
+     * 集めた手がかり（契約14-4）。マッチが終わるまで消えない = 情報が積み上がる。
+     * ステッキ = 使用地点から宝箱へ伸びる方向線 / 千里眼 = 方角+距離帯の扇形 /
+     * 地図3枚 = 宝箱を含む半径40mの円
+     */
+    const marks: { x: number; y: number; z: number; angle: number }[] = [];
+    const cones: { x: number; z: number; angle: number; near: number; far: number }[] = [];
+    let mapCircle: { x: number; z: number } | null = null;
+    /** 円の中心を宝箱からずらす向き（シード由来。中心＝答えにしない） */
+    let circleSeed = 0;
+    /** 宝箱・ミミックの気配の強さ 0..1（契約14-5）。0 = 何も感じない */
+    let sense = 0;
+    let senseTold = false;
     /** 拾った⚡の数（契約13-10。マッチ中は永続・リマッチでリセット） */
     let coins = 0;
     /** 回収アクションの対象になっている場のアイテム番号（-1 = 無し・契約13-3） */
     let pickIndex = -1;
-    /** 千里眼の残り[s]（実時間・契約12） */
-    let farsightLeft = 0;
     /** 偽宝箱の開封済みフラグと足元の高さ（契約12） */
     let mimicOpened = new Uint8Array(0);
     let mimicY = new Float32Array(0);
@@ -231,8 +264,8 @@ export function createDirector(options: DirectorOptions): Director {
     const peerFx = new Map<string, { effect: string; until: number }>();
 
     // --- ディレクターの進行 ---
-    let fireworkTimer = 0;
-    let fireworkPeriod = CHEST_FIREWORK_PERIOD;
+    /** アンチストールの花火を上げたか（1マッチ1回・E103） */
+    let stallFired = false;
     let leadWarned = false;
     /** 直近にログへ出したリード数（?matchdebug のときだけ使う） */
     let leadShown = -1;
@@ -242,23 +275,15 @@ export function createDirector(options: DirectorOptions): Director {
     /** イノシシへ毎フレーム渡す進行状況（使い回して new を作らない） */
     const wildFrame = { t: 0, dt: 0 };
 
+    /**
+     * 直近フレームの宝箱の位置。ヒントを作るときにだけ読む
+     * （アイテムを使った瞬間の計算に要るので、フレームの外からも参照できるよう控えておく）
+     */
+    let chestX = 0;
+    let chestZ = 0;
+
     // 巡回コールバックは使い回す（フレーム内で関数を作らない）
-    let scanX = 0;
-    let scanZ = 0;
-    let nearestPeer = '';
-    let nearestPeerDistance = 0;
-    let nearestPeerX = 0;
-    let nearestPeerZ = 0;
     let peerNow = 0;
-    const findNearestPeer = (id: string, x: number, _y: number, z: number): void => {
-        if (isFoggedAt(id, peerNow)) return;
-        const d = Math.hypot(x - scanX, z - scanZ);
-        if (nearestPeer !== '' && d >= nearestPeerDistance) return;
-        nearestPeer = id;
-        nearestPeerDistance = d;
-        nearestPeerX = x;
-        nearestPeerZ = z;
-    };
     const drawPeerFx = (id: string, x: number, y: number, z: number): void => {
         const fx = peerFx.get(id);
         if (!fx || fx.until < peerNow) return;
@@ -369,9 +394,19 @@ export function createDirector(options: DirectorOptions): Director {
             return;
         }
         if (id === 'stick') {
+            // 契約14-4: 使い切り。使った地点で宝箱の方角へ倒れ、方向線がその場とマップに残る。
+            // 2地点で使えば線の交点が宝箱 — この三角測量がゲームの中核
             slots[index] = null;
-            stickLeft = spec.seconds;
-            options.announce('尋ね人ステッキ — 方角が見えるようになった');
+            const x = game.state.x;
+            const z = game.state.z;
+            const dx = chestX - x;
+            const dz = chestZ - z;
+            marks.push({ x, y: game.physics.surfaceHeight(x, z), z, angle: Math.atan2(dx, -dz) });
+            objects.burst(x, game.state.y + 1, z, 0.74);
+            options.announce(
+                `尋ね人ステッキが${compassName(dx, dz)}へ倒れた — 方向線がマップに残った` +
+                    (marks.length >= 2 ? '（2本目！交点を見ろ）' : '（別の場所でもう1本引け）'),
+            );
             return;
         }
         if (id === 'fog') {
@@ -398,10 +433,19 @@ export function createDirector(options: DirectorOptions): Director {
                 options.announce('展望台の千里眼は「見晴らしスポット」でしか使えない');
                 return;
             }
+            // 契約14-4: 方角 + ざっくりした距離帯。扇形がマップに残る（点は出さない）
             slots[index] = null;
-            farsightLeft = FARSIGHT_TIME;
-            objects.burst(game.state.x, game.state.y + 2, game.state.z, 0.42);
-            options.announce('展望台の千里眼 — 次の安置と宝箱の方角が見えた！');
+            const x = game.state.x;
+            const z = game.state.z;
+            const dx = chestX - x;
+            const dz = chestZ - z;
+            const distance = Math.hypot(dx, dz);
+            const near = Math.max(0, Math.round(distance / BAND_STEP) * BAND_STEP - BAND_STEP);
+            cones.push({ x, z, angle: Math.atan2(dx, -dz), near, far: near + BAND_STEP * 2 });
+            objects.burst(x, game.state.y + 2, z, 0.42);
+            options.announce(
+                `展望台の千里眼 — 宝箱は${compassName(dx, dz)}へ ${near}〜${near + BAND_STEP * 2}m`,
+            );
         }
     };
 
@@ -515,15 +559,56 @@ export function createDirector(options: DirectorOptions): Director {
     };
 
     /** リードの数（全員が同じように知っている「行く理由」だけを数える） */
-    const countLeads = (frame: DirectorFrame, crates: number): number => {
+    const countLeads = (crates: number): number => {
         if (!layout) return 0;
         let leads = crates;
         for (let s = 0; s < layout.spots.length; s++) {
             if (spotAlive(s)) leads++;
         }
-        if (frame.keyLive) leads++;
-        if (frame.reveal >= 1) leads++;
         return leads;
+    };
+
+    /**
+     * 宝箱・ミミックの気配（契約14-5）。粒は**自分の周り**に舞わせる:
+     * 宝箱の位置に出すと壁越しに方角が割れてしまう（E100）。
+     * 「近い」ことだけを伝えて、どちらに近いかは自分の足で確かめさせる
+     */
+    const updateSense = (frame: DirectorFrame): void => {
+        if (!layout || !frame.active) {
+            sense = 0;
+            senseTold = false;
+            return;
+        }
+        const px = game.state.x;
+        const pz = game.state.z;
+        let nearest = Math.hypot(px - frame.chestX, pz - frame.chestZ);
+        for (let i = 0; i < layout.mimics.length; i++) {
+            // 開けてしまったミミックはもう気配を出さない（跡地に惑わされない）
+            if (mimicOpened[i]) continue;
+            const d = Math.hypot(px - layout.mimics[i].x, pz - layout.mimics[i].z);
+            if (d < nearest) nearest = d;
+        }
+        sense = nearest >= SENSE_RADIUS ? 0 : 1 - nearest / SENSE_RADIUS;
+        if (sense <= 0) {
+            senseTold = false;
+            return;
+        }
+        if (!senseTold) {
+            senseTold = true;
+            options.announce('何かの気配がする… この辺りだ');
+        }
+        const count = Math.max(3, Math.round(sense * MOTE_MAX));
+        for (let i = 0; i < count; i++) {
+            const phase = bob * 0.6 + (i / count) * TAU;
+            const radius = MOTE_RADIUS * (0.55 + 0.45 * Math.sin(phase * 1.7 + i));
+            items.motes.push(
+                px + Math.cos(phase) * radius,
+                game.state.y + MOTE_HEIGHT + Math.sin(phase * 2.3 + i) * 0.5,
+                pz + Math.sin(phase) * radius,
+                phase,
+                0.6 + sense * 0.6,
+            );
+        }
     };
 
     const update = (frame: DirectorFrame): void => {
@@ -532,10 +617,23 @@ export function createDirector(options: DirectorOptions): Director {
         const { t, dt } = frame;
         spin = (spin + dt * 1.6) % TAU;
         bob += dt * 2.4;
-        stickLeft = Math.max(0, stickLeft - dt);
         fogLeft = Math.max(0, fogLeft - dt);
-        farsightLeft = Math.max(0, farsightLeft - dt);
         peerNow = performance.now();
+        chestX = frame.chestX;
+        chestZ = frame.chestZ;
+
+        // 地図の切れ端が3枚そろったら「宝箱を含む円」を作る（契約14-4）。
+        // 中心が答えにならないよう、シードで決まるぶんだけ宝箱からずらす
+        if (!mapCircle && mapPieces >= MAP_PIECES) {
+            const rnd = createRandom(circleSeed);
+            const angle = rnd() * TAU;
+            const offset = rnd() * MAP_CIRCLE_OFFSET;
+            mapCircle = {
+                x: chestX + Math.cos(angle) * offset,
+                z: chestZ + Math.sin(angle) * offset,
+            };
+            options.announce(`宝の地図が揃った — 宝箱は半径${MAP_CIRCLE}mの円の中だ（M でマップ）`);
+        }
 
         const px = game.state.x;
         const pz = game.state.z;
@@ -550,6 +648,8 @@ export function createDirector(options: DirectorOptions): Director {
         items.boars.begin();
         items.mimics.begin();
         items.lookouts.begin();
+        items.marks.begin();
+        items.motes.begin();
 
         // --- 補給機・クレート ---
         const crates = updateSupplies(frame);
@@ -615,37 +715,50 @@ export function createDirector(options: DirectorOptions): Director {
             items.beacons.push(spot.x, spotY[s], spot.z, 0, 1, 0xffd257);
         }
 
-        // --- ⚡（触れるだけで拾える永続の速度アップ・契約13-10） ---
+        // --- ⚡（触れるだけで拾える永続の速度アップ・契約13-10 / 契約14-9） ---
         // ここだけは回収ボタンを要求しない: 数が多く、拾うたびにボタンを押させると
-        // 走る気持ちよさが死ぬ。拾った実感は HUD の倍率表示とスパークで返す
+        // 走る気持ちよさが死ぬ。拾った実感は HUD の倍率表示とスパークで返す。
+        // 描くのは近傍だけ（列は数百個あり、インスタンス上限を超えると見えない⚡ができる）
         const sparks = layout.coins;
         for (let i = 0; i < sparks.length; i++) {
             if (coinTaken[i]) continue;
             const spark = sparks[i];
-            items.coins.push(spark.x, coinY[i] + 0.75, spark.z, spin * 2 + i, 1);
+            const dx = px - spark.x;
+            const dz = pz - spark.z;
+            if (Math.abs(dx) < COIN_DRAW && Math.abs(dz) < COIN_DRAW) {
+                items.coins.push(spark.x, coinY[i] + 0.75, spark.z, spin * 2 + i, 1);
+            }
             if (!frame.active) continue;
             if (Math.abs(py - coinY[i]) > PICK_HEIGHT) continue;
-            if (Math.hypot(px - spark.x, pz - spark.z) > COIN_REACH) continue;
+            if (Math.hypot(dx, dz) > COIN_REACH) continue;
             coinTaken[i] = 1;
             coins++;
         }
+
+        // --- 集めた手がかりの3D表示（倒れたステッキ）と 宝箱の気配（契約14-4/5） ---
+        for (const mark of marks) items.marks.push(mark.x, mark.y + 0.02, mark.z, mark.angle, 1);
+        updateSense(frame);
 
         // --- 所持効果 ---
         game.setSlopePower(hasTabi());
         updateAir(frame);
         options.eachPeer(drawPeerFx);
 
-        // --- 宝箱の花火（第2収縮以降・気配演出） ---
-        if (t >= STAGES[1].from) {
-            fireworkTimer -= dt * speed;
-            if (fireworkTimer <= 0) {
-                fireworkTimer = fireworkPeriod;
-                objects.burst(frame.chestX, frame.chestY + 7, frame.chestZ, ((t * 0.07) % 1 + 1) % 1);
-            }
+        // --- アンチストール（契約14-7。定期花火の置き換え） ---
+        // 最終安置に入って3分たっても誰も回収しないときだけ、**1マッチ1回**方向花火を上げる
+        if (!stallFired && !frame.over && t >= FINAL_ZONE_AT + ANTI_STALL_AFTER) {
+            stallFired = true;
+            objects.burst(frame.chestX, frame.chestY + STALL_BURST_HEIGHT, frame.chestZ, 0.11);
+            options.announce(
+                `${placeName(frame.chestX, frame.chestZ)}の方角で花火が上がった！　宝箱はあのあたりだ`,
+            );
+            console.info(
+                `[director] アンチストール花火 t=${t.toFixed(0)}s（最終安置 +${ANTI_STALL_AFTER}s・1マッチ1回）`,
+            );
         }
 
         // --- リード監視（2未満なら次のイベントを前倒し） ---
-        const leads = countLeads(frame, crates);
+        const leads = countLeads(crates);
         if (MATCH_DEBUG && leads !== leadShown) {
             leadShown = leads;
             console.info(`[director] リード ${leads}（下限 ${LEAD_MIN}）t=${t.toFixed(0)}s`);
@@ -667,12 +780,11 @@ export function createDirector(options: DirectorOptions): Director {
                     );
                     options.announce('しばらく動きが無い… 補給機が予定を早めて飛来する');
                 } else {
-                    fireworkPeriod = EARLY_FIREWORK_PERIOD;
-                    fireworkTimer = Math.min(fireworkTimer, 1);
+                    // 宝箱の位置を漏らす花火は廃止（契約14-7）。残っているイベントが無ければ
+                    // アンチストールの3分待ちに任せる
                     console.info(
-                        `[director] リード ${leads} < ${LEAD_MIN} → 宝箱の花火を ${EARLY_FIREWORK_PERIOD}s 間隔へ前倒し`,
+                        `[director] リード ${leads} < ${LEAD_MIN} だが前倒しできるイベントが無い（t=${t.toFixed(0)}s）`,
                     );
-                    options.announce('宝箱から花火が上がり始めた！');
                 }
             }
         } else {
@@ -688,11 +800,12 @@ export function createDirector(options: DirectorOptions): Director {
         items.boars.end();
         items.mimics.end();
         items.lookouts.end();
+        items.marks.end();
+        items.motes.end();
 
         // --- HUD ---
         hud.setSlots(slotView(0), slotView(1));
         hud.setBadge(badgeText());
-        updateArrow(frame);
     };
 
     const slotView = (index: number): { mark: string; name: string; note: string } | null => {
@@ -711,58 +824,26 @@ export function createDirector(options: DirectorOptions): Director {
         if (mapPieces > 0) parts.push(`🗺 ${Math.min(mapPieces, MAP_PIECES)}/${MAP_PIECES}`);
         if (hasTabi()) parts.push(`👟 ×${TABI_SPEED}`);
         if (slots[0] === 'cape' || slots[1] === 'cape') parts.push('🦅 Space長押しで滑空');
-        if (stickLeft > 0) parts.push(`🔮 ${Math.ceil(stickLeft)}s`);
+        // 集めた手がかりの数（マップ(M)で重ねて見る・契約14-4）
+        if (marks.length > 0) parts.push(`🔮 方向線 ${marks.length}`);
+        if (cones.length > 0) parts.push(`👁 扇形 ${cones.length}`);
+        if (mapCircle) parts.push('🗺 円');
         if (fogLeft > 0) parts.push(`🌫 ${Math.ceil(fogLeft)}s`);
-        if (farsightLeft > 0) parts.push(`👁 ${Math.ceil(farsightLeft)}s`);
         if (game.boarSeconds > 0) parts.push(`🐗 ${Math.ceil(game.boarSeconds)}s`);
+        // 気配は距離が近いほど強い（契約14-5）
+        if (sense > 0) parts.push(sense > 0.6 ? '✨ すぐそこだ！' : '✨ 気配');
         return parts.join('　');
     };
 
     const hasTabi = (): boolean => slots[0] === 'tabi' || slots[1] === 'tabi';
 
-    /**
-     * 方角矢印（画面基準の角度に直して HUD へ渡す）。
-     * 尋ね人ステッキは最寄りプレイヤー、千里眼（契約12）は宝箱を指す
-     */
-    const updateArrow = (frame: DirectorFrame): void => {
-        if (stickLeft <= 0 && farsightLeft > 0) {
-            const dx = frame.chestX - game.state.x;
-            const dz = frame.chestZ - game.state.z;
-            hud.setArrow(
-                Math.atan2(dx, -dz) - game.viewYaw,
-                `宝箱 ${Math.round(Math.hypot(dx, dz))}m`,
-            );
-            return;
-        }
-        if (stickLeft <= 0) {
-            hud.setArrow(null, '');
-            return;
-        }
-        scanX = game.state.x;
-        scanZ = game.state.z;
-        nearestPeer = '';
-        nearestPeerDistance = 0;
-        options.eachPeer(findNearestPeer);
-        const targetX = nearestPeer ? nearestPeerX : frame.chestX;
-        const targetZ = nearestPeer ? nearestPeerZ : frame.chestZ;
-        const dx = targetX - game.state.x;
-        const dz = targetZ - game.state.z;
-        const distance = Math.hypot(dx, dz);
-        // カメラの向きを基準にした画面上の角度（0 = 画面上 = 正面）
-        const bearing = Math.atan2(dx, -dz);
-        const screen = bearing - game.viewYaw;
-        hud.setArrow(
-            screen,
-            `${nearestPeer ? options.nameOf(nearestPeer) : '宝箱'} ${Math.round(distance)}m`,
-        );
-    };
-
     return {
         attachMap(pick) {
             pickOnMap = pick;
         },
-        start(nextLayout, seed, previousSeed) {
-            layout = buildItemLayout(seed, nextLayout, world.mapFeatures.roads, previousSeed);
+        start(nextLayout, seed, previousSeed, probe) {
+            layout = buildItemLayout(seed, nextLayout, world.mapFeatures.roads, previousSeed, probe);
+            circleSeed = (seed ^ 0x4d3ac71b) >>> 0;
             const surface = game.physics.surfaceHeight;
             // 見晴らしスポットは地形だけで決まるので1回測れば使い回せる（契約12）
             if (!lookouts) {
@@ -821,19 +902,22 @@ export function createDirector(options: DirectorOptions): Director {
             pending.clear();
             peerFx.clear();
             mapPieces = 0;
-            stickLeft = 0;
             fogLeft = 0;
             // ⚡の成長はマッチ単位。リマッチでは必ず 1.00 から（契約13-10）
             coins = 0;
             pickIndex = -1;
-            farsightLeft = 0;
+            // 集めた手がかりもマッチ単位。リマッチには持ち越さない（E99）
+            marks.length = 0;
+            cones.length = 0;
+            mapCircle = null;
+            sense = 0;
+            senseTold = false;
             mimicOpened = new Uint8Array(0);
             wildlife.reset();
             picking = false;
             canUse = false;
             airState = '';
-            fireworkTimer = 0;
-            fireworkPeriod = CHEST_FIREWORK_PERIOD;
+            stallFired = false;
             leadWarned = false;
             leadShown = -1;
             items.reset();
@@ -841,12 +925,64 @@ export function createDirector(options: DirectorOptions): Director {
             game.setSlopePower(false);
             hud.setSlots(null, null);
             hud.setBadge('');
-            hud.setArrow(null, '');
         },
         update,
         drawMap(draw) {
             if (!layout) return;
-            const { ctx, screenX, screenY, scale, full } = draw;
+            const { ctx, screenX, screenY, ppm, scale, full } = draw;
+
+            // --- 集めた手がかり（契約14-4）。線・扇形・円が重なるほど場所が絞れる ---
+            // 千里眼の扇形（方角 + 距離帯）
+            for (const cone of cones) {
+                const sx = screenX(cone.x);
+                const sy = screenY(cone.z);
+                // 画面の角度へ（マップは +z が下・-z が上なので、北 = 上 = -90°）
+                const base = cone.angle - Math.PI / 2;
+                ctx.save();
+                ctx.fillStyle = 'rgba(100, 240, 200, 0.16)';
+                ctx.strokeStyle = 'rgba(100, 240, 200, 0.9)';
+                ctx.lineWidth = 1.5 * scale;
+                ctx.beginPath();
+                ctx.arc(sx, sy, Math.max(1, cone.near * ppm), base - CONE_HALF, base + CONE_HALF);
+                ctx.arc(sx, sy, Math.max(1, cone.far * ppm), base + CONE_HALF, base - CONE_HALF, true);
+                ctx.closePath();
+                ctx.fill();
+                ctx.stroke();
+                ctx.restore();
+            }
+            // ステッキの方向線（2本の交点が宝箱）
+            for (const mark of marks) {
+                const sx = screenX(mark.x);
+                const sy = screenY(mark.z);
+                ctx.save();
+                ctx.strokeStyle = 'rgba(155, 123, 255, 0.95)';
+                ctx.lineWidth = 2.2 * scale;
+                ctx.beginPath();
+                ctx.moveTo(sx, sy);
+                ctx.lineTo(
+                    screenX(mark.x + Math.sin(mark.angle) * RAY_LENGTH),
+                    screenY(mark.z - Math.cos(mark.angle) * RAY_LENGTH),
+                );
+                ctx.stroke();
+                ctx.fillStyle = '#9b7bff';
+                ctx.beginPath();
+                ctx.arc(sx, sy, 3.5 * scale, 0, TAU);
+                ctx.fill();
+                ctx.restore();
+            }
+            // 地図3枚の円（この中のどこかに宝箱がある）
+            if (mapCircle) {
+                ctx.save();
+                ctx.strokeStyle = 'rgba(242, 209, 107, 0.95)';
+                ctx.fillStyle = 'rgba(242, 209, 107, 0.14)';
+                ctx.lineWidth = 2 * scale;
+                ctx.setLineDash([6 * scale, 4 * scale]);
+                ctx.beginPath();
+                ctx.arc(screenX(mapCircle.x), screenY(mapCircle.z), Math.max(2, MAP_CIRCLE * ppm), 0, TAU);
+                ctx.fill();
+                ctx.stroke();
+                ctx.restore();
+            }
             // コインは全体マップでだけ薄く出す（ミニマップでは道路と喧嘩する）
             if (full) {
                 ctx.fillStyle = 'rgba(255, 200, 60, 0.7)';
@@ -911,6 +1047,39 @@ export function createDirector(options: DirectorOptions): Director {
                 ctx.fill();
                 ctx.stroke();
             }
+
+            // --- 凡例（全体マップだけ・E99）。手がかりの種類が見分けられるようにする ---
+            if (!full) return;
+            const rows: [string, string][] = [];
+            if (marks.length > 0) rows.push(['#9b7bff', 'ステッキの方向線（交点＝宝箱）']);
+            if (cones.length > 0) rows.push(['#64f0c8', '千里眼の扇形（方角と距離帯）']);
+            if (mapCircle) rows.push(['#f2d16b', `地図の円（半径${MAP_CIRCLE}m・この中）`]);
+            if (rows.length === 0) return;
+            ctx.save();
+            ctx.font = `${12 * scale}px system-ui, sans-serif`;
+            ctx.textBaseline = 'middle';
+            ctx.textAlign = 'left';
+            const lineHeight = 18 * scale;
+            const swatch = 14 * scale;
+            const pad = 8 * scale;
+            const textAt = 10 + pad + swatch + 6 * scale;
+            let boxWidth = 0;
+            for (const row of rows) {
+                boxWidth = Math.max(boxWidth, ctx.measureText(row[1]).width);
+            }
+            boxWidth += textAt - 10 + pad;
+            // 下端の操作ヒントバーと重ならない高さに置く
+            const top = draw.h - 52 - rows.length * lineHeight - pad;
+            ctx.fillStyle = 'rgba(16, 18, 24, 0.72)';
+            ctx.fillRect(10, top, boxWidth, rows.length * lineHeight + pad * 2);
+            for (let i = 0; i < rows.length; i++) {
+                const y = top + pad + lineHeight * (i + 0.5);
+                ctx.fillStyle = rows[i][0];
+                ctx.fillRect(10 + pad, y - 3 * scale, swatch, 6 * scale);
+                ctx.fillStyle = '#eef2f7';
+                ctx.fillText(rows[i][1], textAt, y);
+            }
+            ctx.restore();
         },
         useSlot,
         applyTake(index, who) {
@@ -950,9 +1119,6 @@ export function createDirector(options: DirectorOptions): Director {
             // ⚡は上限2倍、足袋はその上に重ねる（契約13 項目11の裁定）
             return coinScale() * (hasTabi() ? TABI_SPEED : 1);
         },
-        get mapReveal() {
-            return mapPieces >= MAP_PIECES;
-        },
         get pickTarget() {
             if (!layout || pickIndex < 0) return null;
             const spec = ITEMS[layout.drops[pickIndex].id];
@@ -980,9 +1146,6 @@ export function createDirector(options: DirectorOptions): Director {
         eachCoin(visit) {
             if (!layout) return;
             for (const spark of layout.coins) visit(spark.x, spark.z);
-        },
-        get farsight() {
-            return farsightLeft > 0;
         },
         eachDrop(visit) {
             if (!layout) return;

@@ -48,6 +48,9 @@ const MAX_WINGS = 10;
 const MAX_BOARS = 8;
 const MAX_MIMICS = 4;
 const MAX_LOOKOUTS = 4;
+/** 倒れたステッキ（使った地点に残る方向の印・契約14-4）と 気配の粒（契約14-5） */
+const MAX_MARKS = 8;
+const MAX_MOTES = 14;
 
 /** ルートビーコン（光の柱）の高さ[m]・半径[m] */
 const BEACON_HEIGHT = 120;
@@ -82,6 +85,10 @@ export interface MatchItemObjects {
     mimics: InstancePool;
     /** 見晴らしスポットの目印（展望デッキ・契約12） */
     lookouts: InstancePool;
+    /** 使った地点に残る「倒れた尋ね人ステッキ」。yaw が宝箱の方角（契約14-4） */
+    marks: InstancePool;
+    /** 宝箱・ミミックの気配（自分の周りを舞うキラキラ・契約14-5） */
+    motes: InstancePool;
     /** 全部隠す（ロビー・リマッチ・E76） */
     reset(): void;
     dispose(): void;
@@ -190,6 +197,35 @@ function createLookoutGeometry(): BufferGeometry {
         { geometry: new CylinderGeometry(0.05, 0.05, 0.62, 6), matrix: partMatrix(0, 2.7, -1.45), color: rail },
     ];
     return mergeParts(parts);
+}
+
+/**
+ * 倒れた尋ね人ステッキ（契約14-4）。使った地点に残り、**yaw=0 で -z（前）を指す**。
+ * 杖の柄が地面に伏せて、その先に細い帯（方向線）が伸びる形にして、
+ * 3Dの画でも「こっちを指している」と読めるようにする
+ */
+function createMarkGeometry(): BufferGeometry {
+    const wood = 0x9b7bff;
+    const line = 0xd9ccff;
+    const parts: GeometryPart[] = [
+        // 柄（横倒しの棒。-z へ向かって伸びる）
+        {
+            geometry: new CylinderGeometry(0.075, 0.075, 1.7, 6),
+            matrix: partMatrix(0, 0.09, -0.2, 1, 1, 1, Math.PI / 2, 0, 0),
+            color: wood,
+        },
+        // 握り玉（手前側）
+        { geometry: new SphereGeometry(0.17, 7, 6), matrix: partMatrix(0, 0.12, 0.66), color: wood },
+        // 方向線（先端から前へ伸びる薄い帯）
+        { geometry: new BoxGeometry(0.12, 0.03, 4.4), matrix: partMatrix(0, 0.03, -3.3), color: line },
+        { geometry: new BoxGeometry(0.44, 0.03, 0.44), matrix: partMatrix(0, 0.03, -5.6, 1, 1, 1, 0, Math.PI / 4, 0), color: line },
+    ];
+    return mergeParts(parts);
+}
+
+/** 気配の粒（契約14-5）。小さな八面体を自分の周りに舞わせる */
+function createMoteGeometry(): BufferGeometry {
+    return new OctahedronGeometry(0.14, 0);
 }
 
 /** 光の柱（加算合成・上へ薄くなる）。色はインスタンスごと */
@@ -331,6 +367,22 @@ export function createMatchItemObjects(scene: Scene, quality: QualitySettings): 
     const lookoutMaterial = new MeshStandardNodeMaterial({ vertexColors: true, roughness: 0.7 });
     const lookouts = build(createLookoutGeometry(), lookoutMaterial, MAX_LOOKOUTS, false);
 
+    // --- 倒れたステッキ（契約14-4）---
+    const markMaterial = new MeshStandardNodeMaterial({
+        vertexColors: true,
+        roughness: 0.5,
+        emissive: 0x2a1f52,
+    });
+    const marks = build(createMarkGeometry(), markMaterial, MAX_MARKS, false);
+
+    // --- 気配の粒（契約14-5）---
+    const moteMaterial = new MeshBasicNodeMaterial({ color: 0xfff0a8, toneMapped: false });
+    moteMaterial.transparent = true;
+    moteMaterial.opacity = 0.85;
+    moteMaterial.depthWrite = false;
+    moteMaterial.blending = AdditiveBlending;
+    const motes = build(createMoteGeometry(), moteMaterial, MAX_MOTES, false);
+
     scene.add(group);
 
     return {
@@ -343,6 +395,8 @@ export function createMatchItemObjects(scene: Scene, quality: QualitySettings): 
         boars,
         mimics,
         lookouts,
+        marks,
+        motes,
         reset() {
             for (const pool of [
                 pickups,
@@ -354,6 +408,8 @@ export function createMatchItemObjects(scene: Scene, quality: QualitySettings): 
                 boars,
                 mimics,
                 lookouts,
+                marks,
+                motes,
             ]) {
                 pool.begin();
                 pool.end();

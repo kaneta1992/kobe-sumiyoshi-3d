@@ -120,10 +120,10 @@ export type { BotState } from './peers';
  *   start  マッチ開始（seed / 開始時刻 / 送信時刻）
  *   claim  取得の申告（非ホスト → ホスト）
  *   award  ホストの裁定（これが正。二重回収を防ぐ・E64）
- *   open   宝箱のチャンネリング開始（実況用）
- *   bump   体当たり（相手のチャンネリングを中断させる）
+ *   open   （廃止・契約14）宝箱のチャンネリング開始。受け手は無視する
+ *   bump   （廃止・契約14）体当たり。受け手は無視する
  *   vote   リマッチ投票
- *   iclaim アイテム取得の申告（契約11。鍵・宝箱と同じ経路）
+ *   iclaim アイテム取得の申告（契約11。宝箱と同じ経路）
  *   iaward アイテム取得の裁定（ホストが出す。これが正・E73）
  *   fx     使用したアイテムの効果（滑空・傘・霧玉の遠隔表示・E77）
  *
@@ -140,13 +140,13 @@ export type MatchPacket = {
     at?: number;
     /** start: 送信時刻[ms]。受信側でローカル時計へのオフセットを作る（E63） */
     now?: number;
-    /** claim / award: 対象 */
+    /** claim / award: 対象（'key' は契約14で廃止。旧クライアント互換のため型は残す・E102） */
     w?: 'key' | 'chest';
     /** award: 取得者のピアID */
     who?: string;
-    /** bump: 押し飛ばす相手のピアID */
+    /** bump（廃止）: 押し飛ばす相手のピアID */
     to?: string;
-    /** bump: 押し出す水平方向 */
+    /** bump（廃止）: 押し出す水平方向 */
     dx?: number;
     dz?: number;
     /** iclaim / iaward: 場のアイテムの番号（配置の添字・契約11） */

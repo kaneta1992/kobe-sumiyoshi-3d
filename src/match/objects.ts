@@ -1,5 +1,8 @@
 /**
- * マッチの3Dオブジェクト（契約10）。安置の円柱壁・宝箱・鍵・輸送機・パラシュート・花火。
+ * マッチの3Dオブジェクト（契約10 / 契約14）。安置の円柱壁・宝箱・輸送機・パラシュート・花火。
+ *
+ * 契約14: 宝箱の光の柱と鍵は廃止。宝箱は隠し配置なので、**目印になるものは何も出さない**
+ * （見つけたい人は自分の足で近づいて「気配」を頼りに探す）。
  *
  * 描画コールの規律（予算 mobile draw ≤ 100）:
  *   - パーツはすべて頂点色で1メッシュへ束ねる（world/geom の mergeParts）
@@ -11,7 +14,6 @@
  * 遠くからでも「動いている壁」だと分かるようにしてある。
  */
 import {
-    AdditiveBlending,
     BoxGeometry,
     ConeGeometry,
     CylinderGeometry,
@@ -24,10 +26,9 @@ import {
     MeshStandardNodeMaterial,
     Object3D,
     SphereGeometry,
-    TorusGeometry,
     type Scene,
 } from 'three/webgpu';
-import { float, mix, sin, time, uv, vec3 } from 'three/tsl';
+import { mix, sin, time, uv, vec3 } from 'three/tsl';
 import type { QualitySettings } from '../quality';
 import { mergeParts, partMatrix, type GeometryPart } from '../world/geom';
 
@@ -42,9 +43,6 @@ const WALL_SEGMENTS = 56;
 const WALL_HEIGHT = 260;
 /** 帯の下端をプレイヤーの足元から何m下に置くか（坂を降りても足元が抜けない余裕） */
 const WALL_BELOW = 60;
-/** 光の柱の高さ[m] と半径[m] */
-const BEAM_HEIGHT = 140;
-const BEAM_RADIUS = 2.4;
 /** 花火の粒の最大数 */
 const SPARKS = 48;
 /** 花火の粒の寿命[s] */
@@ -57,9 +55,8 @@ const SPARK_GRAVITY = 7;
 export interface MatchObjects {
     /** 安置の円柱壁。r <= 0 で消す。baseY はプレイヤーの足元の高さ（帯を合わせる先） */
     setZone(x: number, z: number, r: number, baseY: number): void;
-    /** 宝箱。beam は光の柱（位置が開示されてから点ける） */
-    setChest(x: number, y: number, z: number, visible: boolean, beam: boolean): void;
-    setKey(x: number, y: number, z: number, visible: boolean): void;
+    /** 宝箱（隠し配置。光の柱は付けない・契約14-3） */
+    setChest(x: number, y: number, z: number, visible: boolean): void;
     setTransport(x: number, y: number, z: number, yaw: number, visible: boolean): void;
     setCanopy(x: number, y: number, z: number, yaw: number, visible: boolean): void;
     /** 花火を1発打ち上げる（勝利演出・宝箱の気配） */
@@ -105,24 +102,6 @@ function createZoneWall(): Mesh {
     return mesh;
 }
 
-/** 光の柱（加算合成）。宝箱・鍵の目印 */
-function createBeam(color: number): Mesh {
-    const geometry = new CylinderGeometry(BEAM_RADIUS, BEAM_RADIUS * 0.55, BEAM_HEIGHT, 12, 1, true);
-    geometry.translate(0, BEAM_HEIGHT / 2, 0);
-    const material = new MeshBasicNodeMaterial({ color });
-    const v = uv().y;
-    material.opacityNode = mix(float(0.42), float(0), v.pow(0.6));
-    material.transparent = true;
-    material.depthWrite = false;
-    material.blending = AdditiveBlending;
-    material.side = DoubleSide;
-    material.toneMapped = false;
-    // ジオメトリを上へずらしてあるので境界球も柱と一致する。画面外では描かせない
-    const mesh = new Mesh(geometry, material);
-    mesh.visible = false;
-    return mesh;
-}
-
 /**
  * ポップな宝箱の形（木箱 + かまぼこ蓋 + 金具）。
  * 偽宝箱（ミミック・契約12）も**同じジオメトリ**を使う — 見た目で見分けられない
@@ -153,27 +132,6 @@ function createChest(quality: QualitySettings): Mesh {
     const mesh = new Mesh(createChestGeometry(), material);
     mesh.castShadow = quality.shadows;
     mesh.receiveShadow = true;
-    mesh.visible = false;
-    return mesh;
-}
-
-/** 鍵（輪 + 軸 + 歯）。1メッシュ */
-function createKey(): Mesh {
-    const gold = 0xffd257;
-    const parts: GeometryPart[] = [
-        { geometry: new TorusGeometry(0.34, 0.11, 8, 16), matrix: partMatrix(0, 0.5, 0), color: gold },
-        { geometry: new CylinderGeometry(0.09, 0.09, 0.95, 8), matrix: partMatrix(0, -0.12, 0), color: gold },
-        { geometry: new BoxGeometry(0.3, 0.12, 0.11), matrix: partMatrix(0.16, -0.42, 0), color: gold },
-        { geometry: new BoxGeometry(0.22, 0.12, 0.11), matrix: partMatrix(0.12, -0.2, 0), color: gold },
-    ];
-    const material = new MeshStandardNodeMaterial({
-        vertexColors: true,
-        roughness: 0.3,
-        metalness: 0.7,
-        emissive: 0x3a2600,
-    });
-    // 光の柱が位置を示すので、鍵自体は影を落とさない（シャドウパスの描画を1本節約する）
-    const mesh = new Mesh(mergeParts(parts), material);
     mesh.visible = false;
     return mesh;
 }
@@ -242,9 +200,6 @@ export function createMatchObjects(scene: Scene, quality: QualitySettings): Matc
 
     const wall = createZoneWall();
     const chest = createChest(quality);
-    const chestBeam = createBeam(0xffd257);
-    const key = createKey();
-    const keyBeam = createBeam(0x8fe3ff);
     const transport = createTransport();
     const canopy = createCanopy();
 
@@ -260,13 +215,8 @@ export function createMatchObjects(scene: Scene, quality: QualitySettings): Matc
     const sparkMatrix = new Matrix4();
     const sparkPivot = new Object3D();
 
-    group.add(wall, chest, chestBeam, key, keyBeam, transport, canopy, sparks);
+    group.add(wall, chest, transport, canopy, sparks);
     scene.add(group);
-
-    let keySpin = 0;
-
-    /** 三角関数を毎フレーム作らずに済むよう、揺れの位相だけ進める */
-    let bob = 0;
 
     return {
         setZone(x, z, r, baseY) {
@@ -279,18 +229,9 @@ export function createMatchObjects(scene: Scene, quality: QualitySettings): Matc
             wall.scale.x = r;
             wall.scale.z = r;
         },
-        setChest(x, y, z, visible, beam) {
+        setChest(x, y, z, visible) {
             chest.visible = visible;
             chest.position.set(x, y, z);
-            chestBeam.visible = beam;
-            chestBeam.position.set(x, y, z);
-        },
-        setKey(x, y, z, visible) {
-            key.visible = visible;
-            keyBeam.visible = visible;
-            key.position.set(x, y + 1.1 + Math.sin(bob) * 0.18, z);
-            key.rotation.y = keySpin;
-            keyBeam.position.set(x, y, z);
         },
         setTransport(x, y, z, yaw, visible) {
             transport.visible = visible;
@@ -325,9 +266,6 @@ export function createMatchObjects(scene: Scene, quality: QualitySettings): Matc
         reset() {
             wall.visible = false;
             chest.visible = false;
-            chestBeam.visible = false;
-            key.visible = false;
-            keyBeam.visible = false;
             transport.visible = false;
             canopy.visible = false;
             sparks.visible = false;
@@ -335,8 +273,6 @@ export function createMatchObjects(scene: Scene, quality: QualitySettings): Matc
             for (let i = 0; i < SPARKS; i++) sparkLife[i] = 0;
         },
         update(dt) {
-            bob += dt * 2.2;
-            keySpin = (keySpin + dt * 1.4) % TAU;
             if (!sparks.visible) return;
             let alive = 0;
             for (let i = 0; i < SPARKS; i++) {

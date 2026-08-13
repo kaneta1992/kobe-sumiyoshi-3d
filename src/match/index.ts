@@ -1,11 +1,15 @@
 /**
- * マッチフロー（契約10）: ロビー → 輸送機スカイダイビング → 安置3段収縮 → 鍵 → 宝箱 →
- * 勝利演出 → リマッチ投票。?match のときだけ作られ、既定の自由散策には一切影響しない。
+ * マッチフロー（契約10 / 契約14）: ロビー → 輸送機スカイダイビング → 安置3段収縮 →
+ * 隠された宝箱を探す → 触れて勝利 → リマッチ投票。?match のときだけ作られ、
+ * 既定の自由散策には一切影響しない。
+ *
+ * 契約14の芯: **宝箱の位置は無償では開示しない**。光の柱もマップの★も定期花火も無い。
+ * 無償の情報は安置の円（＝範囲）だけで、方向・距離・円はアイテムを使って自分で集める。
  *
  * 同期の設計:
  *   - ルーム内**最小ピアIDがホスト**。ホストが {seed, 開始時刻} を配って始める
- *   - 宝箱・鍵・安置の中心列・輸送機の経路は全員が seed から**決定的に再現**する（座標は送らない）
- *   - ネットワークを流れるのは開始の合図と、鍵・宝箱の**裁定**（ホストが出す award が正）だけ
+ *   - 宝箱・安置の中心列・輸送機の経路は全員が seed から**決定的に再現**する（座標は送らない）
+ *   - ネットワークを流れるのは開始の合図と、宝箱の**裁定**（ホストが出す award が正）だけ
  *   - ホストが落ちたら次点ピアが継承する。seed と開始時刻は全員が持っているので進行は続く（E62）
  *   - 相手の時計は受信時にローカル時計へオフセット補正する（E63・multiplayer の E32 と同じ方式）
  *
@@ -16,10 +20,9 @@
  *   ?matchspeed=6      マッチ時計を6倍速（デバッグ）
  *   ?matchseed=123     シード固定（同じ配置を再現）
  *   ?matchauto         ロビーの開始ボタンを押さずに始める
- *   ?matchgoto=key|chest  目標の3m手前へテレポート（デバッグ。R で再実行）
+ *   ?matchgoto=chest   目標の3m手前へテレポート（デバッグ。R で再実行）
  */
 import type { Scene } from 'three/webgpu';
-import { AREA_HALF } from '../config';
 import type { Game } from '../game';
 import type { MatchPacket, Multiplayer } from '../net/multiplayer';
 import { isBotId, peerColor } from '../net/peers';
@@ -33,23 +36,16 @@ import { createBots, type BotFrame, type Bots } from './bots';
 import { createDirector, type Director, type DirectorFrame } from './director';
 import { createMatchHud } from './hud';
 import { createMatchItemObjects } from './item-objects';
+import { MATCH_DEBUG } from './items';
 import { createMatchObjects, type MatchObjects } from './objects';
 import { createWildlife } from './wildlife';
 import {
-    BUMP_COOLDOWN,
-    BUMP_PUSH,
-    BUMP_REACH,
-    BUMP_SPEED,
-    CHANNEL_STILL,
-    CHANNEL_TIME,
     COUNTDOWN,
     DROP_TIME,
     GOTO_STANDOFF,
-    KEY_AT,
     OUTSIDE_SPEED,
     PLANE_CLEARANCE,
     REACH,
-    REVEAL_AT,
     VOTE_TIME,
     autoStart,
     buildLayout,
@@ -63,14 +59,11 @@ import {
     noBots,
     zoneAt,
     type MatchLayout,
+    type WorldProbe,
 } from './rules';
 
 const TAU = Math.PI * 2;
 
-/** 宝箱の「円ヒント」の半径[m]（第2段階の開示） */
-const CHEST_HINT_RADIUS = 220;
-/** 位置が割れたあとの宝箱の花火の間隔[s] */
-const CHEST_FIREWORK = 6;
 /** 勝利演出の花火の間隔[s] */
 const WIN_FIREWORK = 1.3;
 /** 裁定が返ってこないときに再申告するまで[s]（ホスト交代の空白を埋める・E62） */
@@ -92,7 +85,8 @@ const SOLO_DETAIL_LIMIT = 2;
 type Phase = 'lobby' | 'live' | 'result';
 /** 降下の進み方 */
 type Board = 'none' | 'aboard' | 'dropped' | 'landed';
-type Prize = 'key' | 'chest';
+/** 裁定の対象。契約14で鍵を廃止したので宝箱だけ（プロトコルの w は互換のため残す） */
+type Prize = 'chest';
 
 export interface MatchOptions {
     scene: Scene;
@@ -126,13 +120,6 @@ function validPacket(packet: MatchPacket): boolean {
         );
     }
     if (packet.k === 'award') return typeof packet.who === 'string' && packet.who.length <= 128;
-    if (packet.k === 'bump') {
-        return (
-            typeof packet.to === 'string' &&
-            Number.isFinite(packet.dx) &&
-            Number.isFinite(packet.dz)
-        );
-    }
     if (packet.k === 'iclaim') return Number.isInteger(packet.i) && (packet.i as number) >= 0;
     if (packet.k === 'iaward') {
         return (
@@ -184,14 +171,9 @@ export function createMatch(options: MatchOptions): Match {
     let spectator = false;
     let board: Board = 'none';
     let chestY = 0;
-    let keyY = 0;
-    let keyOwner: string | null = null;
     let winner: string | null = null;
     let winnerTime = 0;
-    let channel = 0;
-    let chestFireworkTimer = 0;
     let winFireworkTimer = 0;
-    let bumpCooldown = 0;
     let resultAt = 0;
     /** 直前のマッチのシード（POI の連続同一を避ける・契約13-4）。null = 初回 */
     let previousSeed: number | null = null;
@@ -208,15 +190,14 @@ export function createMatch(options: MatchOptions): Match {
     const frame: DirectorFrame = {
         t: 0,
         dt: 0,
-        reveal: 0,
-        keyLive: false,
         chestX: 0,
         chestY: 0,
         chestZ: 0,
+        over: false,
         active: false,
     };
     /** 回収UI へ毎フレーム渡す1件（使い回して new を作らない・契約13-3） */
-    const actionView = { mark: '', target: '', hold: false, progress: -1 };
+    const actionView = { mark: '', target: '' };
     const votes = new Set<string>();
     const claimed = new Map<Prize, number>();
     /** 申告済みのアイテム番号 → 申告時刻[ms]（裁定が返らないときの再申告用・契約11） */
@@ -244,12 +225,6 @@ export function createMatch(options: MatchOptions): Match {
 
     const send = (packet: MatchPacket): void => net?.sendMatch(packet);
 
-    const announceOnce = (key: string, text: string): void => {
-        if (told.has(key)) return;
-        told.add(key);
-        hud.announce(text);
-    };
-
     /**
      * フェーズ遷移の告知（契約13-6）。実況より大きいトーストで1回だけ出す。
      * 実況と二重に出すと画面が同じ文で埋まるので、こちらはトーストだけ
@@ -266,13 +241,9 @@ export function createMatch(options: MatchOptions): Match {
         matchTime = 0;
         spectator = false;
         board = 'none';
-        keyOwner = null;
         winner = null;
         winnerTime = 0;
-        channel = 0;
-        chestFireworkTimer = 0;
         winFireworkTimer = 0;
-        bumpCooldown = 0;
         gotoSent = null;
         votes.clear();
         claimed.clear();
@@ -289,7 +260,6 @@ export function createMatch(options: MatchOptions): Match {
         }
         game.dismountAll();
         game.setHelipads([]);
-        hud.setChannel(-1);
         hud.setVignette(0);
         hud.setAction(null);
         hud.setEdgeArrow(null, '');
@@ -314,8 +284,8 @@ export function createMatch(options: MatchOptions): Match {
             title: '住吉山手トレジャーロワイヤル',
             lines: [
                 `参加 ${count}人${net ? '' : '（ソロ）'}${host && !botsEnabled ? '（BOTなし）' : ''}`,
-                '輸送機から降下し、宝箱に最初に触れた人が勝ち。',
-                '円は縮む。宝箱は必ず円の中にある。',
+                '宝箱は町のどこかに隠されている。最初に触れた人が勝ち。',
+                '円は縮む — 宝箱は必ず円の中。あとはアイテムでヒントを集めて絞り込め。',
             ],
             toggle: host
                 ? {
@@ -375,10 +345,11 @@ export function createMatch(options: MatchOptions): Match {
         appliedGeneration = n;
         generation = Math.max(generation, n);
         botsEnabled = withBots;
-        layout = buildLayout(seed, prevSeed);
+        // 隠し配置はワールド（地形・建物・道路）を見て決める。全員が同じワールドなので
+        // probe を通しても配置は一致する（契約14-3）
+        layout = buildLayout(seed, prevSeed, probe);
         startAt = localStartAt;
-        chestY = world.getElevationAt(layout.chest.x, layout.chest.z);
-        keyY = world.getElevationAt(layout.key.x, layout.key.z);
+        chestY = game.physics.surfaceHeight(layout.chest.x, layout.chest.z);
         // 降下の猶予をとっくに過ぎたマッチへ入った人は観戦（次マッチから参加・契約3）
         spectator = (performance.now() - localStartAt) * 0.001 * speed > DROP_TIME;
         if (spectator) board = 'landed';
@@ -386,21 +357,42 @@ export function createMatch(options: MatchOptions): Match {
         hud.showPanel(null);
         game.setInputSuspended(false, 'match');
         // アイテム・⚡・補給機の配置（同じシードから全員が同じものを作る・契約11/13）
-        director?.start(layout, seed, prevSeed);
+        director?.start(layout, seed, prevSeed, probe);
         previousSeed = seed;
         // ヘリコプター2機（シードから決まる開けた場所へ・契約12）
         game.setHelipads(findHelipads(layout, seed));
         // BOT は「10人枠 - 人間」ぶん。ホストの「BOT: なし」設定なら1体も出さない（契約13-2）
         if (isHost() && withBots) bots?.start(layout, seed, Math.max(0, ROSTER - playerCount()));
         else bots?.reset();
-        // 検証時にどこへ行けばよいかを追えるようにしておく（配置は全員同じはず）
+        // 宝箱の座標は ?matchdebug のときだけ出す（普通に遊ぶときは
+        // コンソールを開いても答えが見えない = 契約14の「無償開示なし」を徹底する）
         console.info(
             `[match] 開始 seed=${seed} 最終安置=${layout.finalPlace} 速度x${speed}` +
                 (withBots ? '' : ' BOTなし') +
                 (spectator ? ' （観戦）' : '') +
-                `　宝箱 ${layout.chest.x.toFixed(0)},${layout.chest.z.toFixed(0)}` +
-                `　鍵 ${layout.key.x.toFixed(0)},${layout.key.z.toFixed(0)}`,
+                (MATCH_DEBUG
+                    ? `　宝箱 ${layout.chest.x.toFixed(0)},${layout.chest.z.toFixed(0)}`
+                    : ''),
         );
+    };
+
+    /**
+     * 隠し配置の判定に渡すワールドの問い合わせ口（契約14-3）。
+     * 道路までの距離は「最寄りの道路頂点」で十分（宝箱を置く粒度は数mでよい）
+     */
+    const probe: WorldProbe = {
+        surface: (x, z) => game.physics.surfaceHeight(x, z),
+        ground: (x, z) => world.getElevationAt(x, z),
+        road: (x, z) => {
+            let best = Infinity;
+            for (const path of world.mapFeatures.roads) {
+                for (const point of path.points) {
+                    const d = (point.x - x) ** 2 + (point.z - z) ** 2;
+                    if (d < best) best = d;
+                }
+            }
+            return Math.sqrt(best);
+        },
     };
 
     // --- ヘリコプターの配置（契約12） --------------------------------------
@@ -469,30 +461,20 @@ export function createMatch(options: MatchOptions): Match {
 
     // --- 裁定 ---------------------------------------------------------------
 
-    /** ホストの裁定。先に届いたほうが勝ち（同時は先着・E64） */
+    /** ホストの裁定。先に届いたほうが勝ち（同時タッチは先着・E64） */
     const award = (prize: Prize, who: string): void => {
-        if (prize === 'key' && keyOwner) return;
-        if (prize === 'chest' && winner) return;
+        if (winner) return;
         send({ k: 'award', n: appliedGeneration, w: prize, who });
         applyAward(prize, who);
     };
 
     const applyAward = (prize: Prize, who: string): void => {
-        if (prize === 'key') {
-            if (keyOwner) return;
-            keyOwner = who;
-            hud.announce(
-                who === selfId ? '鍵を手に入れた！宝箱へ急げ' : `${nameOf(who)}が鍵を手に入れた`,
-            );
-            return;
-        }
-        if (winner) return;
+        // 旧クライアントからの鍵の裁定は無視する（鍵は契約14で廃止・E102）
+        if (prize !== 'chest' || winner) return;
         winner = who;
         winnerTime = matchTime;
         phase = 'result';
         resultAt = performance.now();
-        channel = 0;
-        hud.setChannel(-1);
         hud.setVignette(0);
         hud.setAction(null);
         hud.setEdgeArrow(null, '');
@@ -509,7 +491,7 @@ export function createMatch(options: MatchOptions): Match {
         else send({ k: 'claim', n: appliedGeneration, w: prize });
     };
 
-    // --- アイテムの裁定（契約11。鍵・宝箱とまったく同じ経路） ---
+    // --- アイテムの裁定（契約11。宝箱とまったく同じ経路） ---
 
     /** 裁定を確定させる（再申告の対象からも外す） */
     const settleItem = (index: number, who: string): void => {
@@ -546,7 +528,6 @@ export function createMatch(options: MatchOptions): Match {
         items: itemObjects,
         wildlife,
         selfId,
-        speed,
         claimItem,
         sendFx: (effect, seconds) => send({ k: 'fx', n: appliedGeneration, e: effect, d: seconds }),
         announce: (text) => hud.announce(text),
@@ -566,22 +547,6 @@ export function createMatch(options: MatchOptions): Match {
         claimItem: (index, botId) => awardItem(index, botId),
         eachDrop: (visit) => dir.eachDrop(visit),
         eachCoin: (visit) => dir.eachCoin(visit),
-        eachHuman: (visit) => {
-            visit(selfId, game.state.x, game.state.y, game.state.z);
-            net?.eachPeerPosition((id, x, y, z) => {
-                if (!isBotId(id)) visit(id, x, y, z);
-            });
-        },
-        bump: (targetId, dirX, dirZ) => {
-            if (targetId === selfId) {
-                game.knockback(dirX, dirZ, BUMP_PUSH);
-                if (channel > 0) hud.announce('BOT の体当たりで回収が中断された！');
-                channel = 0;
-                hud.setChannel(-1);
-                return;
-            }
-            send({ k: 'bump', n: appliedGeneration, to: targetId, dx: dirX, dz: dirZ });
-        },
         announce: (text) => hud.announce(text),
     });
     const botBrain: Bots = bots;
@@ -590,10 +555,7 @@ export function createMatch(options: MatchOptions): Match {
         t: 0,
         dt: 0,
         zone,
-        keyLive: false,
-        keyOwner: null,
         winner: null,
-        reveal: 0,
         chestX: 0,
         chestY: 0,
         chestZ: 0,
@@ -644,29 +606,23 @@ export function createMatch(options: MatchOptions): Match {
                 break;
             }
             case 'claim':
-                // 裁定はホストだけが出す。自分がホストでなければ黙って捨てる
-                if (isHost() && packet.n === appliedGeneration && packet.w) award(packet.w, peerId);
+                // 裁定はホストだけが出す。自分がホストでなければ黙って捨てる。
+                // 旧クライアントの鍵の申告（w='key'）は award 側で落ちる（E102）
+                if (isHost() && packet.n === appliedGeneration && packet.w === 'chest') {
+                    award('chest', peerId);
+                }
                 break;
             case 'award':
                 // award を出してよいのはホストだけ（ホストは最小ピアID）
                 if (peerId !== net?.peerIds()[0]) return;
-                if (packet.n === appliedGeneration && packet.w) applyAward(packet.w, packet.who as string);
-                break;
-            case 'open':
-                if (packet.n === appliedGeneration) hud.announce('誰かが宝箱を開け始めた！');
-                break;
-            case 'bump':
-                if (packet.n !== appliedGeneration) return;
-                // BOT への体当たりはホストが受けて BOT 側の状態へ反映する（E83）
-                if (packet.to && isBotId(packet.to)) {
-                    if (isHost()) botBrain.knock(packet.to, packet.dx as number, packet.dz as number);
-                    return;
+                if (packet.n === appliedGeneration && packet.w) {
+                    applyAward(packet.w as Prize, packet.who as string);
                 }
-                if (packet.to !== selfId) return;
-                game.knockback(packet.dx as number, packet.dz as number, BUMP_PUSH);
-                if (channel > 0) hud.announce('体当たりを食らって回収が中断された！');
-                channel = 0;
-                hud.setChannel(-1);
+                break;
+            // open（チャンネリング開始）と bump（体当たり）は契約14で廃止。
+            // 旧クライアントから届いても黙って捨てる（E102）
+            case 'open':
+            case 'bump':
                 break;
             case 'iclaim':
                 if (isHost() && packet.n === appliedGeneration) awardItem(packet.i as number, peerId);
@@ -684,22 +640,6 @@ export function createMatch(options: MatchOptions): Match {
         }
     };
     net?.onMatch(receive);
-
-    // --- 体当たりの相手探し（コールバックは使い回す。フレーム内で関数を作らない） ---
-    let bumpFromX = 0;
-    let bumpFromZ = 0;
-    let bumpTarget: string | null = null;
-    let bumpDirX = 0;
-    let bumpDirZ = 0;
-    const findBumpTarget = (id: string, x: number, _y: number, z: number): void => {
-        const dx = x - bumpFromX;
-        const dz = z - bumpFromZ;
-        const distance = Math.hypot(dx, dz);
-        if (distance > BUMP_REACH || distance < 1e-3) return;
-        bumpTarget = id;
-        bumpDirX = dx / distance;
-        bumpDirZ = dz / distance;
-    };
 
     // --- BOT の配信 -----------------------------------------------------------
 
@@ -841,7 +781,7 @@ export function createMatch(options: MatchOptions): Match {
         hud.setVignette(outside ? Math.min(0.85, 0.35 + (fromCenter - zone.r) / 600) : 0);
 
         // 安置の外にいる間だけ「安置はこっち」を画面端に出す（契約13-6。
-        // 宝箱・鍵の方角は出さない — 場所を推理するのがこのゲームの芯）。
+        // 宝箱の方角は出さない — 場所を推理するのがこのゲームの芯・契約14）。
         // 全体マップを開いている間は消す（E95）
         if (outside && !mapOverlay?.isOpen && !winner) {
             const dx = zone.x - px;
@@ -862,104 +802,25 @@ export function createMatch(options: MatchOptions): Match {
         }
         if (zone.shrinking) toastOnce(`shrink${zone.stage}`, '安置が縮み始めた！　円の中へ入れ');
 
-        // --- 段階開示（契約6: 四半区画 → 円 → 正確な位置） ---
-        // 宝の地図の切れ端を3枚集めていれば、時間を待たずに正確な位置が出る（契約11）
-        const timeReveal = t >= REVEAL_AT[2] ? 3 : t >= REVEAL_AT[1] ? 2 : t >= REVEAL_AT[0] ? 1 : 0;
-        const reveal = dir.mapReveal ? 3 : timeReveal;
-        if (reveal >= 1) {
-            announceOnce(
-                'reveal1',
-                `宝箱は${layout.chest.z < 0 ? '北' : '南'}${layout.chest.x < 0 ? '西' : '東'}のエリアにあるらしい`,
-            );
-        }
-        if (reveal >= 2) announceOnce('reveal2', '宝箱のおおよその場所が絞り込まれた');
-        if (reveal >= 3) {
-            toastOnce(
-                'reveal3',
-                `宝箱の正確な位置が判明！${placeName(layout.chest.x, layout.chest.z)}　マップ(M)で確認`,
-            );
-        }
-        objects.setChest(layout.chest.x, chestY, layout.chest.z, true, reveal >= 2);
+        // --- 宝箱（契約14-3: 隠されている。光の柱もマップの★も花火も無い） ---
+        objects.setChest(layout.chest.x, chestY, layout.chest.z, true);
 
-        // 位置が割れたら定期的に花火を上げる（全員の足が動く）
-        if (reveal >= 3) {
-            chestFireworkTimer -= dt;
-            if (chestFireworkTimer <= 0) {
-                chestFireworkTimer = CHEST_FIREWORK;
-                objects.burst(layout.chest.x, chestY + 6, layout.chest.z, 0.12);
-            }
-        }
-
-        // --- 鍵 ---
-        const keyLive = t >= KEY_AT && !keyOwner;
-        objects.setKey(layout.key.x, keyY, layout.key.z, keyLive);
-        if (t >= KEY_AT) {
-            toastOnce('key', `鍵が出現！${placeName(layout.key.x, layout.key.z)}のあたり　マップ(M)で確認`);
-        }
-        const nearKey =
-            keyLive &&
-            !spectator &&
-            !claimed.has('key') &&
-            Math.hypot(px - layout.key.x, pz - layout.key.z) < REACH &&
-            Math.abs(game.state.y - keyY) < 5;
-
-        // --- 宝箱のチャンネリング（移動・被体当たり・円外で必ず切れる・E64） ---
-        // 契約13-3: 「近づいたら勝手に開く」をやめ、回収ボタン（PC は E）の
-        // 押しっぱなしで進むようにした。押している間だけプログレスが伸びる
-        const nearChest =
-            Math.hypot(px - layout.chest.x, pz - layout.chest.z) < REACH &&
-            Math.abs(game.state.y - chestY) < 5;
-        const canChannel =
+        // --- 触れた瞬間に回収・勝利（契約14-2: チャンネリングも鍵も無い） ---
+        // 高さの差を見るのは、真上の建物・真下の道から誤って触れないようにするため
+        if (
             !spectator &&
             !winner &&
-            keyOwner === selfId &&
-            nearChest &&
-            !outside &&
-            game.state.mode === 'walk' &&
-            game.state.speed < CHANNEL_STILL;
-        if (canChannel && hud.actionHeld && !claimed.has('chest')) {
-            if (channel <= 0) {
-                hud.announce('宝箱を開けている…（離すか動くと中断）');
-                send({ k: 'open', n: appliedGeneration });
-            }
-            channel += dt * speed;
-            hud.setChannel(channel / CHANNEL_TIME);
-            if (channel >= CHANNEL_TIME) claim('chest');
-        } else if (!claimed.has('chest')) {
-            if (channel > 0) hud.announce('宝箱の回収が中断された');
-            channel = 0;
-            hud.setChannel(-1);
-        }
-
-        // --- 体当たり（走って接触した相手のチャンネリングを潰す。BOT にも当たる・E83） ---
-        bumpCooldown -= dt;
-        if (
-            (net || botBrain.count > 0) &&
-            !spectator &&
-            bumpCooldown <= 0 &&
-            game.state.mode === 'walk' &&
-            game.state.running &&
-            game.state.speed > BUMP_SPEED
+            !claimed.has('chest') &&
+            board === 'landed' &&
+            Math.hypot(px - layout.chest.x, pz - layout.chest.z) < REACH &&
+            Math.abs(game.state.y - chestY) < 5
         ) {
-            bumpFromX = px;
-            bumpFromZ = pz;
-            bumpTarget = null;
-            // マルチプレイのゴースト（人間・BOT 兼用）と、ソロの BOT の両方を見る
-            if (net) net.eachPeerPosition(findBumpTarget);
-            else for (const state of botBrain.states) findBumpTarget(`bot${state.index}`, state.x, state.y, state.z);
-            if (bumpTarget) {
-                // 相手が BOT で自分がホストなら、その場で BOT へ効かせる（往復しない）
-                if (isBotId(bumpTarget) && isHost()) botBrain.knock(bumpTarget, bumpDirX, bumpDirZ);
-                else send({ k: 'bump', n: appliedGeneration, to: bumpTarget, dx: bumpDirX, dz: bumpDirZ });
-                bumpCooldown = BUMP_COOLDOWN;
-                hud.announce('体当たり！');
-            }
+            claim('chest');
         }
 
         // --- 裁定が返ってこないとき（ホスト交代の空白）は自分がホストなら確定させる（E62） ---
         for (const [prize, at] of claimed) {
-            if (prize === 'key' && keyOwner) continue;
-            if (prize === 'chest' && winner) continue;
+            if (winner) continue;
             if (now - at < CLAIM_RETRY * 1000) continue;
             claimed.set(prize, now);
             if (isHost()) award(prize, selfId);
@@ -973,8 +834,7 @@ export function createMatch(options: MatchOptions): Match {
         }
 
         // --- デバッグテレポート（?matchgoto。指定が無ければ何も起きない） ---
-        // 行き先は「いまの目標」: 鍵を持っていれば宝箱、まだなら鍵。目標が変わったときだけ飛ぶ。
-        // 飛んだ先は R の戻り先にもなる（game.warpTo）ので、回収が中断されても手前へ戻れる
+        // 飛んだ先は R の戻り先にもなる（game.warpTo）。
         // ?matchgoto=item は「いちばん近い未取得アイテム」を追いかける。拾うと次の
         // アイテムが最寄りになるので、そのまま次々に飛べる（アイテムの通し確認用）。
         // mimic / lookout も同じ仕組みで偽宝箱・見晴らしスポットの手前へ飛ぶ（契約12）
@@ -1007,11 +867,10 @@ export function createMatch(options: MatchOptions): Match {
                           : 'デバッグ: 見晴らしスポットへ移動（R で戻る）',
                 );
             }
-        } else if (gotoParam && !spectator && !winner) {
-            const target: Prize = gotoParam === 'chest' || keyOwner === selfId ? 'chest' : 'key';
-            if (target !== gotoSent) {
-                gotoSent = target;
-                const point = target === 'chest' ? layout.chest : layout.key;
+        } else if (gotoParam === 'chest' && !spectator && !winner) {
+            if (gotoSent !== 'chest') {
+                gotoSent = 'chest';
+                const point = layout.chest;
                 // 「3m手前」= いま自分がいる側へずらす。接触は自分で歩いて成立させる（判定は飛ばさない）
                 const awayX = px - point.x;
                 const awayZ = pz - point.z;
@@ -1025,63 +884,37 @@ export function createMatch(options: MatchOptions): Match {
                     point.z + uz * GOTO_STANDOFF,
                     Math.atan2(ux, uz),
                 );
-                hud.announce(
-                    target === 'chest'
-                        ? 'デバッグ: 宝箱の手前へ移動（R で再実行）'
-                        : 'デバッグ: 鍵の手前へ移動（R で再実行）',
-                );
+                hud.announce('デバッグ: 宝箱の手前へ移動（R で再実行）');
             }
         }
 
         // --- アイテムとディレクター（契約11。輸送機の姿勢を上書きするので最後に回す） ---
         frame.t = t;
         frame.dt = dt;
-        frame.reveal = reveal;
-        frame.keyLive = keyLive;
         frame.chestX = layout.chest.x;
         frame.chestY = chestY;
         frame.chestZ = layout.chest.z;
+        frame.over = winner !== null;
         frame.active = !spectator && !winner && board === 'landed';
         dir.update(frame);
 
-        // --- 統一の回収UI（契約13-3。宝箱 > 鍵 > 場のアイテム の優先順） ---
+        // --- 統一の回収UI（契約13-3。宝箱は触れた瞬間に勝ちなので、ここは場のアイテムだけ） ---
         // ディレクターが「いま拾えるアイテム」を決めたあとに出す
         const pick = frame.active ? dir.pickTarget : null;
-        if (canChannel) {
-            actionView.mark = '🧰';
-            actionView.target = '宝箱';
-            actionView.hold = true;
-            actionView.progress = channel / CHANNEL_TIME;
-            hud.setAction(actionView);
-        } else if (nearKey) {
-            actionView.mark = '🔑';
-            actionView.target = '鍵';
-            actionView.hold = false;
-            actionView.progress = -1;
-            hud.setAction(actionView);
-        } else if (pick) {
+        if (pick) {
             actionView.mark = pick.mark;
             actionView.target = pick.name;
-            actionView.hold = false;
-            actionView.progress = -1;
             hud.setAction(actionView);
         } else {
             hud.setAction(null);
         }
-        // 押した瞬間に成立するもの（鍵・アイテム）。宝箱は押しっぱなしなので上で進む
-        if (hud.consumeActionPress() && !canChannel) {
-            if (nearKey) claim('key');
-            else if (pick) dir.takePick();
-        }
+        if (hud.consumeActionPress() && pick) dir.takePick();
 
         // --- BOT（契約12。ホストだけが思考を回し、state と同じ形で配る） ---
         if (isHost() && botBrain.count > 0) {
             botFrame.t = t;
             botFrame.dt = dt;
-            botFrame.keyLive = keyLive;
-            botFrame.keyOwner = keyOwner;
             botFrame.winner = winner;
-            botFrame.reveal = reveal;
             botFrame.chestX = layout.chest.x;
             botFrame.chestY = chestY;
             botFrame.chestZ = layout.chest.z;
@@ -1090,17 +923,12 @@ export function createMatch(options: MatchOptions): Match {
         }
 
         // --- 状態行（契約13-1: 上部1行に集約。狭い画面でも切れないよう簡潔に） ---
+        // 契約14: 目標は最初から最後まで1つ「宝箱を探せ」。段階も鍵も無い
         const goal = spectator
             ? '観戦中'
-            : keyOwner === selfId
-              ? '宝箱を長押しで開ける'
-              : keyOwner
-                ? `鍵は${nameOf(keyOwner)}`
-                : t >= KEY_AT
-                  ? '鍵を拾え'
-                  : dropping
-                    ? '降下地点を選べ'
-                    : '安置の中で待て';
+            : dropping
+              ? '降下地点を選べ'
+              : '宝箱を探せ（ヒントを集めろ）';
         const zoneText =
             zone.until < 0 ? '最終安置' : zone.until > 0 ? `収縮まで${clock(zone.until)}` : '収縮中';
         hud.setStatus(
@@ -1119,6 +947,7 @@ export function createMatch(options: MatchOptions): Match {
         }
         // 決着後もビーコン・補給機は画に残す（拾得と使用だけ止める）
         frame.dt = dt;
+        frame.over = true;
         frame.active = false;
         dir.update(frame);
         // BOT も画に残す（思考は止め、最後の姿勢のまま立たせておく）
@@ -1164,7 +993,6 @@ export function createMatch(options: MatchOptions): Match {
         drawMap(draw) {
             if (!layout || phase === 'lobby') return;
             const { ctx, screenX, screenY, ppm, scale } = draw;
-            const chest = layout.chest;
 
             // 輸送機の経路（降下中だけ）
             if (matchTime < DROP_TIME) {
@@ -1179,60 +1007,9 @@ export function createMatch(options: MatchOptions): Match {
                 ctx.restore();
             }
 
-            // アイテムPOI・コイン・クレート（契約11）は安置円の下に敷く
+            // アイテムPOI・コイン・クレートと、集めた手がかり（契約11/14）は安置円の下に敷く。
+            // **宝箱そのものはマップに描かない**（無償開示なし・契約14-3）
             dir.drawMap(draw);
-
-            // 宝箱のヒント（段階開示。地図3枚で正確な位置を前倒し・契約11）
-            const reveal = dir.mapReveal
-                ? 3
-                : matchTime >= REVEAL_AT[2]
-                  ? 3
-                  : matchTime >= REVEAL_AT[1]
-                    ? 2
-                    : matchTime >= REVEAL_AT[0]
-                      ? 1
-                      : 0;
-            if (reveal === 1) {
-                const qx = chest.x < 0 ? -AREA_HALF : 0;
-                const qz = chest.z < 0 ? -AREA_HALF : 0;
-                ctx.fillStyle = 'rgba(255, 196, 66, 0.16)';
-                ctx.fillRect(screenX(qx), screenY(qz), AREA_HALF * ppm, AREA_HALF * ppm);
-            } else if (reveal === 2) {
-                ctx.strokeStyle = 'rgba(230, 160, 30, 0.85)';
-                ctx.lineWidth = 2 * scale;
-                ctx.beginPath();
-                ctx.arc(screenX(chest.x), screenY(chest.z), CHEST_HINT_RADIUS * ppm, 0, TAU);
-                ctx.stroke();
-            } else if (reveal >= 3) {
-                const cx = screenX(chest.x);
-                const cz = screenY(chest.z);
-                ctx.fillStyle = '#f2b134';
-                ctx.strokeStyle = '#ffffff';
-                ctx.lineWidth = 2 * scale;
-                ctx.beginPath();
-                for (let i = 0; i < 10; i++) {
-                    const r = (i % 2 === 0 ? 9 : 4.2) * scale;
-                    const a = (i / 10) * TAU - Math.PI / 2;
-                    const x = cx + Math.cos(a) * r;
-                    const y = cz + Math.sin(a) * r;
-                    if (i === 0) ctx.moveTo(x, y);
-                    else ctx.lineTo(x, y);
-                }
-                ctx.closePath();
-                ctx.fill();
-                ctx.stroke();
-            }
-
-            // 鍵
-            if (matchTime >= KEY_AT && !keyOwner) {
-                ctx.fillStyle = '#57c9f2';
-                ctx.strokeStyle = '#ffffff';
-                ctx.lineWidth = 2 * scale;
-                ctx.beginPath();
-                ctx.arc(screenX(layout.key.x), screenY(layout.key.z), 6 * scale, 0, TAU);
-                ctx.fill();
-                ctx.stroke();
-            }
 
             // ヘリコプター（契約12）。乗り物がどこにあるか分からないと乗りに行けない
             game.eachHeli((hx, hz, hyaw, occupied) => {
@@ -1258,30 +1035,6 @@ export function createMatch(options: MatchOptions): Match {
                 ctx.stroke();
                 ctx.restore();
             });
-
-            // 展望台の千里眼: 最終安置の円と宝箱の位置を先読みで出す（契約12）
-            if (dir.farsight) {
-                const last = layout.centers[layout.centers.length - 1];
-                ctx.save();
-                ctx.strokeStyle = 'rgba(100, 240, 200, 0.95)';
-                ctx.lineWidth = 2.5 * scale;
-                ctx.setLineDash([5 * scale, 5 * scale]);
-                ctx.beginPath();
-                ctx.arc(
-                    screenX(last.x),
-                    screenY(last.z),
-                    Math.max(2, layout.radii[layout.radii.length - 1] * ppm),
-                    0,
-                    TAU,
-                );
-                ctx.stroke();
-                ctx.setLineDash([]);
-                ctx.strokeStyle = 'rgba(100, 240, 200, 0.95)';
-                ctx.beginPath();
-                ctx.arc(screenX(chest.x), screenY(chest.z), 9 * scale, 0, TAU);
-                ctx.stroke();
-                ctx.restore();
-            }
 
             // ソロの BOT（マルチプレイがあるときは遠隔プレイヤーとして描かれている）
             if (!net) {

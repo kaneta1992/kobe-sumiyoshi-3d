@@ -6,6 +6,9 @@
  * 実行時乱数は使わない（data-spec §4 の禁止事項）— ここの PRNG はシード由来。
  *
  * 時間はすべて「マッチ時計の秒」。マッチ時計は ?matchspeed= 倍で早送りできる（デバッグ用）。
+ *
+ * 契約14（情報経済の再設計）: 鍵・チャンネリング・体当たりは廃止。宝箱は**隠し配置**で、
+ * 触れた瞬間に勝ち。位置を無償で開示するものはここには無い（安置の円だけが無償の情報）。
  */
 import { AREA_HALF } from '../config';
 import { allPlaces } from '../world/landmarks';
@@ -16,8 +19,6 @@ const TAU = Math.PI * 2;
 export const COUNTDOWN = 3000;
 /** 輸送機がエリアを横断しきる時間[s] = 降りられる猶予 */
 export const DROP_TIME = 50;
-/** 宝箱の回収に必要なチャンネリング[s] */
-export const CHANNEL_TIME = 10;
 /** 初期円の半径[m]。エリア全体（対角 1697m）を包むので開始時は誰も減速しない */
 export const START_RADIUS = 1900;
 
@@ -31,25 +32,19 @@ export const STAGES = [
     { warn: 260, from: 300, to: 400, radius: 120 },
 ] as const;
 
-/** 鍵が湧く時刻[s]（第2収縮の開始と同時） */
-export const KEY_AT = STAGES[1].from;
-/** 宝箱の位置ヒントが開く段階（1=四半区画 / 2=円 / 3=正確な位置） */
-export const REVEAL_AT = [STAGES[0].from, STAGES[1].from, STAGES[2].from] as const;
+/** 最終安置に到達する時刻[s]（第3収縮の完了） */
+export const FINAL_ZONE_AT = STAGES[STAGES.length - 1].to;
+/**
+ * アンチストール（契約14-7）: 最終安置に入ってからこの秒数だけ誰も回収しなければ、
+ * **1マッチに1回だけ**宝箱から方向花火を上げる。定期花火の置き換え
+ */
+export const ANTI_STALL_AFTER = 180;
 /** リマッチ投票の自動締め切り[s]（実時間） */
 export const VOTE_TIME = 10;
-/** 宝箱・鍵に触れたとみなす距離[m] */
+/** 宝箱に触れたとみなす距離[m]（触れた瞬間に回収・勝利。契約14-2） */
 export const REACH = 2.6;
-/** 体当たりが届く距離[m] と クールダウン[s] と 押し飛ばす距離[m] */
-export const BUMP_REACH = 2.2;
-export const BUMP_COOLDOWN = 3;
-export const BUMP_PUSH = 1.5;
-/** 体当たりが成立する最低速度[m/s]（走っていること） */
-export const BUMP_SPEED = 3.2;
-/**
- * チャンネリングが中断される移動速度[m/s]。
- * 既定の移動速度を上げた（契約13-9）ぶん、止まりきる前の余韻で切れないよう緩めてある
- */
-export const CHANNEL_STILL = 0.9;
+/** 宝箱・ミミックの「気配」が届く距離[m]（契約14-5） */
+export const SENSE_RADIUS = 15;
 /** 安置の外での移動速度倍率 */
 export const OUTSIDE_SPEED = 0.5;
 /** 輸送機の飛行高度（地形の最高点からの余裕）[m] */
@@ -87,20 +82,16 @@ export function noBots(): boolean {
 export const GOTO_STANDOFF = 3;
 
 /**
- * ?matchgoto=key|chest|item|mimic|lookout 目標の手前へテレポートする（デバッグ限定）。
- * key/chest は鍵→宝箱の通し検証用、item は「いちばん近い未取得アイテム」へ次々に飛ぶ
+ * ?matchgoto=chest|item|mimic|lookout 目標の手前へテレポートする（デバッグ限定）。
+ * chest は隠された宝箱の通し検証用、item は「いちばん近い未取得アイテム」へ次々に飛ぶ
  * （拾うたびに次のアイテムへ自動で移る・契約11の検証用）。
  * mimic は偽宝箱、lookout は見晴らしスポット（千里眼）の検証用（契約12）。
- * 無指定と不正値は null なので、通常フローには何も出ない
+ * 無指定と不正値は null なので、通常フローには何も出ない（key は契約14で廃止）
  */
-export type MatchGoto = 'key' | 'chest' | 'item' | 'mimic' | 'lookout';
+export type MatchGoto = 'chest' | 'item' | 'mimic' | 'lookout';
 export function matchGoto(): MatchGoto | null {
     const value = new URLSearchParams(location.search).get('matchgoto');
-    return value === 'key' ||
-        value === 'chest' ||
-        value === 'item' ||
-        value === 'mimic' ||
-        value === 'lookout'
+    return value === 'chest' || value === 'item' || value === 'mimic' || value === 'lookout'
         ? value
         : null;
 }
@@ -170,10 +161,83 @@ export interface MatchLayout {
     centers: readonly Point[];
     /** 中心列に対応する半径[m] */
     radii: readonly number[];
+    /** 宝箱。最終安置の中の「隠れた」地点（契約14-3） */
     chest: Point;
-    key: Point;
     /** 最終安置のランドマーク名（実況に使う） */
     finalPlace: string;
+}
+
+/**
+ * 隠し配置の判定に使うワールドの問い合わせ口（契約14-3）。
+ * 全員が同じワールドを持っているので、ここを通しても配置は全クライアントで一致する
+ */
+export interface WorldProbe {
+    /** 足場の高さ（建物・道路を含む） */
+    surface(x: number, z: number): number;
+    /** 地形だけの高さ */
+    ground(x: number, z: number): number;
+    /** 最寄りの道路までの距離[m] */
+    road(x: number, z: number): number;
+}
+
+/** 隠し場所として認める道路からの距離[m]（近すぎ = 道のど真ん中 / 遠すぎ = 山の中） */
+const HIDE_NEAR = 7;
+const HIDE_FAR = 70;
+/** いちばん「らしい」道路からの距離[m]（建物の裏・庭・路地のスケール） */
+const HIDE_IDEAL = 20;
+/** 立てるとみなす条件: 足場と地形の差[m]（屋根・建物の中を弾く） と 傾き[m] */
+const HIDE_ON_GROUND = 0.8;
+const HIDE_SLOPE = 1.3;
+/** 周囲に立てる地面があるか確かめる半径[m]（E101） */
+const HIDE_CLEAR = 1.5;
+/** 隠し場所の候補数（多いほど良い場所が見つかるが、道路走査のぶん重くなる） */
+const HIDE_TRIES = 32;
+
+/** その場に立てるか（屋根の上・建物の中・急斜面を弾く） */
+function standable(probe: WorldProbe, x: number, z: number): boolean {
+    const h = probe.surface(x, z);
+    if (Math.abs(h - probe.ground(x, z)) > HIDE_ON_GROUND) return false;
+    for (let i = 0; i < 4; i++) {
+        const angle = (i / 4) * TAU;
+        const cx = x + Math.cos(angle) * HIDE_CLEAR;
+        const cz = z + Math.sin(angle) * HIDE_CLEAR;
+        const nh = probe.surface(cx, cz);
+        if (Math.abs(nh - h) > HIDE_SLOPE) return false;
+        if (Math.abs(nh - probe.ground(cx, cz)) > HIDE_ON_GROUND) return false;
+    }
+    return true;
+}
+
+/**
+ * 「見つける楽しさ」のある隠し場所を1つ選ぶ（契約14-3）。
+ * 中心から radius 以内へ候補を散らし、**道路から少し外れていて到達できる**点を選ぶ。
+ * probe が無い（ワールド未接続）ときは素直に散らした点を返す
+ */
+export function findHiddenSpot(
+    seed: number,
+    center: Point,
+    radius: number,
+    probe: WorldProbe | null,
+    margin = 20,
+): Point {
+    const rnd = createRandom(seed >>> 0);
+    let best: Point | null = null;
+    let bestScore = -Infinity;
+    let fallback: Point | null = null;
+    for (let i = 0; i < HIDE_TRIES; i++) {
+        const point = scatter(center, radius, rnd, margin);
+        if (!probe) return point;
+        if (!fallback) fallback = point;
+        if (!standable(probe, point.x, point.z)) continue;
+        const distance = probe.road(point.x, point.z);
+        if (distance < HIDE_NEAR || distance > HIDE_FAR) continue;
+        // 理想の距離にいちばん近いものを採る（同点なら先に出た候補 = シード順で安定）
+        const score = -Math.abs(distance - HIDE_IDEAL);
+        if (score <= bestScore) continue;
+        bestScore = score;
+        best = point;
+    }
+    return best ?? fallback ?? { x: center.x, z: center.z };
 }
 
 function clampToArea(value: number, margin: number): number {
@@ -196,7 +260,11 @@ function scatter(from: Point, radius: number, rnd: () => number, margin: number)
  * 中心を外へ広げていくので「次の円は必ず現在の円のだいたい内側」になる。
  * previousSeed を渡すと、直前のマッチの最終安置は選ばない（契約13-4）
  */
-export function buildLayout(seed: number, previousSeed: number | null = null): MatchLayout {
+export function buildLayout(
+    seed: number,
+    previousSeed: number | null = null,
+    probe: WorldProbe | null = null,
+): MatchLayout {
     const rnd = createRandom(seed);
     const radii = [START_RADIUS, STAGES[0].radius, STAGES[1].radius, STAGES[2].radius];
 
@@ -219,14 +287,8 @@ export function buildLayout(seed: number, previousSeed: number | null = null): M
     const midZ = dirX * offset;
     const half = AREA_HALF * 1.4;
 
-    // 宝箱は最終安置の中、鍵は第2円の外周寄り（中心で待つだけの試合にしない）
-    const chest = scatter(c3, radii[3] * 0.55, rnd, 20);
-    const keyAngle = rnd() * TAU;
-    const keyDistance = radii[2] * (0.7 + rnd() * 0.2);
-    const key = {
-        x: clampToArea(c2.x + Math.cos(keyAngle) * keyDistance, 30),
-        z: clampToArea(c2.z + Math.sin(keyAngle) * keyDistance, 30),
-    };
+    // 宝箱は最終安置の中の「隠れた」地点（道路のど真ん中を避け、建物の裏・庭・路地へ寄せる）
+    const chest = findHiddenSpot((seed ^ 0x7a3b19c5) >>> 0, c3, radii[3] * 0.7, probe);
 
     return {
         seed,
@@ -239,7 +301,6 @@ export function buildLayout(seed: number, previousSeed: number | null = null): M
         centers,
         radii,
         chest,
-        key,
         finalPlace: landmark.name,
     };
 }
@@ -305,6 +366,16 @@ export function zoneAt(layout: MatchLayout, t: number, out: ZoneNow): ZoneNow {
     out.until = t < s.from ? s.from - t : 0;
     out.shrinking = t > s.from && t < s.to;
     return out;
+}
+
+/** 方位の呼び名（-z が北・+x が東。ヒントの読み上げに使う・契約14-4） */
+const COMPASS = ['北', '北東', '東', '南東', '南', '南西', '西', '北西'] as const;
+
+/** (dx, dz) の向きを8方位の言葉にする */
+export function compassName(dx: number, dz: number): string {
+    const bearing = Math.atan2(dx, -dz);
+    const index = Math.round((bearing / TAU) * 8);
+    return COMPASS[((index % 8) + 8) % 8];
 }
 
 /** 秒を mm:ss へ（HUD 用） */

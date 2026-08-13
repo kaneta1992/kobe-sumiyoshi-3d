@@ -35,6 +35,9 @@ export interface MapDraw {
     scale: number;
     /** 全体マップか（ラベルを出してよいか） */
     full: boolean;
+    /** 描画領域の大きさ[CSS px]（凡例など、画面に貼り付けるものに使う） */
+    w: number;
+    h: number;
 }
 
 export interface MapOverlayOptions {
@@ -418,11 +421,15 @@ export function createMapOverlay(options: MapOverlayOptions): MapOverlay {
         );
         ctx.restore();
         if (!drawMatch) return;
-        if (!matchDraw) matchDraw = { ctx, screenX, screenY, ppm: view.ppm, scale, full };
+        if (!matchDraw) {
+            matchDraw = { ctx, screenX, screenY, ppm: view.ppm, scale, full, w: view.w, h: view.h };
+        }
         matchDraw.ctx = ctx;
         matchDraw.ppm = view.ppm;
         matchDraw.scale = scale;
         matchDraw.full = full;
+        matchDraw.w = view.w;
+        matchDraw.h = view.h;
         ctx.save();
         drawMatch(matchDraw);
         ctx.restore();

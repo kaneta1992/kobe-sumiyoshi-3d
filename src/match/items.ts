@@ -13,7 +13,15 @@
 import { AREA_HALF } from '../config';
 import type { RoadPath } from '../shared/road-profile.js';
 import { allPlaces, placeName } from '../world/landmarks';
-import { createRandom, createZoneNow, shuffledOrder, zoneAt, type MatchLayout } from './rules';
+import {
+    createRandom,
+    createZoneNow,
+    findHiddenSpot,
+    shuffledOrder,
+    zoneAt,
+    type MatchLayout,
+    type WorldProbe,
+} from './rules';
 
 const TAU = Math.PI * 2;
 
@@ -63,8 +71,9 @@ export const ITEMS: Readonly<Record<ItemId, ItemSpec>> = {
         kind: 'use',
         color: 0x9b7bff,
         mark: '🔮',
-        hint: '30秒、最寄りプレイヤー（居なければ宝箱）の方角が出る',
-        seconds: 30,
+        // 契約14-4: 中核アイテム。使った地点に方向線が残るので、2地点で使えば交点が出る
+        hint: '使うと宝箱の方角へ倒れ、方向線がマップに残る（2本の交点で場所が絞れる）',
+        seconds: 0,
     },
     cape: {
         id: 'cape',
@@ -99,7 +108,7 @@ export const ITEMS: Readonly<Record<ItemId, ItemSpec>> = {
         kind: 'collect',
         color: 0xf2d16b,
         mark: '🗺',
-        hint: '3枚集めると宝箱の正確な位置が出る',
+        hint: '3枚集めると宝箱のいる半径40mの円がマップに出る',
         seconds: 0,
     },
     fog: {
@@ -108,7 +117,7 @@ export const ITEMS: Readonly<Record<ItemId, ItemSpec>> = {
         kind: 'use',
         color: 0xc9d6e4,
         mark: '🌫',
-        hint: '45秒、ステッキ等の探知とマップから消える',
+        hint: '45秒、ほかのプレイヤーのマップから自分が消える',
         seconds: 45,
     },
     whistle: {
@@ -126,8 +135,9 @@ export const ITEMS: Readonly<Record<ItemId, ItemSpec>> = {
         kind: 'use',
         color: 0x64f0c8,
         mark: '👁',
-        hint: '見晴らしスポットで使うと次の安置と宝箱を先読みできる',
-        seconds: 45,
+        // 契約14-4: 方角 + ざっくりした距離帯。マップに扇形が残る
+        hint: '見晴らしスポットで使うと宝箱の方角と距離帯（扇形）がマップに残る',
+        seconds: 0,
     },
 };
 
@@ -141,9 +151,13 @@ const PER_SPOT = 2;
 const SPOT_GAP = 210;
 /** POI の中でアイテムを置く半径[m] */
 const SPOT_RADIUS = 1.7;
-/** ⚡（速度アップ）の間隔[m] と POI から片側に何個敷くか（契約13-10 で増量） */
-const COIN_STEP = 8;
-const COIN_PER_SIDE = 14;
+/**
+ * ⚡（速度アップ）の間隔[m] と POI から片側に何個敷くか。
+ * 契約14-9: 「道なりに走れば自然に集まる」よう間隔を詰めて列を伸ばした
+ * （拾う半径そのものは director 側の COIN_REACH で広げてある）
+ */
+const COIN_STEP = 7;
+const COIN_PER_SIDE = 18;
 /** コイン列を敷くのに十分な道路の長さ[m] と、その道を探しに行く範囲[m] */
 const COIN_ROAD_LENGTH = 120;
 const COIN_ROAD_SEARCH = 90;
@@ -151,6 +165,8 @@ const COIN_ROAD_SEARCH = 90;
 const MIMIC_COUNT = 3;
 const MIMIC_MIN = 45;
 const MIMIC_RADIUS = 220;
+/** ミミックの隠し場所を探す半径[m]（本物と同じ隠し方をする・契約14-4/E101） */
+const MIMIC_HIDE = 55;
 /** 見晴らしスポット（千里眼・契約12）: 標高を測る格子の分割数 */
 const LOOKOUT_GRID = 41;
 /** 補給機の飛来時刻[s]（マッチ時計。ディレクターが前倒しすることがある） */
@@ -296,6 +312,7 @@ export function buildItemLayout(
     layout: MatchLayout,
     roads: readonly RoadPath[],
     previousSeed: number | null = null,
+    probe: WorldProbe | null = null,
 ): ItemLayout {
     // マッチ本体のシードと同じ列を使うと配置が絡むので、ひねってから使う
     const rnd = createRandom((seed ^ 0x5bf03635) >>> 0);
@@ -380,16 +397,17 @@ export function buildItemLayout(
         }
     }
 
-    // 偽宝箱（ミミック・契約12）: 宝箱のヒント円の中に、本物と同じ見た目で紛れ込ませる。
-    // 道路上へ寄せるので「探しに来た人が必ず通る場所」に立つ
+    // 偽宝箱（ミミック・契約12/14）: 本物の周りへ、**本物とまったく同じ隠し方**で紛れ込ませる。
+    // 道路脇に立てると「道路にあるのは偽物」と学習できてしまうので、隠し場所の判定を共有する
     const mimics: { x: number; z: number }[] = [];
     for (let i = 0; i < MIMIC_COUNT; i++) {
         const angle = rnd() * TAU;
         const distance = MIMIC_MIN + Math.sqrt(rnd()) * (MIMIC_RADIUS - MIMIC_MIN);
-        const mx = clampToArea(layout.chest.x + Math.cos(angle) * distance, 20);
-        const mz = clampToArea(layout.chest.z + Math.sin(angle) * distance, 20);
-        const near = nearestRoadVertex(roads, mx, mz);
-        mimics.push(near ? { x: near.path.points[near.index].x, z: near.path.points[near.index].z } : { x: mx, z: mz });
+        const around = {
+            x: clampToArea(layout.chest.x + Math.cos(angle) * distance, 20),
+            z: clampToArea(layout.chest.z + Math.sin(angle) * distance, 20),
+        };
+        mimics.push(findHiddenSpot((seed ^ (0x2b1f0a7d + i * 0x9e3779b9)) >>> 0, around, MIMIC_HIDE, probe));
     }
 
     return { spots, drops, coins, supplies, poiDrops, mimics };

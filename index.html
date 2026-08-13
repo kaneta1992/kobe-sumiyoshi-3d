@@ -523,27 +523,6 @@
                     opacity: 1;
                 }
             }
-            #match-ui .match-channel {
-                position: absolute;
-                left: 50%;
-                bottom: calc(env(safe-area-inset-bottom, 0px) + 42%);
-                transform: translateX(-50%);
-                width: min(340px, 74vw);
-                text-align: center;
-            }
-            #match-ui .match-channel-fill {
-                height: 12px;
-                width: 0%;
-                border-radius: 999px;
-                background: linear-gradient(90deg, #ffd257, #ff9a3c);
-                box-shadow: 0 0 0 2px rgba(12, 16, 22, 0.7);
-                transition: width 0.08s linear;
-            }
-            #match-ui .match-channel-label {
-                margin-top: 6px;
-                font-size: 12px;
-                text-shadow: 0 1px 3px rgba(0, 0, 0, 0.75);
-            }
             /* 効いているアイテムの残り時間・速度倍率（契約11 / 13-10）。
                契約13-1 で上部に情報が集まるので、バッジは小さめにして状態行を邪魔しない */
             #match-ui .match-badge {
@@ -576,7 +555,7 @@
                 animation: match-pop 0.4s ease-out;
             }
             /* 安置の外にいるときだけ出す画面端インジケータ（契約13-6）。
-               宝箱・鍵の方角は出さない — 場所を推理するのがこのゲームの芯 */
+               宝箱の方角は出さない — 場所を推理するのがこのゲームの芯（契約14） */
             #match-ui .match-edge {
                 position: absolute;
                 left: 50%;
@@ -635,16 +614,6 @@
                 background: rgba(60, 44, 12, 0.86);
                 border-color: #ffd257;
             }
-            /* 長押しの進捗はボタン自身が満ちていく（別の場所を見なくてよい） */
-            #match-ui .match-action-ring {
-                position: absolute;
-                left: 0;
-                top: 0;
-                bottom: 0;
-                width: 0%;
-                background: linear-gradient(90deg, rgba(255, 210, 87, 0.45), rgba(255, 154, 60, 0.5));
-                transition: width 0.08s linear;
-            }
             #match-ui .match-action-key {
                 position: relative;
                 padding: 1px 8px;
@@ -680,37 +649,6 @@
                 #match-ui .match-action-mark {
                     font-size: 26px;
                 }
-            }
-            /* 尋ね人ステッキの方角矢印（契約11） */
-            #match-ui .match-arrow {
-                position: absolute;
-                left: 50%;
-                bottom: calc(env(safe-area-inset-bottom, 0px) + var(--match-bottom) + 148px);
-                transform: translateX(-50%);
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                gap: 2px;
-            }
-            #match-ui .match-arrow-dial {
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                width: 54px;
-                height: 54px;
-                border-radius: 50%;
-                background: rgba(12, 16, 22, 0.6);
-                border: 2px solid rgba(155, 123, 255, 0.85);
-                color: #d8caff;
-                font-size: 24px;
-                line-height: 1;
-            }
-            #match-ui .match-arrow-label {
-                padding: 2px 8px;
-                border-radius: 999px;
-                background: rgba(12, 16, 22, 0.66);
-                font-size: 11px;
-                font-variant-numeric: tabular-nums;
             }
             /* 所持アイテム2枠。既存のタッチ操作系（左スティック・右ボタン）と
                重ならないよう、画面下中央でモバイルだけ持ち上げる（E78） */
